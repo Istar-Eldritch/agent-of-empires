@@ -70,6 +70,12 @@ pub struct TerminalManager {
 #[derive(Debug, Default)]
 struct TerminalManagerInner {
     outputs: std::collections::HashMap<TerminalId, TerminalOutput>,
+    /// Ids this session has already released. Lets `terminal/release` be
+    /// idempotent for a replayed call (#2977 replays a completed-but-undelivered
+    /// result across a control reattach) without masking a genuinely unknown
+    /// id, which still errors. Bounded by the session's terminal count, which
+    /// is bounded by the agent's tool calls.
+    released: std::collections::HashSet<TerminalId>,
 }
 
 /// Build the `docker exec` argv and inherit-env pairs for a sandboxed
@@ -198,7 +204,15 @@ impl TerminalManager {
         if inner.outputs.remove(terminal_id).is_none() {
             return Err(TerminalError::UnknownTerminal(terminal_id.into()));
         }
+        inner.released.insert(terminal_id.into());
         Ok(())
+    }
+
+    /// Whether this session already released `terminal_id`. Distinguishes a
+    /// duplicate release (idempotent success) from an id that was never
+    /// created (a real error).
+    pub async fn was_released(&self, terminal_id: &str) -> bool {
+        self.inner.lock().await.released.contains(terminal_id)
     }
 }
 
@@ -230,6 +244,31 @@ mod tests {
         mgr.release(&id).await.unwrap();
         let result = mgr.output(&id).await;
         assert!(matches!(result, Err(TerminalError::UnknownTerminal(_))));
+    }
+
+    // #2977: a replayed `terminal/release` must be distinguishable from one
+    // naming an id that never existed, so the handler can answer the first
+    // idempotently while still erroring on the second.
+    #[tokio::test]
+    async fn released_ids_are_remembered_but_unknown_ids_are_not() {
+        let mgr = TerminalManager::new();
+        let id = mgr
+            .create_and_run("s-1", "true", vec![], std::env::temp_dir(), None)
+            .await
+            .unwrap();
+        assert!(!mgr.was_released(&id).await, "not released yet");
+        mgr.release(&id).await.unwrap();
+        assert!(mgr.was_released(&id).await, "release is recorded");
+        // A second release still errors at the manager layer; the handler is
+        // what turns that into idempotent success, and only for a known id.
+        assert!(matches!(
+            mgr.release(&id).await,
+            Err(TerminalError::UnknownTerminal(_))
+        ));
+        assert!(
+            !mgr.was_released("never-existed").await,
+            "a bogus id must stay an error rather than being masked"
+        );
     }
 
     // Regression: pipe-buffer deadlock when stderr exceeds the

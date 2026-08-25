@@ -6925,15 +6925,17 @@ async fn run_connection_task<W, R>(
                 let pending = pending_for_perm.clone();
                 let tool_context_cache = tool_context_cache_for_perm.clone();
                 async move {
-                    handle_permission_request(
-                        request,
+                    reply(
                         responder,
-                        event_tx,
-                        pending,
-                        profile,
-                        tool_context_cache,
+                        handle_permission_request(
+                            request,
+                            event_tx,
+                            pending,
+                            profile,
+                            tool_context_cache,
+                        )
+                        .await,
                     )
-                    .await
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -6945,7 +6947,10 @@ async fn run_connection_task<W, R>(
                 let event_tx = event_tx_for_elicit.clone();
                 let pending = pending_for_elicit.clone();
                 async move {
-                    handle_elicitation_request(request, responder, event_tx, pending).await
+                    reply(
+                        responder,
+                        handle_elicitation_request(request, event_tx, pending).await,
+                    )
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -6955,7 +6960,7 @@ async fn run_connection_task<W, R>(
                   responder: Responder<ReadTextFileResponse>,
                   _conn| {
                 let res = res_read.clone();
-                async move { handle_read_text_file(request, responder, res).await }
+                async move { reply(responder, handle_read_text_file(request, res).await) }
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -6964,7 +6969,7 @@ async fn run_connection_task<W, R>(
                   responder: Responder<WriteTextFileResponse>,
                   _conn| {
                 let res = res_write.clone();
-                async move { handle_write_text_file(request, responder, res).await }
+                async move { reply(responder, handle_write_text_file(request, res).await) }
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -6973,7 +6978,7 @@ async fn run_connection_task<W, R>(
                   responder: Responder<CreateTerminalResponse>,
                   _conn| {
                 let res = res_term_create.clone();
-                async move { handle_create_terminal(request, responder, res).await }
+                async move { reply(responder, handle_create_terminal(request, res).await) }
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -6982,7 +6987,7 @@ async fn run_connection_task<W, R>(
                   responder: Responder<TerminalOutputResponse>,
                   _conn| {
                 let res = res_term_output.clone();
-                async move { handle_terminal_output(request, responder, res).await }
+                async move { reply(responder, handle_terminal_output(request, res).await) }
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -6991,7 +6996,7 @@ async fn run_connection_task<W, R>(
                   responder: Responder<WaitForTerminalExitResponse>,
                   _conn| {
                 let res = res_term_wait.clone();
-                async move { handle_wait_for_terminal_exit(request, responder, res).await }
+                async move { reply(responder, handle_wait_for_terminal_exit(request, res).await) }
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -7000,7 +7005,7 @@ async fn run_connection_task<W, R>(
                   responder: Responder<KillTerminalResponse>,
                   _conn| {
                 let res = res_term_kill.clone();
-                async move { handle_kill_terminal(request, responder, res).await }
+                async move { reply(responder, handle_kill_terminal(request, res).await) }
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -7009,7 +7014,7 @@ async fn run_connection_task<W, R>(
                   responder: Responder<ReleaseTerminalResponse>,
                   _conn| {
                 let res = res_term_release.clone();
-                async move { handle_release_terminal(request, responder, res).await }
+                async move { reply(responder, handle_release_terminal(request, res).await) }
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -9347,11 +9352,145 @@ where
     }
 }
 
+/// Everything the nine agent-to-client handlers need, so one value can be
+/// threaded through [`dispatch_server_method`] instead of a nine-argument
+/// call. Cheap to clone: every field is an `Arc` or a small handle.
+#[derive(Clone)]
+struct ServerDispatchCtx {
+    resources: SessionResources,
+    event_tx: mpsc::Sender<Event>,
+    pending: PendingResponders,
+    profile: &'static agent_profiles::AgentProfile,
+    tool_context_cache: ToolContextCache,
+}
+
+/// Bridge a handler's `Result<Response, Error>` onto a crate [`Responder`].
+///
+/// The direct-stdio path keeps its typed `on_receive_request` closures, but
+/// each one now calls the same handler the control-channel dispatcher does,
+/// so there is exactly one implementation of every method (#2977). Without
+/// this the two transports would drift.
+fn reply<T: agent_client_protocol::JsonRpcResponse>(
+    responder: Responder<T>,
+    outcome: Result<T, agent_client_protocol::Error>,
+) -> agent_client_protocol::Result<()> {
+    match outcome {
+        Ok(value) => responder.respond(value),
+        Err(e) => responder.respond_with_error(e),
+    }
+}
+
+/// One dispatch arm: parse the opaque params into the crate request type,
+/// run the handler, serialize the response back to JSON.
+///
+/// Deliberately uses the crate's own `parse_message` / `into_json` rather
+/// than bare serde, so a payload crossing the control channel is shaped
+/// exactly as the crate would have shaped it on the byte relay. A serde
+/// round trip would be *nearly* identical, and the near-misses (untagged
+/// enums, skipped `None`s, method-sensitive response bodies) are precisely
+/// the ones that would surface as an adapter-specific bug in the field.
+async fn dispatch_arm<Req, Fut>(
+    method: &str,
+    params: serde_json::Value,
+    run: impl FnOnce(Req) -> Fut,
+) -> Result<serde_json::Value, agent_client_protocol::Error>
+where
+    Req: agent_client_protocol::JsonRpcRequest,
+    Fut: std::future::Future<Output = Result<Req::Response, agent_client_protocol::Error>>,
+{
+    let request = Req::parse_message(method, &params)?;
+    run(request).await?.into_json(method)
+}
+
+/// Service one agent-to-client request that arrived over the control channel
+/// as opaque JSON (#2977). The runner-path counterpart of the nine typed
+/// `on_receive_request` closures the direct-stdio path registers; both funnel
+/// into the same `handle_*` functions.
+///
+/// Method identity comes from the crate's `matches_method` rather than
+/// hardcoded strings, so a crate-side rename cannot silently turn a live
+/// method into a "not found".
+async fn dispatch_server_method(
+    method: &str,
+    params: serde_json::Value,
+    ctx: ServerDispatchCtx,
+) -> Result<serde_json::Value, agent_client_protocol::Error> {
+    use agent_client_protocol::JsonRpcMessage;
+
+    if RequestPermissionRequest::matches_method(method) {
+        return dispatch_arm(method, params, |req| {
+            handle_permission_request(
+                req,
+                ctx.event_tx.clone(),
+                ctx.pending.clone(),
+                ctx.profile,
+                ctx.tool_context_cache.clone(),
+            )
+        })
+        .await;
+    }
+    if CreateElicitationRequest::matches_method(method) {
+        return dispatch_arm(method, params, |req| {
+            handle_elicitation_request(req, ctx.event_tx.clone(), ctx.pending.clone())
+        })
+        .await;
+    }
+    if ReadTextFileRequest::matches_method(method) {
+        return dispatch_arm(method, params, |req| {
+            handle_read_text_file(req, ctx.resources.clone())
+        })
+        .await;
+    }
+    if WriteTextFileRequest::matches_method(method) {
+        return dispatch_arm(method, params, |req| {
+            handle_write_text_file(req, ctx.resources.clone())
+        })
+        .await;
+    }
+    if CreateTerminalRequest::matches_method(method) {
+        return dispatch_arm(method, params, |req| {
+            handle_create_terminal(req, ctx.resources.clone())
+        })
+        .await;
+    }
+    if TerminalOutputRequest::matches_method(method) {
+        return dispatch_arm(method, params, |req| {
+            handle_terminal_output(req, ctx.resources.clone())
+        })
+        .await;
+    }
+    if WaitForTerminalExitRequest::matches_method(method) {
+        return dispatch_arm(method, params, |req| {
+            handle_wait_for_terminal_exit(req, ctx.resources.clone())
+        })
+        .await;
+    }
+    if KillTerminalRequest::matches_method(method) {
+        return dispatch_arm(method, params, |req| {
+            handle_kill_terminal(req, ctx.resources.clone())
+        })
+        .await;
+    }
+    if ReleaseTerminalRequest::matches_method(method) {
+        return dispatch_arm(method, params, |req| {
+            handle_release_terminal(req, ctx.resources.clone())
+        })
+        .await;
+    }
+    // An unhandled request MUST get an error, never a silent drop: the agent
+    // is parked on this id and would wait forever.
+    warn!(
+        target: "acp.protocol",
+        method,
+        "agent issued an unsupported client method; answering method_not_found"
+    );
+    Err(agent_client_protocol::Error::method_not_found())
+}
+
 async fn handle_read_text_file(
     request: ReadTextFileRequest,
-    responder: Responder<ReadTextFileResponse>,
     res: SessionResources,
-) -> agent_client_protocol::Result<()> {
+) -> Result<ReadTextFileResponse, agent_client_protocol::Error> {
     // Issue #1147: parallel-tool-call diagnostics. The `enter_ns` value is a
     // monotonic ns-since-process-start counter; if the model dispatches N
     // tool calls in parallel, the entries should interleave (close `enter_ns`
@@ -9394,11 +9533,9 @@ async fn handle_read_text_file(
             } else {
                 content
             };
-            responder.respond(ReadTextFileResponse::new(sliced))
+            Ok(ReadTextFileResponse::new(sliced))
         }
-        Err(e) => {
-            responder.respond_with_error(agent_client_protocol::util::internal_error(e.to_string()))
-        }
+        Err(e) => Err(agent_client_protocol::util::internal_error(e.to_string())),
     };
     trace!(
         target: "acp.protocol.tool_dispatch",
@@ -9412,9 +9549,8 @@ async fn handle_read_text_file(
 
 async fn handle_write_text_file(
     request: WriteTextFileRequest,
-    responder: Responder<WriteTextFileResponse>,
     res: SessionResources,
-) -> agent_client_protocol::Result<()> {
+) -> Result<WriteTextFileResponse, agent_client_protocol::Error> {
     let enter_ns = enter_timestamp_ns();
     trace!(
         target: "acp.protocol.tool_dispatch",
@@ -9435,10 +9571,8 @@ async fn handle_write_text_file(
     })
     .await;
     let result = match write_outcome {
-        Ok(()) => responder.respond(WriteTextFileResponse::new()),
-        Err(e) => {
-            responder.respond_with_error(agent_client_protocol::util::internal_error(e.to_string()))
-        }
+        Ok(()) => Ok(WriteTextFileResponse::new()),
+        Err(e) => Err(agent_client_protocol::util::internal_error(e.to_string())),
     };
     trace!(
         target: "acp.protocol.tool_dispatch",
@@ -9452,9 +9586,8 @@ async fn handle_write_text_file(
 
 async fn handle_create_terminal(
     request: CreateTerminalRequest,
-    responder: Responder<CreateTerminalResponse>,
     res: SessionResources,
-) -> agent_client_protocol::Result<()> {
+) -> Result<CreateTerminalResponse, agent_client_protocol::Error> {
     let enter_ns = enter_timestamp_ns();
     trace!(
         target: "acp.protocol.tool_dispatch",
@@ -9467,7 +9600,7 @@ async fn handle_create_terminal(
     let cwd = request.cwd.clone().unwrap_or_else(|| res.cwd.clone());
     // Sandbox the cwd: must be inside session roots.
     if let Err(e) = res.fs_policy.resolve_inside(&cwd) {
-        let r = responder.respond_with_error(agent_client_protocol::util::internal_error(format!(
+        let r = Err(agent_client_protocol::util::internal_error(format!(
             "terminal cwd outside session roots: {e}"
         )));
         trace!(
@@ -9498,10 +9631,8 @@ async fn handle_create_terminal(
         )
         .await
     {
-        Ok(id) => responder.respond(CreateTerminalResponse::new(TerminalId::new(id))),
-        Err(e) => {
-            responder.respond_with_error(agent_client_protocol::util::internal_error(e.to_string()))
-        }
+        Ok(id) => Ok(CreateTerminalResponse::new(TerminalId::new(id))),
+        Err(e) => Err(agent_client_protocol::util::internal_error(e.to_string())),
     };
     trace!(
         target: "acp.protocol.tool_dispatch",
@@ -9523,9 +9654,8 @@ fn build_exit_status(
 
 async fn handle_terminal_output(
     request: TerminalOutputRequest,
-    responder: Responder<TerminalOutputResponse>,
     res: SessionResources,
-) -> agent_client_protocol::Result<()> {
+) -> Result<TerminalOutputResponse, agent_client_protocol::Error> {
     let enter_ns = enter_timestamp_ns();
     trace!(
         target: "acp.protocol.tool_dispatch",
@@ -9537,14 +9667,10 @@ async fn handle_terminal_output(
     let result = match res.terminals.output(request.terminal_id.0.as_ref()).await {
         Ok(out) => {
             let combined = format!("{}{}", out.stdout, out.stderr);
-            responder.respond(
-                TerminalOutputResponse::new(combined, false)
-                    .exit_status(build_exit_status(out.exit_code)),
-            )
+            Ok(TerminalOutputResponse::new(combined, false)
+                .exit_status(build_exit_status(out.exit_code)))
         }
-        Err(e) => {
-            responder.respond_with_error(agent_client_protocol::util::internal_error(e.to_string()))
-        }
+        Err(e) => Err(agent_client_protocol::util::internal_error(e.to_string())),
     };
     trace!(
         target: "acp.protocol.tool_dispatch",
@@ -9558,9 +9684,8 @@ async fn handle_terminal_output(
 
 async fn handle_wait_for_terminal_exit(
     request: WaitForTerminalExitRequest,
-    responder: Responder<WaitForTerminalExitResponse>,
     res: SessionResources,
-) -> agent_client_protocol::Result<()> {
+) -> Result<WaitForTerminalExitResponse, agent_client_protocol::Error> {
     let enter_ns = enter_timestamp_ns();
     trace!(
         target: "acp.protocol.tool_dispatch",
@@ -9573,12 +9698,10 @@ async fn handle_wait_for_terminal_exit(
     // the time `create_and_run` returns. So `output()` immediately yields
     // the captured exit status.
     let result = match res.terminals.output(request.terminal_id.0.as_ref()).await {
-        Ok(out) => responder.respond(WaitForTerminalExitResponse::new(build_exit_status(
+        Ok(out) => Ok(WaitForTerminalExitResponse::new(build_exit_status(
             out.exit_code,
         ))),
-        Err(e) => {
-            responder.respond_with_error(agent_client_protocol::util::internal_error(e.to_string()))
-        }
+        Err(e) => Err(agent_client_protocol::util::internal_error(e.to_string())),
     };
     trace!(
         target: "acp.protocol.tool_dispatch",
@@ -9592,9 +9715,8 @@ async fn handle_wait_for_terminal_exit(
 
 async fn handle_kill_terminal(
     request: KillTerminalRequest,
-    responder: Responder<KillTerminalResponse>,
     _res: SessionResources,
-) -> agent_client_protocol::Result<()> {
+) -> Result<KillTerminalResponse, agent_client_protocol::Error> {
     let enter_ns = enter_timestamp_ns();
     trace!(
         target: "acp.protocol.tool_dispatch",
@@ -9604,7 +9726,7 @@ async fn handle_kill_terminal(
         "ACP request handler entered"
     );
     // One-shot terminals are already finished; kill is a no-op.
-    let result = responder.respond(KillTerminalResponse::new());
+    let result = Ok(KillTerminalResponse::new());
     trace!(
         target: "acp.protocol.tool_dispatch",
         handler = "kill_terminal",
@@ -9617,9 +9739,8 @@ async fn handle_kill_terminal(
 
 async fn handle_release_terminal(
     request: ReleaseTerminalRequest,
-    responder: Responder<ReleaseTerminalResponse>,
     res: SessionResources,
-) -> agent_client_protocol::Result<()> {
+) -> Result<ReleaseTerminalResponse, agent_client_protocol::Error> {
     let enter_ns = enter_timestamp_ns();
     trace!(
         target: "acp.protocol.tool_dispatch",
@@ -9629,10 +9750,21 @@ async fn handle_release_terminal(
         "ACP request handler entered"
     );
     let result = match res.terminals.release(request.terminal_id.0.as_ref()).await {
-        Ok(()) => responder.respond(ReleaseTerminalResponse::new()),
-        Err(e) => {
-            responder.respond_with_error(agent_client_protocol::util::internal_error(e.to_string()))
+        Ok(()) => Ok(ReleaseTerminalResponse::new()),
+        // Releasing a terminal this session already released is success, not
+        // an error: #2977 replays a completed-but-undelivered result across a
+        // control reattach, so the agent can legitimately ask twice. Scoped
+        // to ids we know were released, so a genuinely bogus id still errors
+        // rather than being masked.
+        Err(super::terminal_handler::TerminalError::UnknownTerminal(_))
+            if res
+                .terminals
+                .was_released(request.terminal_id.0.as_ref())
+                .await =>
+        {
+            Ok(ReleaseTerminalResponse::new())
         }
+        Err(e) => Err(agent_client_protocol::util::internal_error(e.to_string())),
     };
     trace!(
         target: "acp.protocol.tool_dispatch",
@@ -9646,12 +9778,11 @@ async fn handle_release_terminal(
 
 async fn handle_permission_request(
     request: RequestPermissionRequest,
-    responder: Responder<RequestPermissionResponse>,
     event_tx: mpsc::Sender<Event>,
     pending: PendingResponders,
     profile: &'static agent_profiles::AgentProfile,
     tool_context_cache: ToolContextCache,
-) -> agent_client_protocol::Result<()> {
+) -> Result<RequestPermissionResponse, agent_client_protocol::Error> {
     let enter_ns = enter_timestamp_ns();
     let tool_call_id = request.tool_call.tool_call_id.0.to_string();
     trace!(
@@ -9737,14 +9868,14 @@ async fn handle_permission_request(
             outcome = "receiver_gone",
             "ACP request handler exited"
         );
-        return responder.respond(RequestPermissionResponse::new(
+        return Ok(RequestPermissionResponse::new(
             RequestPermissionOutcome::Cancelled,
         ));
     }
 
     // Issue #1147: this `await` is the suspected serializer for the user-felt
     // slowness. Log the moment we begin awaiting so a wall-clock comparison
-    // with later "responder.respond" emissions exposes how long each pending
+    // with later "responding to permission request" emissions exposes how
     // approval blocked the agent's turn.
     let await_enter_ns = enter_timestamp_ns();
     trace!(
@@ -9822,7 +9953,7 @@ async fn handle_permission_request(
         outcome = outcome_label,
         "responding to permission request"
     );
-    responder.respond(RequestPermissionResponse::new(outcome))
+    Ok(RequestPermissionResponse::new(outcome))
 }
 
 /// Handle an `elicitation/create` request (claude-agent-acp's
@@ -9834,10 +9965,9 @@ async fn handle_permission_request(
 /// response so the agent's turn never hangs.
 async fn handle_elicitation_request(
     request: CreateElicitationRequest,
-    responder: Responder<CreateElicitationResponse>,
     event_tx: mpsc::Sender<Event>,
     pending: PendingResponders,
-) -> agent_client_protocol::Result<()> {
+) -> Result<CreateElicitationResponse, agent_client_protocol::Error> {
     let nonce = Nonce::new();
     let elicitation = match parse_elicitation(nonce.clone(), &request, chrono::Utc::now()) {
         Ok(elicitation) => elicitation,
@@ -9849,7 +9979,7 @@ async fn handle_elicitation_request(
             // request could not be presented. Either way the turn does not
             // hang on a card we'll never show.
             warn!(target: "acp.protocol", "unsupported elicitation, cancelling: {e}");
-            return responder.respond(CreateElicitationResponse::new(ElicitationAction::Cancel));
+            return Ok(CreateElicitationResponse::new(ElicitationAction::Cancel));
         }
     };
 
@@ -9872,7 +10002,7 @@ async fn handle_elicitation_request(
         .is_err()
     {
         pending.lock().await.remove(&nonce);
-        return responder.respond(CreateElicitationResponse::new(ElicitationAction::Cancel));
+        return Ok(CreateElicitationResponse::new(ElicitationAction::Cancel));
     }
 
     // Await the user's answer. `resolve_elicitation` validates server-side
@@ -9899,7 +10029,7 @@ async fn handle_elicitation_request(
         })
         .await;
 
-    responder.respond(response)
+    Ok(response)
 }
 
 #[cfg(test)]
