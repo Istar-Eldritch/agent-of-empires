@@ -430,12 +430,11 @@ pub(crate) async fn spawn_structured_session(
             return Err(e);
         }
 
-        return Ok::<(Instance, Vec<String>, Option<String>), anyhow::Error>((
+        Ok::<(Instance, Vec<String>, Option<String>), anyhow::Error>((
             instance,
             build_warnings,
             agent_effort,
-        ));
-
+        ))
     })
     .await;
 

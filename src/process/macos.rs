@@ -262,56 +262,6 @@ fn parse_vm_stat_pages(vm_stat: &str, key: &str) -> Option<u64> {
     None
 }
 
-#[cfg(test)]
-mod memory_tests {
-    use super::*;
-
-    const VM_STAT: &str = "\
-Mach Virtual Memory Statistics: (page size of 16384 bytes)
-Pages free:                              123456.
-Pages active:                            654321.
-Pages inactive:                          200000.
-Pages speculative:                        10000.
-Pages wired down:                        300000.
-";
-
-    #[test]
-    fn test_parse_vm_stat_available() {
-        assert_eq!(parse_vm_stat_page_size(VM_STAT), Some(16384));
-        assert_eq!(parse_vm_stat_pages(VM_STAT, "Pages free"), Some(123456));
-        assert_eq!(parse_vm_stat_pages(VM_STAT, "Pages inactive"), Some(200000));
-        // available = (free + inactive) * page_size
-        assert_eq!(
-            parse_vm_stat_available(VM_STAT),
-            Some((123456 + 200000) * 16384)
-        );
-        assert_eq!(parse_vm_stat_pages(VM_STAT, "Pages nonexistent"), None);
-    }
-
-    #[test]
-    fn process_record_parses_stable_identity_and_cpu_time() {
-        let time_cases = [
-            ("03:04", Some(184.0)),
-            ("02:03:04", Some(7_384.0)),
-            ("1-02:03:04", Some(93_784.0)),
-            ("1-02:x:04", None),
-            ("1-02:03:bad", None),
-        ];
-        for (value, expected) in time_cases {
-            assert_eq!(parse_ps_time(value), expected, "CPU time {value}");
-        }
-
-        let line = "42 1 512 1-02:03:04 Thu Aug 13 12:34:56 2026";
-        let record = parse_process_record(line).unwrap();
-        assert_eq!(record.cpu_seconds, 93_784.0);
-        assert_ne!(record.start_id, 0);
-        assert_eq!(
-            record.start_id,
-            parse_process_record(line).unwrap().start_id
-        );
-    }
-}
-
 /// Per-boot identity from `kern.bootsessionuuid`: a UUID fixed for the boot's
 /// lifetime. Preferred over `kern.boottime`, which is recomputed as
 /// `now - uptime` and shifts on clock steps (NTP, sleep/wake), which would
@@ -437,5 +387,55 @@ impl super::SleepInhibit for CaffeinateInhibitor {
             &mut self.child,
             "caffeinate exited unexpectedly; OS sleep will not be inhibited on this host",
         )
+    }
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+
+    const VM_STAT: &str = "\
+Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                              123456.
+Pages active:                            654321.
+Pages inactive:                          200000.
+Pages speculative:                        10000.
+Pages wired down:                        300000.
+";
+
+    #[test]
+    fn test_parse_vm_stat_available() {
+        assert_eq!(parse_vm_stat_page_size(VM_STAT), Some(16384));
+        assert_eq!(parse_vm_stat_pages(VM_STAT, "Pages free"), Some(123456));
+        assert_eq!(parse_vm_stat_pages(VM_STAT, "Pages inactive"), Some(200000));
+        // available = (free + inactive) * page_size
+        assert_eq!(
+            parse_vm_stat_available(VM_STAT),
+            Some((123456 + 200000) * 16384)
+        );
+        assert_eq!(parse_vm_stat_pages(VM_STAT, "Pages nonexistent"), None);
+    }
+
+    #[test]
+    fn process_record_parses_stable_identity_and_cpu_time() {
+        let time_cases = [
+            ("03:04", Some(184.0)),
+            ("02:03:04", Some(7_384.0)),
+            ("1-02:03:04", Some(93_784.0)),
+            ("1-02:x:04", None),
+            ("1-02:03:bad", None),
+        ];
+        for (value, expected) in time_cases {
+            assert_eq!(parse_ps_time(value), expected, "CPU time {value}");
+        }
+
+        let line = "42 1 512 1-02:03:04 Thu Aug 13 12:34:56 2026";
+        let record = parse_process_record(line).unwrap();
+        assert_eq!(record.cpu_seconds, 93_784.0);
+        assert_ne!(record.start_id, 0);
+        assert_eq!(
+            record.start_id,
+            parse_process_record(line).unwrap().start_id
+        );
     }
 }

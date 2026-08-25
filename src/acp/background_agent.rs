@@ -624,7 +624,7 @@ mod tests {
         let line =
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"}]}}"#;
         // First write ends mid-line (no trailing newline): nothing folds yet.
-        tokio::fs::write(&path, format!("{line}")).await.unwrap();
+        tokio::fs::write(&path, line.to_string()).await.unwrap();
         let mut offset = 0u64;
         let mut buf = String::new();
         let mut snap = Snapshot::default();
@@ -742,7 +742,14 @@ mod tests {
     #[test]
     fn infer_idle_outcome_distinguishes_finished_from_hung() {
         // (lines, expected status, expected result, warning substring, case)
-        let cases: Vec<(Vec<&str>, BackgroundAgentStatus, Option<&str>, &str, &str)> = vec![
+        type Case<'a> = (
+            Vec<&'a str>,
+            BackgroundAgentStatus,
+            Option<&'a str>,
+            &'a str,
+            &'a str,
+        );
+        let cases: Vec<Case<'_>> = vec![
             (
                 vec![
                     r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash"}]}}"#,

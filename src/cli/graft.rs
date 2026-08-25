@@ -47,8 +47,7 @@ pub fn plugin_commands() -> Vec<PluginCommand> {
 /// so no extra cost is added to the fast parse path.
 pub fn augmented_command() -> Command {
     let cmd = graft_onto(Cli::command(), plugin_commands());
-    let cmd = hide_disabled_serve(cmd, web_disabled());
-    cmd
+    hide_disabled_serve(cmd, web_disabled())
 }
 
 /// True when the builtin `aoe.web` plugin is present and disabled.
