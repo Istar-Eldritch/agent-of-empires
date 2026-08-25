@@ -2093,7 +2093,9 @@ mod tests {
     #[test]
     fn parse_request_value_id_covers_id_shapes_and_non_requests() {
         let j = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
-        let cases: Vec<(&[u8], Option<(serde_json::Value, String)>)> = vec![
+        /// `(line, expected (id, method))`.
+        type Case = (&'static [u8], Option<(serde_json::Value, String)>);
+        let cases: Vec<Case> = vec![
             // Numeric id: the common shape.
             (
                 br#"{"jsonrpc":"2.0","id":7,"method":"fs/read_text_file","params":{}}"#,

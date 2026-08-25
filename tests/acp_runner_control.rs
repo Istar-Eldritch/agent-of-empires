@@ -88,8 +88,17 @@ fn read_frame(stream: &mut UnixStream) -> serde_json::Value {
     serde_json::from_slice(&body).expect("parse frame json")
 }
 
+/// The Phase C (#2977) core loop over real sockets and real framing: an
+/// agent-issued request reaches the daemon as a `ServerCall`, and the
+/// daemon's `ServerResult` reaches the agent as a JSON-RPC response echoing
+/// the agent's own id.
+///
+/// The stand-in agent is `/bin/cat`, so whatever the runner writes to its
+/// stdin comes back on its stdout. That is enough to drive both directions:
+/// the test writes an agent-to-client request into the runner (by having the
+/// runner send it to cat), and reads back the response the runner wrote.
 #[test]
-fn runner_reports_native_prompt_complete_over_control_socket() {
+fn runner_proxies_agent_requests_over_the_control_channel() {
     if cfg!(not(unix)) {
         return;
     }
@@ -129,50 +138,102 @@ fn runner_reports_native_prompt_complete_over_control_socket() {
         .spawn()
         .expect("spawn acp runner");
 
-    // The runner binds the control socket before the main relay socket, so
-    // both exist once the record is written.
     wait_for(&record, "registry record");
     wait_for(&control, "control socket");
-    wait_for(&socket, "relay socket");
+    // #2977: the relay socket is retired, so the runner must NOT create it.
+    assert!(
+        !socket.exists(),
+        "a v3 runner must not bind the retired byte relay at {}",
+        socket.display()
+    );
 
-    // Attach the control channel and read the runner's Hello greeting.
     let mut ctl = UnixStream::connect(&control).expect("connect control socket");
     ctl.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let hello = read_frame(&mut ctl);
     assert_eq!(hello["kind"], "hello", "first control frame is Hello");
     assert_eq!(hello["session_id"], session_id);
+    assert_eq!(hello["control_protocol_version"], 3);
 
-    // Reading Hello proves the runner has started installing the control
-    // outbound, but the write half is stored just after Hello is sent, so
-    // this short wait lets that store land before we drive the prompt,
-    // exercising the live-write path rather than the buffered path. This is
-    // an ordering wait, not the closed emit/install TOCTOU race.
-    std::thread::sleep(Duration::from_millis(150));
+    write_frame(
+        &mut ctl,
+        &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
+    );
+    // Release the runner's backlog, as the daemon does once it can serve.
+    write_frame(&mut ctl, &serde_json::json!({"kind": "ready"}));
 
-    // Act as the daemon on the relay socket: issue a session/prompt request
-    // (records the id), then a matching response (cat echoes it back on the
-    // agent-to-daemon path, where the runner detects turn completion).
-    let mut relay = UnixStream::connect(&socket).expect("connect relay socket");
-    relay
-        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"session/prompt\",\"params\":{}}\n")
-        .unwrap();
-    relay
-        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"stopReason\":\"end_turn\"}}\n")
-        .unwrap();
-    relay.flush().unwrap();
+    // Drive an agent-to-client request through cat. `session/set_mode` is a
+    // forward-lane call, so the runner writes it to the agent; cat echoes it
+    // back, and the echo is indistinguishable from the agent issuing that
+    // request itself. A string id proves the runner round-trips the id as
+    // the JSON value it arrived as rather than a rendering of it.
+    write_frame(
+        &mut ctl,
+        &serde_json::json!({
+            "kind": "agent_call",
+            "call_id": 1,
+            "method": "fs/read_text_file",
+            "params": {"path": "/tmp/x"},
+        }),
+    );
 
-    // The runner surfaces a native turn-complete for prompt id 5. The relay
-    // echoes the two request/response lines first, but those flow on the
-    // relay socket, not the control socket, so the next control frame is the
-    // PromptCompleted.
-    let completed = read_frame(&mut ctl);
-    assert_eq!(completed["kind"], "prompt_completed");
-    assert_eq!(completed["prompt_req_id"], 5);
-    assert_eq!(completed["outcome"]["status"], "completed");
-    assert_eq!(completed["outcome"]["stop_reason"], "end_turn");
+    // cat echoes the runner's own request back, so the runner sees a request
+    // (id + method) on the agent-to-daemon path and forwards it as a
+    // ServerCall.
+    let call = read_frame(&mut ctl);
+    assert_eq!(call["kind"], "server_call", "got {call}");
+    assert_eq!(call["method"], "fs/read_text_file");
+    assert_eq!(call["params"]["path"], "/tmp/x");
+    let call_id = call["call_id"].as_u64().expect("call_id");
+
+    // Answer it. The runner must write a JSON-RPC response to the agent
+    // echoing the agent's own id, which cat echoes back to the runner, which
+    // has no waiter for it and drops it. Nothing more should arrive on the
+    // control channel.
+    write_frame(
+        &mut ctl,
+        &serde_json::json!({
+            "kind": "server_result",
+            "call_id": call_id,
+            "result": {"content": "hello"},
+        }),
+    );
+
+    // A second answer for the same call must be dropped, not written again.
+    write_frame(
+        &mut ctl,
+        &serde_json::json!({
+            "kind": "server_result",
+            "call_id": call_id,
+            "result": {"content": "duplicate"},
+        }),
+    );
+
+    // The runner answered the echoed request, so cat echoes that response
+    // back; it carries an id the runner allocated for the forward call, so it
+    // resolves call_id 1. That is the next (and only) control frame.
+    let result = read_frame(&mut ctl);
+    assert_eq!(result["kind"], "agent_result", "got {result}");
+    assert_eq!(result["call_id"], 1);
 
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// Read control frames until one is not a `notify`.
+///
+/// Since #2977 the control channel carries the agent's whole event stream
+/// alongside the typed frames, in agent-stdout order. An adapter that emits
+/// `session/update` while answering a handshake step (history replay on
+/// `session/load`, for instance) therefore puts those notifications ahead of
+/// the reply, which is the ordering guarantee working as intended. Tests that
+/// want the typed frame skip past them.
+fn read_typed_frame(stream: &mut UnixStream) -> serde_json::Value {
+    loop {
+        let frame = read_frame(stream);
+        if frame["kind"] != "notify" {
+            return frame;
+        }
+    }
 }
 
 /// Write a length-prefixed control frame (4-byte big-endian length, then
@@ -293,7 +354,7 @@ for line in sys.stdin:
     wait_for(&record, "registry record");
     wait_for(&control, "control socket");
 
-    let v2 = serde_json::json!(2);
+    let v3 = serde_json::json!(3);
 
     // --- First attach: the runner runs the handshake against the agent. ---
     {
@@ -301,17 +362,21 @@ for line in sys.stdin:
         ctl.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         let hello = read_frame(&mut ctl);
         assert_eq!(hello["kind"], "hello");
-        assert_eq!(hello["control_protocol_version"], v2);
+        assert_eq!(hello["control_protocol_version"], v3);
 
         write_frame(
             &mut ctl,
-            &serde_json::json!({"kind": "attach", "control_protocol_version": 2}),
+            &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
         );
+        // #2977: the runner holds its outbound queue until the daemon says
+        // it is ready to receive, so a real daemon's attach-time rehydration
+        // cannot race a flushed frame.
+        write_frame(&mut ctl, &serde_json::json!({"kind": "ready"}));
         write_frame(
             &mut ctl,
             &serde_json::json!({"kind": "initialize", "request": {"protocolVersion": 1}}),
         );
-        let initialized = read_frame(&mut ctl);
+        let initialized = read_typed_frame(&mut ctl);
         assert_eq!(initialized["kind"], "initialized");
         assert!(initialized["result"].is_object());
 
@@ -319,7 +384,7 @@ for line in sys.stdin:
             &mut ctl,
             &serde_json::json!({"kind": "establish_session", "method": "session/new", "request": {"cwd": home.to_str().unwrap()}}),
         );
-        let ready = read_frame(&mut ctl);
+        let ready = read_typed_frame(&mut ctl);
         assert_eq!(ready["kind"], "session_ready");
         assert_eq!(ready["acp_session_id"], "sess-fake-1");
 
@@ -327,7 +392,7 @@ for line in sys.stdin:
             &mut ctl,
             &serde_json::json!({"kind": "prompt", "request": {"sessionId": "sess-fake-1", "prompt": []}}),
         );
-        let completed = read_frame(&mut ctl);
+        let completed = read_typed_frame(&mut ctl);
         assert_eq!(completed["kind"], "prompt_completed");
         assert_eq!(completed["outcome"]["status"], "completed");
         assert_eq!(completed["outcome"]["stop_reason"], "end_turn");
@@ -342,20 +407,24 @@ for line in sys.stdin:
 
         write_frame(
             &mut ctl,
-            &serde_json::json!({"kind": "attach", "control_protocol_version": 2}),
+            &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
         );
+        // #2977: the runner holds its outbound queue until the daemon says
+        // it is ready to receive, so a real daemon's attach-time rehydration
+        // cannot race a flushed frame.
+        write_frame(&mut ctl, &serde_json::json!({"kind": "ready"}));
         write_frame(
             &mut ctl,
             &serde_json::json!({"kind": "initialize", "request": {"protocolVersion": 1}}),
         );
-        let initialized = read_frame(&mut ctl);
+        let initialized = read_typed_frame(&mut ctl);
         assert_eq!(initialized["kind"], "initialized");
 
         write_frame(
             &mut ctl,
             &serde_json::json!({"kind": "establish_session", "method": "session/new", "request": {}}),
         );
-        let ready = read_frame(&mut ctl);
+        let ready = read_typed_frame(&mut ctl);
         assert_eq!(ready["kind"], "session_ready");
         assert_eq!(ready["acp_session_id"], "sess-fake-1");
     }
@@ -445,8 +514,12 @@ fn runner_load_uses_requested_id_and_caches_response() {
         assert_eq!(read_frame(&mut ctl)["kind"], "hello");
         write_frame(
             &mut ctl,
-            &serde_json::json!({"kind": "attach", "control_protocol_version": 2}),
+            &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
         );
+        // #2977: the runner holds its outbound queue until the daemon says
+        // it is ready to receive, so a real daemon's attach-time rehydration
+        // cannot race a flushed frame.
+        write_frame(&mut ctl, &serde_json::json!({"kind": "ready"}));
         write_frame(
             &mut ctl,
             &serde_json::json!({
@@ -456,7 +529,7 @@ fn runner_load_uses_requested_id_and_caches_response() {
             }),
         );
 
-        let ready = read_frame(&mut ctl);
+        let ready = read_typed_frame(&mut ctl);
         assert_eq!(ready["kind"], "session_ready", "load must succeed: {ready}");
         assert_eq!(ready["acp_session_id"], "existing-session");
         assert!(ready["result"].get("sessionId").is_none());
@@ -472,8 +545,12 @@ fn runner_load_uses_requested_id_and_caches_response() {
         assert_eq!(read_frame(&mut ctl)["kind"], "hello");
         write_frame(
             &mut ctl,
-            &serde_json::json!({"kind": "attach", "control_protocol_version": 2}),
+            &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
         );
+        // #2977: the runner holds its outbound queue until the daemon says
+        // it is ready to receive, so a real daemon's attach-time rehydration
+        // cannot race a flushed frame.
+        write_frame(&mut ctl, &serde_json::json!({"kind": "ready"}));
         write_frame(
             &mut ctl,
             &serde_json::json!({
@@ -482,7 +559,7 @@ fn runner_load_uses_requested_id_and_caches_response() {
                 "request": {"sessionId": "existing-session", "cwd": home.to_str().unwrap()}
             }),
         );
-        let ready = read_frame(&mut ctl);
+        let ready = read_typed_frame(&mut ctl);
         assert_eq!(ready["kind"], "session_ready");
         assert_eq!(ready["acp_session_id"], "existing-session");
         assert!(ready["result"].get("sessionId").is_none());
@@ -611,20 +688,22 @@ for line in sys.stdin:
 
     write_frame(
         &mut ctl,
-        &serde_json::json!({"kind": "attach", "control_protocol_version": 2}),
+        &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
     );
+    // #2977: release the runner's outbound queue.
+    write_frame(&mut ctl, &serde_json::json!({"kind": "ready"}));
     write_frame(
         &mut ctl,
         &serde_json::json!({"kind": "initialize", "request": {"protocolVersion": 1}}),
     );
-    let initialized = read_frame(&mut ctl);
+    let initialized = read_typed_frame(&mut ctl);
     assert_eq!(initialized["kind"], "initialized");
 
     write_frame(
         &mut ctl,
         &serde_json::json!({"kind": "establish_session", "method": "session/new", "request": {}}),
     );
-    let failed = read_frame(&mut ctl);
+    let failed = read_typed_frame(&mut ctl);
     assert_eq!(failed["kind"], "handshake_failed");
     // The remediation detail survives the control channel intact.
     assert_eq!(

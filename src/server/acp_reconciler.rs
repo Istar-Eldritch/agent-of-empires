@@ -1860,7 +1860,6 @@ pub(crate) async fn trigger_resume_background(
     service: &Arc<SessionService>,
     id: &str,
 ) -> Result<ResumeTrigger, crate::acp::supervisor::SupervisorError> {
-    use crate::acp::supervisor::RespawnReason;
     use crate::acp::supervisor::{ResumeKind, ResumeReservationOutcome};
     let reservation = match service
         .acp_supervisor
