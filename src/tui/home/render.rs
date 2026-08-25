@@ -845,7 +845,6 @@ impl HomeView {
         }
 
         // Serve view takes over the whole screen
-        #[cfg(feature = "serve")]
         if let Some(ref serve) = self.serve_view {
             self.divider_col = None;
             self.main_area_width = 0;
@@ -1473,10 +1472,7 @@ impl HomeView {
     }
 
     fn has_overlay_above_search(&self) -> bool {
-        #[cfg(feature = "serve")]
         let serve_open = self.serve_view.is_some();
-        #[cfg(not(feature = "serve"))]
-        let serve_open = false;
 
         self.show_help
             || self.new_dialog.is_some()
@@ -2624,10 +2620,7 @@ impl HomeView {
             // transcript scrolls inside the embedded view); the generic
             // indicator below reads the tmux capture cache and home's
             // wheel offset, both of which are stale or empty for it.
-            #[cfg(feature = "serve")]
             let structured_mounted = self.structured_preview.is_some();
-            #[cfg(not(feature = "serve"))]
-            let structured_mounted = false;
             let scroll_indicator = if !self.show_preview_info && !structured_mounted {
                 let inner_height = area.height.saturating_sub(2);
                 let visible_height = inner_height as usize;
@@ -2763,7 +2756,6 @@ impl HomeView {
             // content: info header on top (same `i` toggle and layout as
             // the terminal previews), the streaming transcript below, and
             // the drag-select machinery pointed at the painted rows.
-            #[cfg(feature = "serve")]
             {
                 let selected_id = self.selected_session.clone();
                 let mounted_matches = self
@@ -3734,7 +3726,6 @@ impl HomeView {
         // The TUI does not own the daemon, so we probe the PID file each
         // render. Mode comes from a PID-keyed cache so we don't read the
         // serve.mode file from disk on every frame.
-        #[cfg(feature = "serve")]
         {
             let mode_label = crate::cli::serve::cached_serve_mode_label();
             if crate::cli::serve::daemon_pid().is_some() {

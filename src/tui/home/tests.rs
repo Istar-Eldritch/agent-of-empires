@@ -1662,7 +1662,6 @@ fn test_enter_on_session_returns_attach_action() {
     assert!(matches!(action, Some(Action::AttachSession(_))));
 }
 
-#[cfg(feature = "serve")]
 #[test]
 #[serial]
 fn test_enter_on_acp_session_opens_structured_view() {
@@ -4941,7 +4940,6 @@ fn test_strict_mode_ctrl_d_r_p_reach_secondary_actions() {
         "Ctrl+R in strict mode must NOT open the rename dialog (it targets serve)"
     );
     env.view.info_dialog = None;
-    #[cfg(feature = "serve")]
     {
         env.view.serve_view = None;
     }
@@ -6661,7 +6659,6 @@ fn fork_from_selection_preselects_parent_tool() {
 /// A structured (ACP) parent forks via the ACP `session/fork` handshake, so the
 /// seed must be `Structured` carrying the parent's captured ACP session id, not
 /// a terminal resume-with-fork-flag seed.
-#[cfg(feature = "serve")]
 #[test]
 #[serial]
 fn fork_from_selection_structured_parent_seeds_structured_fork() {
@@ -6694,7 +6691,6 @@ fn fork_from_selection_structured_parent_seeds_structured_fork() {
 
 /// A structured parent with no captured ACP session id yet has no conversation
 /// to fork; the dialog must not open and an explanatory info dialog is shown.
-#[cfg(feature = "serve")]
 #[test]
 #[serial]
 fn fork_from_selection_structured_parent_without_acp_id_denies() {
@@ -6726,7 +6722,6 @@ fn fork_from_selection_structured_parent_without_acp_id_denies() {
 /// the fork would silently downgrade to session/new at the handshake. This is
 /// the exact silent-downgrade the reviewer flagged; the gate mirrors the REST
 /// create guard and the web `acp_can_fork` projection.
-#[cfg(feature = "serve")]
 #[test]
 #[serial]
 fn fork_from_selection_structured_unforkable_agent_denies() {
@@ -8077,7 +8072,6 @@ fn wants_text_selection_tracks_copy_friendly_surfaces() {
 
     // serve_view is feature-gated; only assert it when the feature is on,
     // since the field isn't present otherwise.
-    #[cfg(feature = "serve")]
     {
         use crate::tui::dialogs::ServeView;
         env.view.serve_view = Some(ServeView::new());
@@ -15112,7 +15106,6 @@ mod click_to_select {
 
     /// Acp-mode sessions are not tmux-backed, so click cannot
     /// enter live mode for them; selection still updates.
-    #[cfg(feature = "serve")]
     #[test]
     #[serial]
     fn single_click_on_acp_session_returns_no_action() {
@@ -16619,7 +16612,6 @@ mod live_send_mode {
     /// it, `is_structured()` is hard-coded to false and the gate is
     /// a no-op, so there's nothing meaningful to verify in the default
     /// build.
-    #[cfg(feature = "serve")]
     #[test]
     #[serial]
     fn tab_does_not_start_live_send_for_acp_session() {
@@ -17108,7 +17100,6 @@ mod post_create_attach_mode {
         assert!(mode.is_none());
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     #[serial]
     fn returns_none_for_acp_session() {
@@ -17612,7 +17603,6 @@ mod default_attach_mode {
     /// `OpenStructuredView`/transient-status before we get to the view-mode
     /// match), so the resolver also returns None for them; the setting
     /// must not be able to misroute a structured view row into live mode.
-    #[cfg(feature = "serve")]
     #[test]
     #[serial]
     fn acp_session_ignores_default_attach_mode() {
@@ -17693,7 +17683,6 @@ mod default_attach_mode {
     /// a structured row, structured for a terminal row whose tool is
     /// ACP-capable (only when the structured-view opt-in is on), and nothing
     /// for rows mid-lifecycle.
-    #[cfg(feature = "serve")]
     #[test]
     #[serial]
     fn switch_view_target_gates_by_view_and_state() {
@@ -17720,7 +17709,6 @@ mod default_attach_mode {
     /// `offer_structured_in_new_session` opt-in, so with it off an ACP-capable
     /// terminal row offers no switch. A structured row can always switch back
     /// to terminal regardless, so a session is never stranded.
-    #[cfg(feature = "serve")]
     #[test]
     #[serial]
     fn switch_view_target_gated_on_structured_opt_in() {
@@ -17741,7 +17729,6 @@ mod default_attach_mode {
 
     /// Accepting the switch-view confirm emits the action with the stashed
     /// session id, mirroring the other confirm-carrying actions.
-    #[cfg(feature = "serve")]
     #[test]
     #[serial]
     fn switch_view_confirm_dispatches_action_with_stashed_id() {
@@ -20367,7 +20354,6 @@ mod settings_scroll_wiring {
 /// `apply_acp_overlay_inplace`). Before this wiring existed the pill sat frozen
 /// at whatever creation or an explicit start/stop wrote, for the whole life of
 /// the session.
-#[cfg(feature = "serve")]
 mod daemon_status_apply_tests {
     use super::*;
     use crate::session::Status;

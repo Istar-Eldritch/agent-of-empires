@@ -3,9 +3,7 @@
 //! Provides an embedded axum web server that serves a responsive dashboard
 //! for monitoring and interacting with agent sessions from any browser.
 
-#[cfg(feature = "serve")]
 pub mod acp_reconciler;
-#[cfg(feature = "serve")]
 pub mod acp_ws;
 pub mod api;
 pub(crate) mod attach_project;
@@ -34,14 +32,12 @@ use tracing::{info, Instrument};
 
 use self::push::{PushState, StatusChange, STATUS_CHANNEL_CAPACITY};
 
-#[cfg(feature = "serve")]
 const ACP_CHANNEL_CAPACITY: usize = 256;
 
 /// Re-export of the broadcast frame defined in `crate::acp::protocol`,
 /// kept under `crate::server::` so existing supervisor/WS call sites keep
 /// resolving without churn. The canonical definition lives in protocol.rs
 /// so the daemon and any client share a single source of truth.
-#[cfg(feature = "serve")]
 pub use crate::acp::protocol::AcpBroadcastFrame;
 
 use crate::file_watch::{FileMatcher, FileWatchService, SubscriptionHandle, WatchSpec};
@@ -454,7 +450,6 @@ pub struct AppState {
     /// channel carries `(session_id, serialized event JSON)` frames so
     /// clients can filter by session. Empty when no clients are
     /// connected; senders never need to check before emitting.
-    #[cfg(feature = "serve")]
     pub acp_events_tx: broadcast::Sender<AcpBroadcastFrame>,
     /// Disk-backed acp event log. The single source of truth for
     /// replay: `ChannelSink::publish` writes here on every event, the
@@ -462,20 +457,16 @@ pub struct AppState {
     /// endpoint reads from here, and `Supervisor::next_seqs` is seeded
     /// from here at startup so a fresh publish gets `max_seq + 1`
     /// rather than 1.
-    #[cfg(feature = "serve")]
     pub acp_event_store: Arc<crate::acp::event_store::EventStore>,
     /// Live control-state projection per session, folded at the publish choke
     /// point and shared with `ChannelSink`. Prompt dispatch reads it instead
     /// of replaying the log on every POST; see `crate::acp::control_cache`.
-    #[cfg(feature = "serve")]
     pub acp_control_cache: Arc<crate::acp::control_cache::ControlStateCache>,
     /// Owns the per-session ACP agent subprocesses.
-    #[cfg(feature = "serve")]
     pub acp_supervisor:
         Arc<crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>>,
     /// The Tier 1 plugin worker host. `None` in test harnesses that do not
     /// stand up a host; `Some` in a live daemon.
-    #[cfg(feature = "serve")]
     pub plugin_host: Option<Arc<crate::plugin::host::PluginHost>>,
     /// Tracks in-flight web plugin install / update / uninstall jobs so the
     /// dashboard can tail their host-side log. In-memory; see
@@ -862,9 +853,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         None
     };
 
-    #[cfg(feature = "serve")]
     let acp_events_tx = broadcast::channel(ACP_CHANNEL_CAPACITY).0;
-    #[cfg(feature = "serve")]
     let acp_event_store = {
         let app_dir = crate::session::get_app_dir().context("acp event store: resolve app dir")?;
         let db_path = app_dir.join("acp_events.db");
@@ -873,9 +862,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
                 .context("acp event store: open")?,
         )
     };
-    #[cfg(feature = "serve")]
     let acp_control_cache = Arc::new(crate::acp::control_cache::ControlStateCache::new());
-    #[cfg(feature = "serve")]
     let acp_supervisor = {
         // Approval pushes are dispatched from `acp_event_listener`,
         // which subscribes to the broadcast that ChannelSink::publish
@@ -908,7 +895,6 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     let idempotency_locks = Arc::new(RwLock::new(std::collections::HashMap::new()));
     let telemetry_session_creates = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let mutation_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    #[cfg(feature = "serve")]
     let session_service = Arc::new(session_service::SessionService::new(
         Arc::clone(&instances),
         Arc::clone(&instance_locks),
@@ -918,19 +904,10 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         acp_supervisor.clone(),
         acp_event_store.clone(),
     ));
-    #[cfg(not(feature = "serve"))]
-    let session_service = Arc::new(session_service::SessionService::new(
-        Arc::clone(&instances),
-        Arc::clone(&instance_locks),
-        Arc::clone(&file_watch),
-        Arc::clone(&telemetry_session_creates),
-        Arc::clone(&mutation_epoch),
-    ));
 
     // the daemon serves fine without plugin workers.
     // The host API includes mutating session.meta.set/cas, so a read-only
     // daemon must not run plugin workers at all: gate the host on !read_only.
-    #[cfg(feature = "serve")]
     let plugin_host = if read_only {
         tracing::info!(target: "plugin.host", "plugin host disabled in read-only serve mode");
         None
@@ -1233,15 +1210,10 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         remote_owner_cache: RwLock::new(std::collections::HashMap::new()),
         changed_files_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
         status_tx: broadcast::channel(STATUS_CHANNEL_CAPACITY).0,
-        #[cfg(feature = "serve")]
         acp_events_tx: acp_events_tx.clone(),
-        #[cfg(feature = "serve")]
         acp_event_store: acp_event_store.clone(),
-        #[cfg(feature = "serve")]
         acp_control_cache: acp_control_cache.clone(),
-        #[cfg(feature = "serve")]
         acp_supervisor: acp_supervisor.clone(),
-        #[cfg(feature = "serve")]
         plugin_host: plugin_host.clone(),
         plugin_jobs: Arc::new(api::plugins::PluginJobRegistry::new()),
         push: push_state,
@@ -1469,7 +1441,6 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // Launch plugin workers for every active plugin that declares a runtime.
     // Non-blocking: each worker runs in its own supervised task. A daemon with
     // no community plugin workers (the common case) does nothing here.
-    #[cfg(feature = "serve")]
     if let Some(host) = state.plugin_host.clone() {
         host.start(&crate::plugin::registry()).await;
     }
@@ -1640,7 +1611,6 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         shutdown_state.shutdown.cancel();
         // Reap plugin workers before the force-exit deadline so no worker tree
         // is left behind when the daemon stops.
-        #[cfg(feature = "serve")]
         if let Some(host) = shutdown_state.plugin_host.clone() {
             host.shutdown().await;
         }
@@ -1968,7 +1938,6 @@ fn build_router(state: Arc<AppState>) -> Router {
             get(live_ws::live_container_terminal_ws),
         );
 
-    #[cfg(feature = "serve")]
     let app = app
         .route("/sessions/{id}/acp/ws", get(acp_ws::acp_ws))
         .route("/api/sessions/{id}/acp/spawn", post(api::spawn_acp))
@@ -2508,7 +2477,6 @@ async fn access_policy(
 /// the handlers keep their `cityhall_block*` calls as defense in depth. Reads
 /// (GET/HEAD) pass the gate; the few sensitive ones keep their per-handler
 /// guard. See #7.
-#[cfg(feature = "serve")]
 const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
     // Session creation (server-derived) + lifecycle / metadata on the structured
     // sessions this mode owns; each handler re-checks the target is structured.
@@ -2647,7 +2615,6 @@ const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
 /// for: it covers every module prefix and method uniformly (an unmatched or
 /// unlisted mutating route fails closed), so a handler can no longer silently
 /// reopen a hole by omission. See #7.
-#[cfg(feature = "serve")]
 async fn cityhall_gate(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     request: axum::extract::Request,
@@ -3346,7 +3313,7 @@ impl PriorById {
 pub(crate) async fn reload_state_instances_from_disk(
     state: &Arc<AppState>,
     fresh: Vec<Instance>,
-    #[cfg(feature = "serve")] live_worker_records: Vec<LiveStructuredWorkerRecord>,
+    live_worker_records: Vec<LiveStructuredWorkerRecord>,
     status_source: StatusSource,
     read_epoch: u64,
 ) {
@@ -3429,16 +3396,13 @@ pub(crate) async fn reload_state_instances_from_disk(
         merged.push(row);
     }
 
-    #[cfg(feature = "serve")]
     let repairs = repair_structured_rows_from_live_workers(&mut merged, live_worker_records);
 
-    #[cfg(feature = "serve")]
     apply_acp_overlay_inplace(&prior_by_id, &mut merged);
 
     *current = merged;
     drop(current);
 
-    #[cfg(feature = "serve")]
     persist_structured_row_repairs(state, repairs);
 }
 
@@ -3462,7 +3426,6 @@ pub(crate) async fn reload_state_instances_from_disk(
 /// event handlers are responsible for any post-restart re-emission that
 /// updates these fields for structured sessions; the passive-status
 /// writer at `status_poll_loop` deliberately does not.
-#[cfg(feature = "serve")]
 fn apply_acp_overlay_inplace(prior_by_id: &PriorById, merged: &mut [Instance]) {
     for inst in merged.iter_mut() {
         if !inst.is_structured() {
@@ -3477,7 +3440,6 @@ fn apply_acp_overlay_inplace(prior_by_id: &PriorById, merged: &mut [Instance]) {
     }
 }
 
-#[cfg(feature = "serve")]
 struct StructuredRowRepair {
     session_id: String,
     source_profile: String,
@@ -3486,10 +3448,8 @@ struct StructuredRowRepair {
     acp_session_id: String,
 }
 
-#[cfg(feature = "serve")]
 type LiveStructuredWorkerRecord = (crate::process::worker_registry::WorkerRecord, String);
 
-#[cfg(feature = "serve")]
 fn live_structured_worker_records() -> Vec<LiveStructuredWorkerRecord> {
     use crate::process::worker_registry::{self, is_record_live};
 
@@ -3520,7 +3480,6 @@ fn live_structured_worker_records() -> Vec<LiveStructuredWorkerRecord> {
 
 /// Runs before the ACP overlay so freshly repaired rows pass the
 /// `is_structured()` gate and keep their live worker status.
-#[cfg(feature = "serve")]
 fn repair_structured_rows_from_live_workers(
     merged: &mut [Instance],
     records: Vec<LiveStructuredWorkerRecord>,
@@ -3574,7 +3533,6 @@ fn repair_structured_rows_from_live_workers(
     repairs
 }
 
-#[cfg(feature = "serve")]
 fn persist_structured_row_repairs(state: &Arc<AppState>, repairs: Vec<StructuredRowRepair>) {
     if repairs.is_empty() {
         return;
@@ -3648,7 +3606,6 @@ fn persist_structured_row_repairs(state: &Arc<AppState>, repairs: Vec<Structured
     );
 }
 
-#[cfg(feature = "serve")]
 async fn rollback_structured_row_repairs(state: &Arc<AppState>, failed_ids: &[String]) {
     let mut instances = state.instances.write().await;
     for inst in instances.iter_mut() {
@@ -4465,7 +4422,6 @@ async fn flush_passive_transition_writes(
 /// is guaranteed even on a tick whose scrape fails, and entries for a session
 /// that is merely paused (archived / snoozed / idle-dormant) are not needed to
 /// be re-derived here.
-#[cfg(feature = "serve")]
 fn gc_reconciler_session_maps(
     live_ids: &std::collections::HashSet<&str>,
     attempted: &mut std::collections::HashSet<String>,
@@ -4491,34 +4447,26 @@ async fn status_poll_loop(state: Arc<AppState>) {
     // queued ticks and collapse the 2s cooldown the per-tick work expects.
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    #[cfg(feature = "serve")]
     let mut attempted_acp_spawns: std::collections::HashSet<String> =
         std::collections::HashSet::new();
-    #[cfg(feature = "serve")]
     let mut acp_reap_cadence = acp_reconciler::ReapCadence::default();
-    #[cfg(feature = "serve")]
     let mut last_session_idle_reap: Option<std::time::Instant> = None;
     // Loop-local, single-owner sleep-inhibit assertion (single global toggle,
     // so one slot for the whole daemon). Kept off `AppState`, which is for
     // cross-task shared state; this is owned solely by the poll loop, like
     // `last_session_idle_reap`.
-    #[cfg(feature = "serve")]
     let mut sleep_inhibitor: Option<Box<dyn crate::process::SleepInhibit>> = None;
-    #[cfg(feature = "serve")]
     let mut last_sleep_inhibit_reconcile: Option<std::time::Instant> = None;
     // Per-session reconciler respawn budget + crash-loop park set (#1945).
     // Owned by the loop so they persist across ticks, swept against live
     // sessions inside the reconciler.
-    #[cfg(feature = "serve")]
     let mut acp_respawn_history: std::collections::HashMap<String, Vec<std::time::Instant>> =
         std::collections::HashMap::new();
-    #[cfg(feature = "serve")]
     let mut acp_parked: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Per-session capacity-deferred marker (#1027). A structured session
     // refused by `CapacityFull` is re-armed for retry every tick; this set
     // gates the capacity banner to publish once per transition and is cleared
     // once the session's worker comes online or leaves the live set.
-    #[cfg(feature = "serve")]
     let mut acp_capacity_deferred: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     loop {
@@ -4534,7 +4482,6 @@ async fn status_poll_loop(state: Arc<AppState>) {
         // long-uptime daemon's footprint stays bounded by live-session count,
         // not by lifetime-observed sessions (#2758). Above the scrape guard so
         // the sweep still runs on a tick whose tmux scrape fails.
-        #[cfg(feature = "serve")]
         {
             let live_ids: std::collections::HashSet<&str> =
                 prev.keys().map(String::as_str).collect();
@@ -4675,7 +4622,6 @@ async fn status_poll_loop(state: Arc<AppState>) {
 
             drain_session_id_updates_in_state(&state).await;
 
-            #[cfg(feature = "serve")]
             acp_reconciler::reconcile_acp_workers(
                 &state,
                 &mut attempted_acp_spawns,
@@ -4686,10 +4632,8 @@ async fn status_poll_loop(state: Arc<AppState>) {
             )
             .await;
 
-            #[cfg(feature = "serve")]
             reap_idle_sessions(&state, &mut last_session_idle_reap).await;
 
-            #[cfg(feature = "serve")]
             update_sleep_inhibit(
                 &state,
                 &mut sleep_inhibitor,
@@ -4703,13 +4647,11 @@ async fn status_poll_loop(state: Arc<AppState>) {
 /// How often the serve daemon evaluates plain tmux sessions for idle
 /// auto-stop. Mirrors the acp reaper's cadence so a 2s status tick does
 /// not drive a storage + tmux sweep on every iteration.
-#[cfg(feature = "serve")]
 const SESSION_IDLE_REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Cap on concurrent `perform_stop` calls during one reap pass. `Instance::stop`
 /// can block ~10s on `docker stop`; without a bound, a fleet of sessions all
 /// crossing the threshold on the same tick would stampede the Docker daemon.
-#[cfg(feature = "serve")]
 const SESSION_IDLE_REAP_MAX_CONCURRENT: usize = 4;
 
 /// Auto-stop plain (non-acp) tmux sessions that have been `Idle` past
@@ -4718,7 +4660,6 @@ const SESSION_IDLE_REAP_MAX_CONCURRENT: usize = 4;
 /// under the per-profile storage lock (so a concurrently running TUI cannot
 /// double-stop it) and stopped on a detached task with bounded concurrency,
 /// keeping the status poll loop responsive.
-#[cfg(feature = "serve")]
 async fn reap_idle_sessions(state: &Arc<AppState>, last_reap: &mut Option<std::time::Instant>) {
     if last_reap.is_some_and(|t| t.elapsed() < SESSION_IDLE_REAP_INTERVAL) {
         return;
@@ -4848,16 +4789,13 @@ async fn reap_idle_sessions(state: &Arc<AppState>, last_reap: &mut Option<std::t
 /// (caffeinate `-w <pid>` and the systemd-inhibit `cat` otherwise outlive every
 /// tick), and both acquire and release lag are dominated by the minutes-long
 /// grace window and the OS idle-sleep timer.
-#[cfg(feature = "serve")]
 const SLEEP_INHIBIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// `AppState::sleep_inhibit_snapshot` bit: `prevent_sleep_when_active` was on
 /// at the last reconcile.
-#[cfg(feature = "serve")]
 pub(crate) const SLEEP_INHIBIT_SNAPSHOT_ENABLED: u8 = 0b01;
 /// `AppState::sleep_inhibit_snapshot` bit: an inhibitor slot is retained. This
 /// is slot presence, not held: the endpoint gates it on `backend_available`.
-#[cfg(feature = "serve")]
 pub(crate) const SLEEP_INHIBIT_SNAPSHOT_SLOT_PRESENT: u8 = 0b10;
 
 /// Acquire or release the OS sleep-inhibit assertion. Throttled to
@@ -4867,7 +4805,6 @@ pub(crate) const SLEEP_INHIBIT_SNAPSHOT_SLOT_PRESENT: u8 = 0b10;
 /// then reconciles: hold the assertion while the toggle is on and any session
 /// has recent activity, release once every session has been idle past the
 /// grace window.
-#[cfg(feature = "serve")]
 async fn update_sleep_inhibit(
     state: &Arc<AppState>,
     slot: &mut Option<Box<dyn crate::process::SleepInhibit>>,
@@ -4912,7 +4849,6 @@ async fn update_sleep_inhibit(
 /// here is a subprocess spawn / `try_wait` / kill that returns in milliseconds,
 /// and the call is throttled to once per interval; only the config read in
 /// `update_sleep_inhibit`, which touches disk, is offloaded.
-#[cfg(feature = "serve")]
 fn reconcile_sleep_inhibit(
     desired: bool,
     slot: &mut Option<Box<dyn crate::process::SleepInhibit>>,
@@ -5343,7 +5279,6 @@ async fn daemon_startup_recovery_cascade(
 /// One task instead of two halves the broadcast clone count and locks
 /// `state.instances` once per event instead of twice for the events
 /// (e.g. `AcpSessionAssigned`) that both consumers care about.
-#[cfg(feature = "serve")]
 async fn acp_event_listener(state: Arc<AppState>) {
     let mut rx = state.acp_events_tx.subscribe();
     loop {
@@ -5780,7 +5715,6 @@ async fn acp_event_listener(state: Arc<AppState>) {
 /// Acts via the same `apply_status_intent` path as the live listener
 /// so push subscribers and the broadcast channel see the seeded
 /// transitions as ordinary StatusChange events. See #1103 (B).
-#[cfg(feature = "serve")]
 pub(crate) async fn seed_acp_statuses(state: Arc<AppState>) {
     let acp_ids: Vec<String> = state
         .instances
@@ -5823,7 +5757,6 @@ pub(crate) async fn seed_acp_statuses(state: Arc<AppState>) {
 /// callers hold the write lock. Sends a `StatusChange` on
 /// `status_tx` so push notifications and the dashboard see the
 /// transition like any tmux-driven one.
-#[cfg(feature = "serve")]
 pub(crate) fn apply_status_intent(
     inst: &mut Instance,
     intent: Option<StatusIntent>,
@@ -6080,7 +6013,6 @@ async fn recover_structured_unread_after_lag(
 /// owning profile when sessions.json needs to be re-saved (so the new
 /// `acp_session_id` survives daemon restart), or `None` if the
 /// change was a no-op or no change was emitted.
-#[cfg(feature = "serve")]
 fn apply_acp_session_change(
     inst: &mut Instance,
     session_id: &str,
@@ -6195,7 +6127,6 @@ fn apply_acp_session_change(
 /// What an event tells the ACP-session-id listener to do. `None` means
 /// the event is irrelevant. Extracted so the JSON-shape parsing has a
 /// pure-function test surface.
-#[cfg(feature = "serve")]
 #[derive(Debug, PartialEq, Eq, Clone)]
 enum AcpSessionChange {
     Assigned(String),
@@ -6206,7 +6137,6 @@ enum AcpSessionChange {
     Cleared,
 }
 
-#[cfg(feature = "serve")]
 fn derive_acp_session_change(event: &crate::acp::Event) -> Option<AcpSessionChange> {
     use crate::acp::Event;
     match event {
@@ -6224,14 +6154,12 @@ fn derive_acp_session_change(event: &crate::acp::Event) -> Option<AcpSessionChan
 /// current status is `Error` (used to recover the sidebar from a
 /// sticky `AgentStartupError` banner after a successful respawn
 /// without clobbering an in-progress Running/Waiting turn).
-#[cfg(feature = "serve")]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum StatusIntent {
     Set(Status),
     HealError,
 }
 
-#[cfg(feature = "serve")]
 pub(crate) fn derive_acp_status(event: &crate::acp::Event) -> Option<StatusIntent> {
     use crate::acp::Event;
     match event {
@@ -6378,7 +6306,7 @@ async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
 /// `src/tmux/mod.rs`'s `test_support` module: gated on
 /// `#[cfg(any(test, feature = "test-support"))]` so the surface stays out of
 /// production builds, and `#[doc(hidden)]` so it's invisible in rustdoc.
-#[cfg(all(feature = "serve", any(test, feature = "test-support")))]
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod test_support {
     use super::*;
@@ -6658,7 +6586,6 @@ mod tests {
     /// `idempotency_locks` must not grow for the daemon's lifetime: keys are
     /// caller-supplied and unbounded, so an entry nobody holds is pruned on
     /// the next miss. A key whose lock is still held must survive. See #3156.
-    #[cfg(feature = "serve")]
     #[tokio::test]
     async fn idempotency_lock_prunes_unreferenced_keys() {
         let state = test_support::build_test_app_state(vec![]);
@@ -7837,7 +7764,6 @@ mod tests {
     /// #2758: the reconciler's persistent per-session maps must be swept
     /// against the live instance set every tick, so a deleted session's id
     /// does not linger and grow the daemon's footprint over its uptime.
-    #[cfg(feature = "serve")]
     #[test]
     fn gc_reconciler_session_maps_drops_deleted_session_ids() {
         use std::collections::{HashMap, HashSet};
@@ -8975,7 +8901,6 @@ mod tests {
     // session/load reattach reuses it). Without this, a stale marker left by a
     // non-user respawn keeps the reconciler's resume filter skipping the
     // session forever once the worker dies, deadlocking a queued prompt.
-    #[cfg(feature = "serve")]
     #[test]
     fn acp_session_assigned_clears_stale_dormant_marker_on_same_id() {
         let mut inst = Instance::new("seed", "/tmp/seed");
@@ -9004,7 +8929,6 @@ mod tests {
     // new-assignment path. That path must consume the one-shot fork_pending seed
     // and persist, so a restart resumes the child via session/load rather than
     // re-forking the parent.
-    #[cfg(feature = "serve")]
     #[test]
     fn assigning_forked_id_clears_fork_pending_and_persists() {
         let mut inst = Instance::new("seed", "/tmp/seed");
@@ -9038,7 +8962,6 @@ mod tests {
     // None) must leave import_pending alone: that marker belongs to the import
     // flow, which lands on the same-id path, and clearing it here would block a
     // legitimate import retry from re-seeding the transcript.
-    #[cfg(feature = "serve")]
     #[test]
     fn non_fork_assignment_preserves_import_pending() {
         let mut inst = Instance::new("seed", "/tmp/seed");
@@ -9069,7 +8992,6 @@ mod tests {
     // reconciler nor the supervisor re-issues the same failing session/fork on
     // the next reattach. This is the reducer side of the fork-failure retry-loop
     // fix; the reset carries no new id, so acp_session_id is cleared too.
-    #[cfg(feature = "serve")]
     #[test]
     fn reset_clears_fork_pending_and_import_pending() {
         let mut inst = Instance::new("seed", "/tmp/seed");
@@ -9100,7 +9022,6 @@ mod tests {
     // must clear the dead id but leave import_pending untouched: that marker
     // belongs to the import flow, and clearing it here would block a legitimate
     // import retry. Mirrors the non-fork assignment guard.
-    #[cfg(feature = "serve")]
     #[test]
     fn reset_without_fork_pending_preserves_import_pending() {
         let mut inst = Instance::new("seed", "/tmp/seed");
@@ -9123,7 +9044,6 @@ mod tests {
         assert!(profile.is_some(), "the reset must persist");
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn acp_session_assigned_same_id_no_marker_is_noop() {
         let mut inst = Instance::new("seed", "/tmp/seed");
@@ -9145,7 +9065,6 @@ mod tests {
     // derived no session change, so the stale ACP id survived on disk and the
     // next worker restart replayed the pre-clear conversation via session/load.
     // It must now derive a Cleared change so the stored id is dropped.
-    #[cfg(feature = "serve")]
     #[test]
     fn session_cleared_derives_cleared_change() {
         assert_eq!(
@@ -9159,7 +9078,6 @@ mod tests {
     // dropping the paired fork/import markers too: a /clear issued before a
     // pending fork/import resolves must still restart as session/new, not
     // re-session/fork the parent. See #3080.
-    #[cfg(feature = "serve")]
     #[test]
     fn cleared_nulls_stored_id_and_pending_markers() {
         let mut inst = Instance::new("seed", "/tmp/seed");
@@ -9185,7 +9103,6 @@ mod tests {
 
     // Regression for the event-ordering the listener sees: an id assigned at
     // connect followed by a later /clear must end with no stored id. See #3080.
-    #[cfg(feature = "serve")]
     #[test]
     fn assign_then_clear_leaves_no_stored_id() {
         let mut inst = Instance::new("seed", "/tmp/seed");
@@ -9237,7 +9154,6 @@ mod tests {
         assert_eq!(merged.last_error, None);
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     #[serial_test::serial]
     fn repair_structured_rows_from_live_workers_restores_structured_session_rows() {
@@ -10022,7 +9938,6 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), 0);
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn derive_acp_status_maps_terminal_events() {
         use crate::acp::approvals::{ApprovalDecision, Nonce};
@@ -10124,7 +10039,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn derive_acp_session_change_extracts_assigned_id() {
         use crate::acp::Event;
@@ -10137,7 +10051,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn derive_acp_session_change_extracts_reset_reason() {
         use crate::acp::Event;
@@ -10152,7 +10065,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn derive_acp_session_change_ignores_unrelated_events() {
         use crate::acp::Event;
@@ -10169,7 +10081,6 @@ mod tests {
         assert_eq!(derive_acp_session_change(&Event::ThinkingStarted), None);
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn derive_acp_status_running_on_agent_activity() {
         use crate::acp::state::ToolCall;
@@ -10207,7 +10118,6 @@ mod tests {
 
     // --- #2248: a structured session must heal out of a stale Stopped ---
 
-    #[cfg(feature = "serve")]
     fn stopped_structured_instance() -> Instance {
         let mut inst = Instance::new("s", "/tmp/s");
         inst.view = crate::session::View::Structured;
@@ -10215,13 +10125,11 @@ mod tests {
         inst
     }
 
-    #[cfg(feature = "serve")]
     fn apply(inst: &mut Instance, intent: StatusIntent) {
         let tx = broadcast::channel(8).0;
         apply_status_intent(inst, Some(intent), &tx);
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn heal_error_wakes_a_stopped_session() {
         // AcpSessionAssigned / RateLimitAutoResumed -> HealError: a fresh
@@ -10236,7 +10144,6 @@ mod tests {
         assert_eq!(inst.status, Status::Running);
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn trailing_acp_event_cannot_change_a_trashed_session_status() {
         let mut inst = stopped_structured_instance();
@@ -10252,7 +10159,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn agent_activity_wakes_an_idle_session_after_a_fired_wakeup() {
         // A session that paused on ScheduleWakeup sits Idle. When the wake
@@ -10266,7 +10172,6 @@ mod tests {
         assert_eq!(inst.idle_entered_at, None);
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn heal_error_still_heals_a_sticky_error() {
         let mut inst = stopped_structured_instance();
@@ -10275,7 +10180,6 @@ mod tests {
         assert_eq!(inst.status, Status::Idle);
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn status_intent_transitions_preserve_last_accessed_at() {
         // #3465 residual: the intent applier used to restamp
@@ -10309,7 +10213,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn relayed_intent_stamp_wipes_concurrent_archive() {
         // Full #3465 residual chain on structured rows:
@@ -10342,7 +10245,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn trailing_set_intents_do_not_wake_a_stopped_session() {
         // A deliberate Stop, or a session mid-stop, keeps emitting acp
@@ -10360,7 +10262,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn deleting_and_creating_block_every_intent() {
         for terminal in [Status::Deleting, Status::Creating] {
@@ -10373,7 +10274,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "serve")]
     #[tokio::test]
     async fn seed_unblocks_a_stopped_session_with_an_in_flight_turn() {
         use crate::acp::Event;
@@ -10399,7 +10299,6 @@ mod tests {
         assert_eq!(state.instances.read().await[0].status, Status::Running);
     }
 
-    #[cfg(feature = "serve")]
     #[tokio::test]
     async fn seed_preserves_a_deliberate_stop_across_restart() {
         use crate::acp::Event;

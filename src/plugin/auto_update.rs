@@ -18,14 +18,13 @@ use crate::session::Config;
 
 use super::{install, update_check};
 
-/// Surfaces a consent-needed auto-update skip in-product. Kept abstract so this
-/// module (which compiles in TUI-only builds) never references the serve-gated
-/// plugin host. The `aoe serve` daemon implements it on `PluginHost`.
+/// Surfaces a consent-needed auto-update skip in-product. Kept abstract so
+/// this module never references the plugin host directly. The `aoe serve`
+/// daemon implements it on `PluginHost`.
 pub trait UpdateNotifier: Send + Sync {
     fn needs_approval(&self, plugin_id: &str, reason: &str);
 }
 
-#[cfg(feature = "serve")]
 impl UpdateNotifier for super::host::PluginHost {
     fn needs_approval(&self, plugin_id: &str, reason: &str) {
         self.notify_host(

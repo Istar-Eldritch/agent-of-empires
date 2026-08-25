@@ -12,7 +12,6 @@ use crate::session::config::{
 };
 use crate::session::{list_profiles, repo_config, resolve_config_or_warn, Item, Status};
 use crate::tui::app::Action;
-#[cfg(feature = "serve")]
 use crate::tui::dialogs::ServeAction;
 use crate::tui::dialogs::{
     builtin_commands, CommandPaletteDialog, ConfirmDialog, ContextMenuAction, ContextMenuDialog,
@@ -1035,7 +1034,6 @@ impl HomeView {
         // (see `wrapped_transcript`), so (row, column) slicing below maps
         // one-to-one onto the on-screen cells. Terminal previews keep
         // reading the tmux capture cache.
-        #[cfg(feature = "serve")]
         let structured_lines = self
             .structured_preview
             .as_ref()
@@ -1045,13 +1043,10 @@ impl HomeView {
                     .is_some_and(|id| id == v.session_id())
             })
             .map(|v| v.selection_text(width));
-        #[cfg(feature = "serve")]
         let lines = match structured_lines.as_ref() {
             Some(text) => text,
             None => self.active_preview_cache().parsed_text.as_ref()?,
         };
-        #[cfg(not(feature = "serve"))]
-        let lines = self.active_preview_cache().parsed_text.as_ref()?;
         // Resolve `from_bottom` distances to absolute indices against the
         // SAME `total_lines` the renderer used this frame, so the copied
         // range matches the painted highlight cell for cell.
@@ -1186,12 +1181,10 @@ impl HomeView {
                 None
             }
             "pull_sandbox_image" => self.pending_image_pull.take().map(Action::SpawnImagePull),
-            #[cfg(feature = "serve")]
             "switch_view" => self
                 .pending_switch_view_session
                 .take()
                 .map(Action::SwitchSessionView),
-            #[cfg(feature = "serve")]
             "start_daemon_structured" => self
                 .pending_daemon_start_session
                 .take()
@@ -1860,7 +1853,6 @@ impl HomeView {
         }
 
         // Handle serve view (full-screen takeover)
-        #[cfg(feature = "serve")]
         if let Some(ref mut serve) = self.serve_view {
             match serve.handle_key(key) {
                 ServeAction::Continue => return None,
@@ -3019,17 +3011,7 @@ impl HomeView {
             return false;
         };
         if inst.is_structured() {
-            #[cfg(feature = "serve")]
-            {
-                crate::session::fork::structured_fork_capable(
-                    &inst.tool,
-                    inst.agent_name.as_deref(),
-                )
-            }
-            #[cfg(not(feature = "serve"))]
-            {
-                false
-            }
+            crate::session::fork::structured_fork_capable(&inst.tool, inst.agent_name.as_deref())
         } else {
             crate::session::fork::terminal_agent_can_fork(&inst.tool)
         }
@@ -3047,36 +3029,28 @@ impl HomeView {
     /// deliberately stopped, and the swap would boot a worker or tmux pane
     /// behind the parked state.
     pub(super) fn session_switch_view_target(&self, id: &str) -> Option<bool> {
-        #[cfg(feature = "serve")]
+        let inst = self.get_instance(id)?;
+        if inst.is_archived()
+            || inst.is_trashed()
+            || matches!(inst.status, Status::Creating | Status::Deleting)
         {
-            let inst = self.get_instance(id)?;
-            if inst.is_archived()
-                || inst.is_trashed()
-                || matches!(inst.status, Status::Creating | Status::Deleting)
-            {
-                return None;
-            }
-            if inst.is_structured() {
-                return Some(true);
-            }
-            let config = crate::session::repo_config::resolve_config_with_repo_or_warn(
-                &inst.source_profile,
-                std::path::Path::new(&inst.project_path),
-            );
-            // Switching a terminal session INTO the structured view is gated on
-            // the same opt-in as the new-session toggle: the structured view is
-            // still maturing, so don't offer to switch into it unless the user
-            // turned it on. The reverse direction (already-structured -> terminal)
-            // stays available above regardless, so a session can always get out.
-            (config.acp.offer_structured_in_new_session
-                && crate::session::builder::structured::tool_acp_capable(&inst.tool, &config))
-            .then_some(false)
+            return None;
         }
-        #[cfg(not(feature = "serve"))]
-        {
-            let _ = id;
-            None
+        if inst.is_structured() {
+            return Some(true);
         }
+        let config = crate::session::repo_config::resolve_config_with_repo_or_warn(
+            &inst.source_profile,
+            std::path::Path::new(&inst.project_path),
+        );
+        // Switching a terminal session INTO the structured view is gated on
+        // the same opt-in as the new-session toggle: the structured view is
+        // still maturing, so don't offer to switch into it unless the user
+        // turned it on. The reverse direction (already-structured -> terminal)
+        // stays available above regardless, so a session can always get out.
+        (config.acp.offer_structured_in_new_session
+            && crate::session::builder::structured::tool_acp_capable(&inst.tool, &config))
+        .then_some(false)
     }
 
     /// Confirm before flipping the selected session's view. Enabling
@@ -3140,7 +3114,6 @@ impl HomeView {
     /// found no daemon running. Neutral tone: nothing is destroyed; the
     /// user is just about to run a background process they may not have
     /// expected. Remote setups keep their manual commands.
-    #[cfg(feature = "serve")]
     pub(in crate::tui) fn prompt_start_daemon_for_structured(&mut self, session_id: &str) {
         self.pending_daemon_start_session = Some(session_id.to_string());
         self.confirm_dialog = Some(
@@ -3161,7 +3134,6 @@ impl HomeView {
     /// archive or trash (those render their own placeholder pages, so a
     /// mounted view would be invisible while still streaming). Drives
     /// preview-on-select and the active-view liveness check.
-    #[cfg(feature = "serve")]
     pub(in crate::tui) fn selected_structured_session(&self) -> Option<String> {
         let id = self.selected_session.clone()?;
         let inst = self.get_instance(&id)?;
@@ -3176,7 +3148,6 @@ impl HomeView {
     /// Used by the embedded structured view open path: both modes route
     /// keystrokes away from the home view and paint the preview pane,
     /// so they cannot coexist.
-    #[cfg(feature = "serve")]
     pub(in crate::tui) fn exit_live_send_if_active(&mut self) {
         if let Some(state) = self.live_send.clone() {
             self.exit_live_send_and_restore_sizing(&state);
@@ -3221,9 +3192,7 @@ impl HomeView {
         let group_path = parent.group_path.clone();
         let title = parent.title.clone();
         let parent_is_structured = parent.is_structured();
-        #[cfg(feature = "serve")]
         let parent_agent_name = parent.agent_name.clone();
-        #[cfg(feature = "serve")]
         let parent_acp_session_id = parent.acp_session_id.clone();
 
         let seed = if parent_is_structured {
@@ -3231,7 +3200,6 @@ impl HomeView {
             // not the terminal resume-with-fork-flag path. The captured ACP
             // session id is the parent to fork from; without one there is no
             // conversation to fork yet.
-            #[cfg(feature = "serve")]
             {
                 // Gate on the same predicate the REST create-guard and the web
                 // `acp_can_fork` projection use: a resume-only ACP agent (e.g.
@@ -3263,20 +3231,6 @@ impl HomeView {
                 crate::session::ForkSeed::Structured {
                     parent_acp_session_id: acp_id,
                 }
-            }
-            #[cfg(not(feature = "serve"))]
-            {
-                self.info_dialog = Some(InfoDialog::new(
-                    "Fork not available in this build",
-                    "This `aoe` binary was built without the web dashboard \
-                     (a `--no-default-features` source build), so structured \
-                     view session forking is not included.\n\n\
-                     To fork this session:\n\
-                       \u{2022} Install a release build from GitHub Releases, or\n\
-                       \u{2022} Build from source with default features:\n\
-                         cargo build --release",
-                ));
-                return;
             }
         } else {
             let child_id = crate::session::capture::generate_claude_session_id();
@@ -3627,18 +3581,7 @@ impl HomeView {
         }
 
         if structured {
-            #[cfg(feature = "serve")]
-            {
-                return Some(Action::SmartRenameNow(id));
-            }
-            #[cfg(not(feature = "serve"))]
-            {
-                self.info_dialog = Some(InfoDialog::new(
-                    "Unavailable",
-                    "Auto-naming a structured-view session needs a serve-enabled build.",
-                ));
-                return None;
-            }
+            return Some(Action::SmartRenameNow(id));
         }
 
         // Preflight the gates the detached child re-applies, so this action stops
@@ -3705,38 +3648,20 @@ impl HomeView {
     }
 
     fn open_serve(&mut self) {
-        #[cfg(feature = "serve")]
-        {
-            let web_disabled = crate::plugin::registry()
-                .get("aoe.web")
-                .is_some_and(|p| !p.enabled);
-            if web_disabled {
-                self.info_dialog = Some(InfoDialog::new(
-                    "Web dashboard disabled",
-                    "The aoe.web plugin is disabled, so the web dashboard cannot \
-                     be served.\n\n\
-                     Re-enable it in Settings > Plugins (or run \
-                     `aoe plugin enable aoe.web`), then press R again.",
-                ));
-                return;
-            }
-            self.serve_view = Some(crate::tui::dialogs::ServeView::new());
-        }
-        #[cfg(not(feature = "serve"))]
-        {
+        let web_disabled = crate::plugin::registry()
+            .get("aoe.web")
+            .is_some_and(|p| !p.enabled);
+        if web_disabled {
             self.info_dialog = Some(InfoDialog::new(
-                "Serve unavailable",
-                "This `aoe` binary was built without the web dashboard \
-                 (a `--no-default-features` source build), so local network \
-                 serving and Cloudflare Tunnel integration are not included.\n\n\
-                 To serve to your phone (LAN / Tailscale / tunnel):\n\
-                   \u{2022} Install a release build from GitHub Releases, or\n\
-                   \u{2022} Build from source with default features:\n\
-                     cargo build --release\n\n\
-                 Once you have a `serve`-enabled binary, press R again to \
-                 open the serve dialog.",
+                "Web dashboard disabled",
+                "The aoe.web plugin is disabled, so the web dashboard cannot \
+                 be served.\n\n\
+                 Re-enable it in Settings > Plugins (or run \
+                 `aoe plugin enable aoe.web`), then press R again.",
             ));
+            return;
         }
+        self.serve_view = Some(crate::tui::dialogs::ServeView::new());
     }
 
     pub(super) fn open_settings(&mut self) {
@@ -4180,20 +4105,11 @@ impl HomeView {
                 return None;
             }
             if inst.is_structured() {
-                #[cfg(feature = "serve")]
-                {
-                    // The embedded structured view takes over the preview
-                    // pane; leave live-send first so the two don't fight
-                    // over it (mirrors `exit_live_send_before_attach`).
-                    self.exit_live_send_if_active();
-                    return Some(Action::OpenStructuredView(id));
-                }
-                #[cfg(not(feature = "serve"))]
-                {
-                    return Some(Action::SetTransientStatus(
-                        "Acp session: rebuild with default features to attach".to_string(),
-                    ));
-                }
+                // The embedded structured view takes over the preview
+                // pane; leave live-send first so the two don't fight
+                // over it (mirrors `exit_live_send_before_attach`).
+                self.exit_live_send_if_active();
+                return Some(Action::OpenStructuredView(id));
             }
         }
         match self.view_mode {

@@ -57,14 +57,14 @@ fn run_dev(_args: DevArgs) {
     std::process::exit(1);
 }
 
-/// Build the serve-enabled debug binary. Returns whether the build succeeded so
-/// the watch loop can keep the old backend running on a failed rebuild.
+/// Build the debug binary. Returns whether the build succeeded so the watch
+/// loop can keep the old backend running on a failed rebuild.
 #[cfg(unix)]
-fn build_serve() -> bool {
+fn build_aoe() -> bool {
     use std::process::Command;
-    eprintln!("[xtask dev] building aoe --features serve...");
+    eprintln!("[xtask dev] building aoe...");
     Command::new("cargo")
-        .args(["build", "--features", "serve"])
+        .args(["build"])
         .status()
         .map(|s| s.success())
         .unwrap_or_else(|e| {
@@ -160,7 +160,7 @@ fn run_dev(args: DevArgs) {
 
     // Build up front so build output doesn't interleave with Vite's startup
     // and a broken build fails fast before either server comes up.
-    if !build_serve() {
+    if !build_aoe() {
         std::process::exit(1);
     }
 
@@ -339,7 +339,7 @@ fn run_dev(args: DevArgs) {
                 if Instant::now() >= at {
                     rebuild_at = None;
                     eprintln!("[xtask dev] change detected; rebuilding aoe...");
-                    if build_serve() {
+                    if build_aoe() {
                         if let Some(mut old) = serve.take() {
                             terminate_group(&mut old, Duration::from_secs(2));
                         }

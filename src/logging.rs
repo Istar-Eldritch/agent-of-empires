@@ -497,10 +497,7 @@ impl std::error::Error for LogFilterError {}
 /// `crate::acp::session_tee`); the acp module is `serve`-gated, so without
 /// that feature the slot is the no-op `Identity` layer and callers always
 /// pass `None`.
-#[cfg(feature = "serve")]
 pub type TeeLayer = crate::acp::session_tee::SessionTeeLayer;
-#[cfg(not(feature = "serve"))]
-pub type TeeLayer = tracing_subscriber::layer::Identity;
 
 pub fn init_subscriber(target: SubscriberTarget, filter: String) -> InitResult {
     init_subscriber_with_options(target, filter, false, None)

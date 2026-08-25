@@ -8,7 +8,6 @@
 //!
 //! Only compiled with the `serve` feature, since the tunnel integration
 //! (and the qrcode crate it needs) lives there.
-#![cfg(feature = "serve")]
 
 use std::path::PathBuf;
 use std::sync::Mutex;

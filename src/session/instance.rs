@@ -872,9 +872,7 @@ pub struct Instance {
     /// store and are reloaded at drain time. Empty for create-time initial
     /// turns (those are text-only). `#[serde(default)]` + skip-when-empty keeps
     /// pre-existing rows deserialising unchanged, so no migration is needed.
-    /// Serve-only: `PromptAttachmentRef` lives in the serve-gated `acp` module,
-    /// and only the structured-view resume path (serve) ever populates it.
-    #[cfg(feature = "serve")]
+    /// Only the structured-view resume path ever populates it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_initial_turn_attachments: Vec<crate::acp::state::PromptAttachmentRef>,
 
@@ -885,13 +883,11 @@ pub struct Instance {
     /// `QueuedPromptEntry::seq`. Serve-only: the queue exists only for the
     /// web dashboard's structured view. `#[serde(default)]` + skip-when-empty
     /// keeps pre-existing rows deserialising unchanged, so no migration.
-    #[cfg(feature = "serve")]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queued_prompts: Vec<crate::acp::state::QueuedPromptEntry>,
 
     /// Monotonic counter for `QueuedPromptEntry::seq`, so ordering is stable
     /// even after rows drain or are removed. Never reused within a session.
-    #[cfg(feature = "serve")]
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub queued_prompt_next_seq: u64,
 
@@ -1613,11 +1609,8 @@ impl Instance {
             created_by_plugin: None,
             plugin_create_idempotency: None,
             pending_initial_turn: None,
-            #[cfg(feature = "serve")]
             pending_initial_turn_attachments: Vec::new(),
-            #[cfg(feature = "serve")]
             queued_prompts: Vec::new(),
-            #[cfg(feature = "serve")]
             queued_prompt_next_seq: 0,
             acp_mode_id: None,
             prior_tool_session_ids: HashMap::new(),
@@ -2988,10 +2981,9 @@ impl Instance {
         self.yolo_mode
     }
 
-    /// True when this session renders in the structured (ACP) view. The
-    /// persisted `view` field exists in every build so non-serve writers
-    /// round-trip it intact; rows damaged by pre-fix writers are healed on
-    /// reload by the server's structured row repair path.
+    /// True when this session renders in the structured (ACP) view. Rows
+    /// damaged by pre-fix writers are healed on reload by the server's
+    /// structured row repair path.
     pub fn is_structured(&self) -> bool {
         self.view == View::Structured
     }
@@ -3018,9 +3010,7 @@ impl Instance {
     /// When `acp_session_id` is unset this only flips the view, leaving no
     /// resume target, which is why the caller also gates on it being present.
     ///
-    /// Only the serve-gated `acp_disable` handler calls this, so it is
-    /// `cfg(serve)` to stay dead-code-free in a TUI-only build.
-    #[cfg(feature = "serve")]
+    /// Only the `acp_disable` handler calls this.
     pub(crate) fn switch_to_terminal_keep_context(&mut self) {
         if let Some(sid) = self.acp_session_id.take() {
             self.agent_session_id = Some(sid.clone());
@@ -7946,7 +7936,6 @@ mod tests {
         assert_eq!(Status::from_api_str("Hibernating"), None);
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn switch_to_terminal_keep_context_carries_acp_id_into_resume_target() {
         let mut inst = Instance::new("claude", "/tmp");
@@ -9878,7 +9867,6 @@ mod tests {
     // A non-fork session omits fork_pending on the wire (skip_serializing_if),
     // so legacy sessions.json without the key deserializes to None and no
     // migration is needed. A seeded fork id round-trips.
-    #[cfg(feature = "serve")]
     #[test]
     fn test_fork_pending_serde_roundtrip_and_default() {
         let fresh = Instance::new("s", "/tmp/x");
@@ -15404,7 +15392,6 @@ mod tests {
             );
         }
 
-        #[cfg(feature = "serve")]
         #[test]
         #[serial]
         fn restart_outcome_for_acp_session_is_fresh() {

@@ -4,11 +4,8 @@
 //! start while the `aoe.web` plugin is disabled, and the command palette opens
 //! the plugin manager listing the builtins.
 //!
-//! Compiled only under `serve`: the sole bundled plugin is the serve-gated
-//! `aoe.web`, so without that feature the builtin set is empty and there is
-//! nothing for these management-surface tests to exercise. The bare-core
-//! `--no-default-features` e2e leg skips this module by design.
-#![cfg(feature = "serve")]
+//! The sole bundled plugin is `aoe.web`, so these tests drive the management
+//! surface against that one builtin.
 
 use serial_test::parallel;
 

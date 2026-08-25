@@ -21,21 +21,13 @@ pub mod update_check;
 pub mod view;
 
 // The Tier 1 worker host runs only in the `aoe serve` daemon, where the event
-// store and session storage it serves over the capability-gated API live. A
-// TUI-only build has no host, so these modules are gated with it.
-#[cfg(feature = "serve")]
+// store and session storage it serves over the capability-gated API live.
 pub(crate) mod automation_policy;
-#[cfg(feature = "serve")]
 pub mod host;
-#[cfg(feature = "serve")]
 pub mod host_api;
-#[cfg(feature = "serve")]
 pub mod protocol;
-#[cfg(feature = "serve")]
 pub mod sandbox;
-#[cfg(feature = "serve")]
 pub mod session_api;
-#[cfg(feature = "serve")]
 pub mod ui_state;
 
 // Launch resolution is pure (PATH / filesystem probing) and is shared by the

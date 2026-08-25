@@ -32,7 +32,6 @@ use crate::tmux::AvailableTools;
 
 use super::creation_poller::{CreatedWorktreeInfo, CreationPoller, CreationRequest};
 use super::deletion_poller::DeletionPoller;
-#[cfg(feature = "serve")]
 use super::dialogs::ServeView;
 use super::dialogs::{
     AttachProjectDialog, ChangelogDialog, CommandPaletteDialog, ConfirmDialog, ContextMenuDialog,
@@ -592,7 +591,6 @@ pub struct HomeView {
     pub(super) plugin_manager_dialog: Option<crate::tui::dialogs::PluginManagerDialog>,
     pub(super) skills_manager_dialog: Option<crate::tui::dialogs::SkillsManagerDialog>,
     pub(super) command_palette: Option<CommandPaletteDialog>,
-    #[cfg(feature = "serve")]
     pub(super) serve_view: Option<ServeView>,
     pub(super) update_confirm_dialog: Option<UpdateConfirmDialog>,
     /// One-time opt-in popup for users who finished the walkthrough before
@@ -736,7 +734,6 @@ pub struct HomeView {
     pub(super) pending_switch_view_session: Option<String>,
     /// Session whose structured-view open is waiting on the "start a
     /// local daemon?" confirm (see `prompt_start_daemon_for_structured`).
-    #[cfg(feature = "serve")]
     pub(super) pending_daemon_start_session: Option<String>,
     /// The structured-view session mounted in the preview pane, if any:
     /// a streaming transcript that `render_preview` paints as the
@@ -745,7 +742,6 @@ pub struct HomeView {
     /// preview renderer, info header, and drag-select all compose with
     /// it; the `App` loop drives its async sides (connect, WS pump,
     /// active-mode key routing).
-    #[cfg(feature = "serve")]
     pub(in crate::tui) structured_preview:
         Option<crate::tui::structured_view::embedded::EmbeddedView>,
     /// True while the App's preview-on-select reconcile has picked a
@@ -753,7 +749,6 @@ pub struct HomeView {
     /// preview renderer shows a quiet placeholder instead of the wordy
     /// "press Enter" page, which otherwise flashes for the connect
     /// window on every selection.
-    #[cfg(feature = "serve")]
     pub(in crate::tui) structured_preview_pending: bool,
     /// Session to force-remove after the confirmation dialog is accepted
     pub(super) pending_force_remove_session: Option<String>,
@@ -796,9 +791,7 @@ pub struct HomeView {
 
     // Structured (ACP) rows: the tmux poller above bails on them, so their
     // status comes from the daemon instead. See `daemon_status_poller`.
-    #[cfg(feature = "serve")]
     pub(super) daemon_status_poller: super::daemon_status_poller::DaemonStatusPoller,
-    #[cfg(feature = "serve")]
     pub(super) pending_daemon_status_refresh: bool,
 
     // Performance: background deletion
@@ -2271,7 +2264,6 @@ impl HomeView {
             plugin_manager_dialog: None,
             skills_manager_dialog: None,
             command_palette: None,
-            #[cfg(feature = "serve")]
             serve_view: None,
             update_confirm_dialog: None,
             telemetry_consent_dialog: None,
@@ -2311,11 +2303,8 @@ impl HomeView {
             pending_stop_tool: None,
             pending_image_pull: None,
             pending_switch_view_session: None,
-            #[cfg(feature = "serve")]
             pending_daemon_start_session: None,
-            #[cfg(feature = "serve")]
             structured_preview: None,
-            #[cfg(feature = "serve")]
             structured_preview_pending: false,
             pending_force_remove_session: None,
             pending_trash_session: None,
@@ -2342,9 +2331,7 @@ impl HomeView {
             system_health_discovered: user_config
                 .as_ref()
                 .is_some_and(|config| config.app_state.used_system_health),
-            #[cfg(feature = "serve")]
             daemon_status_poller: super::daemon_status_poller::DaemonStatusPoller::new(),
-            #[cfg(feature = "serve")]
             pending_daemon_status_refresh: false,
             deletion_poller: DeletionPoller::new(),
             stop_poller: StopPoller::new(),
@@ -3050,7 +3037,6 @@ impl HomeView {
     /// Request the daemon's view of every structured row's status
     /// (non-blocking). Skipped entirely when no structured session is
     /// loaded, so a terminal-only home view never talks to the daemon.
-    #[cfg(feature = "serve")]
     pub fn request_daemon_status_refresh(&mut self) {
         if self.pending_daemon_status_refresh {
             return;
@@ -3089,7 +3075,6 @@ impl HomeView {
     /// legible). The tmux producer has the same property via its own
     /// `is_archived()` short-circuit, so this is consistent rather than new,
     /// but unarchiving is the only way back.
-    #[cfg(feature = "serve")]
     fn daemon_status_applies_to(&self, inst: &Instance) -> bool {
         !self.recovery_in_flight.contains(&inst.id)
             && !self.restart_in_flight.contains(&inst.id)
@@ -3099,7 +3084,6 @@ impl HomeView {
 
     /// Apply any pending daemon-sourced statuses. Returns true if the
     /// caller should redraw.
-    #[cfg(feature = "serve")]
     pub fn apply_daemon_status_updates(&mut self) -> bool {
         use std::sync::mpsc::TryRecvError;
 
@@ -3141,7 +3125,6 @@ impl HomeView {
     /// trusted from the wire: the daemon's `view` and the local row's could
     /// disagree for a session mid-conversion, and the tmux poller owns
     /// terminal rows. Dropping the mismatch keeps one producer per row.
-    #[cfg(feature = "serve")]
     pub(super) fn apply_daemon_status_update(
         &mut self,
         update: super::daemon_status_poller::DaemonStatusUpdate,
@@ -3950,7 +3933,6 @@ impl HomeView {
         // is the exact failure mode the file lock is meant to prevent;
         // checking `daemon_pid()` first short-circuits the more expensive
         // lock acquisition in the common case.
-        #[cfg(feature = "serve")]
         if crate::cli::serve::daemon_pid().is_some() {
             return;
         }
@@ -4723,7 +4705,6 @@ impl HomeView {
         }
 
         // Poll serve dialog for subprocess startup events.
-        #[cfg(feature = "serve")]
         if let Some(view) = &mut self.serve_view {
             if view.tick() {
                 changed = true;
@@ -4782,10 +4763,7 @@ impl HomeView {
     /// (the wheel-scroll on the dashboard preview won't work while it's
     /// off).
     pub fn wants_text_selection(&self) -> bool {
-        #[cfg(feature = "serve")]
         let serve_open = self.serve_view.is_some();
-        #[cfg(not(feature = "serve"))]
-        let serve_open = false;
 
         serve_open
             || self.info_dialog.is_some()
@@ -4810,10 +4788,7 @@ impl HomeView {
     /// gate off the fast path it's supposed to enable — that's why the
     /// fast path needs this method instead.
     pub(in crate::tui) fn has_non_live_send_overlay(&self) -> bool {
-        #[cfg(feature = "serve")]
         let serve_open = self.serve_view.is_some();
-        #[cfg(not(feature = "serve"))]
-        let serve_open = false;
 
         self.show_help
             || self.search_active
@@ -4876,10 +4851,7 @@ impl HomeView {
     }
 
     pub fn has_dialog(&self) -> bool {
-        #[cfg(feature = "serve")]
         let serve_open = self.serve_view.is_some();
-        #[cfg(not(feature = "serve"))]
-        let serve_open = false;
 
         self.live_send.is_some()
             || self.show_help

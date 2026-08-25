@@ -137,19 +137,16 @@ pub struct AddArgs {
     /// to the terminal (raw tmux/PTY) so the CLI matches the TUI; pass this
     /// (or `--agent`) to opt into the structured rendering. Ignored for
     /// tools with no ACP adapter.
-    #[cfg(feature = "serve")]
     #[arg(long = "structured-view")]
     structured_view: bool,
 
     /// Pick a specific ACP agent for the structured view (e.g., aoe-agent,
     /// claude-code).
-    #[cfg(feature = "serve")]
     #[arg(long = "agent")]
     agent: Option<String>,
 
     /// Override the model used by aoe-agent (e.g., claude-opus-4-7,
     /// gpt-5, gemini-2.5-pro). Forwarded to the agent at session start.
-    #[cfg(feature = "serve")]
     #[arg(long = "model")]
     model: Option<String>,
 
@@ -284,12 +281,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     // incoherent: structured fork is its own flow (ACP `session/fork`) and is
     // offered from the web dashboard, not here. Reject it here, before any
     // worktree or scratch directory is created, so the refusal leaks nothing.
-    // The structured-view flags are serve-gated, so `wants_structured` is
-    // always false on bare-core.
-    #[cfg(feature = "serve")]
     let wants_structured = args.structured_view || args.agent.is_some();
-    #[cfg(not(feature = "serve"))]
-    let wants_structured = false;
     if args.fork_from.is_some() && wants_structured {
         bail!(
             "`--fork-from` performs a terminal fork and cannot be combined with \
@@ -730,7 +722,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     // structured. `--structured-view` (or `--agent`, which names a specific
     // ACP agent) opts into the structured rendering; a non-ACP tool always
     // runs in the terminal view.
-    #[cfg(feature = "serve")]
     {
         // `--agent` is an explicit structured-view choice: the user named a
         // specific ACP agent, so a missing adapter is a hard error rather
@@ -1220,10 +1211,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         }
     }
 
-    #[cfg(feature = "serve")]
     let is_acp = instance.is_structured();
-    #[cfg(not(feature = "serve"))]
-    let is_acp = false;
 
     if is_acp {
         // Acp sessions aren't backed by tmux: their ACP worker is
@@ -1450,7 +1438,6 @@ fn cleanup_partial_session(
 /// registry entry → custom agent with `agent_acp_cmd` → custom agent
 /// inheriting a registry-backed base via `agent_detect_as` (resolves to
 /// the base key) → legacy (`claude` → `claude`, else `aoe-agent`).
-#[cfg(feature = "serve")]
 fn pick_acp_agent_name(
     registry: &crate::acp::agent_registry::AgentRegistry,
     session: &crate::session::config::SessionConfig,

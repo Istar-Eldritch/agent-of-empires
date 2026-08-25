@@ -272,10 +272,6 @@ pub fn resolve_action(key: &KeyEvent, strict: bool, ctx: &Ctx) -> Option<Resolve
 /// key event. The structured view resolves daemon-provided command keybinds
 /// through this rather than the local registry, so it parses the raw chord
 /// string here. A chord string that does not parse never matches.
-///
-/// Only the structured view (serve-gated) executes plugin commands, so this is
-/// unused in a bare-core build; gate it to avoid a dead-code warning there.
-#[cfg(feature = "serve")]
 pub fn keybind_matches(key_str: &str, key: &KeyEvent) -> bool {
     parse_chord(key_str).is_some_and(|chord| chord_matches(&chord, key))
 }

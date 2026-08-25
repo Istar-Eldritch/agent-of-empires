@@ -199,7 +199,7 @@ pub struct NewSessionDialog {
     pub(super) structured_enabled: bool,
     /// Whether the currently selected tool can back a structured-view
     /// session (registry entry or `agent_acp_cmd`). Recomputed whenever
-    /// the tool or profile changes; always false on non-serve builds.
+    /// the tool or profile changes.
     /// Gates the Structured field's visibility, so the field-index chains
     /// treat it exactly like `has_yolo` / `has_sandbox`.
     pub(super) structured_capable: bool,
@@ -389,9 +389,7 @@ fn handle_editable_list_key(
 }
 
 /// Whether `tool` can back a structured-view (ACP) session, judged against
-/// the resolved config. Always false without the serve feature: the binary
-/// then has no structured view to open, so the wizard must not offer one.
-#[cfg(feature = "serve")]
+/// the resolved config.
 fn compute_structured_capable(tool: &str, config: &crate::session::Config) -> bool {
     // Gated behind an opt-in setting: the structured view is still
     // maturing, so the new-session toggle is hidden unless the user
@@ -400,11 +398,6 @@ fn compute_structured_capable(tool: &str, config: &crate::session::Config) -> bo
     config.acp.offer_structured_in_new_session
         && crate::session::builder::structured::tool_acp_capable(tool, config)
 }
-#[cfg(not(feature = "serve"))]
-fn compute_structured_capable(_tool: &str, _config: &crate::session::Config) -> bool {
-    false
-}
-
 /// Build label/value pairs for non-default inherited sandbox settings.
 fn build_inherited_settings(sandbox: &SandboxConfig) -> Vec<(String, String)> {
     let mut settings = Vec::new();
@@ -2145,7 +2138,6 @@ impl NewSessionDialog {
         if !(self.structured_enabled && self.structured_capable) {
             return true;
         }
-        #[cfg(feature = "serve")]
         {
             let profile = self.selected_profile().to_string();
             let config = self.resolve_config_for_path(&profile);
