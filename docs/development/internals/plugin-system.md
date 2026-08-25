@@ -91,15 +91,13 @@ fallback instead.
 `src/plugin/registry.rs` owns the in-process registry.
 
 - `BUILTINS` is a static slice of `BuiltinPlugin`, each embedding its manifest
-  TOML via `include_str!`. The `aoe.web` marker is gated on the `serve` cargo
-  feature, so it is present in every dashboard/release build and absent from a
-  TUI-only build. `default-plugins` (on by default) reserves the on-by-default
-  slot for bundled plugins that do not require the dashboard. CI runs a
-  `--no-default-features` leg (`.github/workflows/tests.yml`) that builds with
-  every default plugin compiled out and runs the e2e suite, so a default plugin
-  cannot silently grow an undeclared core dependency: core must still create,
-  attach to, and destroy a tmux + worktree session from CLI and TUI with all
-  default plugins disabled (invariant 1 of #268).
+  TOML via `include_str!`. The `aoe.web` marker is unconditional: every binary
+  carries it, and whether the dashboard surface is reachable is decided only by
+  the plugin's runtime enabled flag (#2170). There is no cargo feature that
+  compiles a bundled plugin out, so invariant 1 of #268 (core still creates,
+  attaches to, and destroys a tmux + worktree session with all bundled plugins
+  disabled) now holds by construction rather than by a build corner: the
+  session lifecycle path never consults the registry.
 - `PluginRegistry::load(config)` parses every builtin manifest, resolves each
   plugin's enabled flag from `[plugins."<id>"]` in `config.toml` (default
   enabled), and collects any parse errors as non-fatal `load_errors`.
@@ -135,7 +133,7 @@ The CLI and the palette-opened TUI manager route through
 discovered via the serve state files), the toggle POSTs the daemon endpoint so
 its worker host reconciles live, exactly like the web toggle; with no daemon,
 or when the daemon refuses (read-only, unreachable), the change is written
-locally and the surface says so. A TUI-only build always writes locally.
+locally and the surface says so.
 
 The one behavior wired to a plugin's state today: `aoe serve` refuses to start
 while `aoe.web` is disabled (`src/cli/serve.rs`).
@@ -513,7 +511,7 @@ needs the runtime (#2095).
 
 The worker host runs inside the `aoe serve` daemon (it is `serve`-gated, like
 `aoe.web`), because the host API it exposes reads and writes the event store and
-session storage the daemon owns. A TUI-only build has no host. The daemon builds
+session storage the daemon owns. The daemon builds
 one `PluginHost` at startup, launches a worker for every active plugin that
 declares a `[runtime]`, and reaps them all on shutdown
 (`AppState.plugin_host`, `src/server/mod.rs`).

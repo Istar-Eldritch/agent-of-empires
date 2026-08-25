@@ -8,11 +8,10 @@ Loaded when working with files under `web/`. Repo-wide rules live in the root
 ## Build and run
 
 - Installable as a PWA ("Install Agent of Empires" in Chrome; "Add to Home Screen" on iOS).
-- Build: `cargo build --features serve` (build.rs runs `npm install && npm run build` in `web/` when inputs change).
+- Build: `cargo build` (build.rs runs `npm install && npm run build` in `web/` when inputs change).
 - Run: `aoe serve --host 0.0.0.0` (token-based auth by default).
-- Frontend dev: `cargo xtask dev` (Unix) builds the serve binary, then runs `aoe serve` (8081) and the Vite dev server (5173, HMR) together, pointing Vite at the backend via `VITE_PROXY` so `/api` and the `/sessions/*/ws` relays resolve; open `:5173`, Ctrl-C stops both. Or run them by hand: `cd web && npm run dev` plus a separate `cargo run --features serve -- serve`.
+- Frontend dev: `cargo xtask dev` (Unix) builds the binary, then runs `aoe serve` (8081) and the Vite dev server (5173, HMR) together, pointing Vite at the backend via `VITE_PROXY` so `/api` and the `/sessions/*/ws` relays resolve; open `:5173`, Ctrl-C stops both. Or run them by hand: `cd web && npm run dev` plus a separate `cargo run -- serve`.
 - Web checks (CI gates all three on any `web/` change): `cd web && npm run format:check` (oxfmt, NOT prettier; `npm run format` to fix), `npm run lint` (ESLint), and `npx tsc -b` (typecheck, also part of `npm run build`). ESLint and tsc do not catch formatting; run oxfmt explicitly.
-- TUI-only `cargo build` (without `--features serve`) needs no JS tooling.
 
 ## Playwright Tests
 

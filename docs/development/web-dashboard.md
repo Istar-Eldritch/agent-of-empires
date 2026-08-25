@@ -10,7 +10,7 @@ The React frontend lives in `web/`. To run the pieces by hand instead of `cargo 
 
 ```bash
 cd web && npm install && npm run dev    # Vite + HMR on :5173
-cargo run --features serve -- serve     # backend, separate shell
+cargo run -- serve     # backend, separate shell
 ```
 
 To develop the frontend against an already-running "production" backend (e.g.

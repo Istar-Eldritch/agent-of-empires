@@ -10,7 +10,7 @@ cargo build --profile dev-release  # Optimized build without LTO (faster compile
 
 The release binary is at `target/release/aoe`.
 
-The web dashboard needs the `serve` feature and Node.js: `cargo build --release --features serve`. See [Web Dashboard Development](development/web-dashboard.md).
+The web dashboard is embedded in every binary, so `cargo build --release` builds it and Node.js is required. See [Web Dashboard Development](development/web-dashboard.md).
 
 ## Faster rebuilds across worktrees (kache)
 
@@ -78,7 +78,7 @@ RUSTC_WRAPPER=sccache` for a time-only cache without disk dedup).
 - **Native-linking crates still rebuild.** Dependencies with build scripts that
   link C libraries (`git2`, `openssl-sys`, `ring`) are not cacheable and
   recompile each time. They are a minority of total build time.
-- **`--features serve` and stale assets.** The web dashboard embeds `web/dist`
+- **Stale web assets.** The web dashboard embeds `web/dist`
   at compile time via `rust-embed` (the `debug-embed` feature embeds in debug
   builds too). `build.rs` emits `rerun-if-changed=web/src` (and the other web
   inputs), so rebuilding the frontend dirties the crate and kache recompiles it;
@@ -135,7 +135,7 @@ cargo xtask dev --watch
 ```
 
 It watches `src/**`, `Cargo.toml`, and `Cargo.lock`; on a change it runs
-`cargo build --features serve` and, if that succeeds, restarts `aoe serve`. A
+`cargo build` and, if that succeeds, restarts `aoe serve`. A
 failed build leaves the running backend in place and prints the error. The Vite
 dev server is never restarted, so frontend HMR keeps working and the browser
 reconnects through the proxy once the backend is back. Note that the backend

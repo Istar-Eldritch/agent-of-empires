@@ -18,9 +18,8 @@ the code alone would not give you.
 
 ## Build, Test, and Development Commands
 
-- `cargo build` / `cargo build --release`: TUI-only (release binary at `target/release/aoe`).
+- `cargo build` / `cargo build --release`: the full binary, web dashboard included (release binary at `target/release/aoe`). Needs Node.js + npm.
 - `cargo build --profile dev-release`: optimized local builds without LTO; faster compile. Lands on the release namespace (app dir, tmux prefix, serve port), so it shares state with an installed release `aoe`. Use `--release` only when producing a shipping binary.
-- `cargo build --features serve`: includes the web dashboard (needs Node.js + npm).
 - `cargo test`: unit + integration tests (some skip if `tmux` unavailable).
 - `cargo fmt` + `cargo clippy`: run before pushing; fix clippy warnings unless there's a strong reason not to.
 - Debug logging: `AGENT_OF_EMPIRES_DEBUG=1 cargo run` (writes `debug.log` in app data dir).
@@ -30,9 +29,11 @@ the code alone would not give you.
 
 ### Web Dashboard
 
-Build it with `cargo build --features serve` (needs Node.js + npm); a plain
-`cargo build` is TUI-only and needs no JS tooling. Build/run/dev-server recipes,
-the oxfmt-not-prettier CI gate, and the Playwright + Vitest suites are in
+Every binary embeds it, so any `cargo build` builds it and Node.js + npm are
+a hard build requirement (#2170). Whether the dashboard is reachable is a
+runtime question: the `aoe.web` plugin has to be enabled. Packagers who cannot
+run npm can point `AOE_WEB_DIST` at a prebuilt bundle. Build/run/dev-server
+recipes, the oxfmt-not-prettier CI gate, and the Playwright + Vitest suites are in
 `web/AGENTS.md` (loaded via its `web/CLAUDE.md` symlink when you work under
 `web/`).
 
@@ -143,7 +144,7 @@ should treat "added a test that cannot fail" as a review comment.
 
 ### E2E Tests
 
-Full-binary e2e tests live in `tests/e2e/`, exercising `aoe` through tmux (TUI) and as a subprocess (CLI). Run with `cargo test --features e2e-tests --test e2e` (add `-- --nocapture` for screen dumps on failure). The e2e target is gated behind the `e2e-tests` feature so CI can run the serve suite as parallel shards (one runs everything except e2e, one runs e2e only); `cargo test --features serve` skips e2e, and naming the target without the feature errors loudly instead of skipping. Run the full serve suite locally with `cargo test --features serve,e2e-tests`.
+Full-binary e2e tests live in `tests/e2e/`, exercising `aoe` through tmux (TUI) and as a subprocess (CLI). Run with `cargo test --features e2e-tests --test e2e` (add `-- --nocapture` for screen dumps on failure). The e2e target is gated behind the `e2e-tests` feature so CI can run the suite as parallel shards (one runs everything except e2e, one runs e2e only); a plain `cargo test` skips e2e, and naming the target without the feature errors loudly instead of skipping. Run the full suite locally with `cargo test --features e2e-tests`.
 
 The harness (`tests/e2e/harness.rs`) exposes `TuiTestHarness` with `spawn_tui()`/`spawn(args)`, `send_keys(keys)`/`type_text(text)`, `wait_for(text)` (10s timeout), `capture_screen()`/`assert_screen_contains(text)`, and `run_cli(args)`. TUI tests auto-skip without tmux; Docker tests use `#[ignore]`.
 
@@ -151,7 +152,7 @@ The harness (`tests/e2e/harness.rs`) exposes `TuiTestHarness` with `spawn_tui()`
 
 `#[serial]` (default key) is reserved for the few tests that mutate **process-global** state, which today means `HomeGuard` callers (`filewatch_tui_*`) and `update_command.rs` (`set_var("AOE_UPDATE_BASE_URL")`). `serial_test` guarantees a default-key `#[serial]` test never overlaps a default-key `#[parallel]` one, and that guarantee is what makes the `unsafe` env mutation in `HomeGuard` sound. If a test needs an isolated `$HOME` only for its *subprocesses*, it does not need `HomeGuard` or `#[serial]` at all. A named `#[serial(key)]` group (e.g. `file_watch`) only excludes other tests sharing that key, so it is not a substitute.
 
-Agent-view live-daemon e2e (`tests/e2e/acp_focus_isolation_e2e.rs`) stands up a real `aoe serve --daemon` and attaches the native TUI structured view against it. It reuses the shared Node fake-ACP agent (`web/tests/helpers/fakeAcpAgent.mjs`) to drive a deterministic pending approval, so it needs `--features serve` and Node on `PATH` (it auto-skips via `require_node!` otherwise). The harness installs the fake as the `claude` / `claude-agent-acp` / `aoe-agent` shims (`install_acp_shim`), roots `$HOME` under `/tmp` (`new_in_tmp`, keeping the worker unix socket under the macOS `sun_path` limit), and stops the worker plus daemon on `Drop` (`stop_daemon_on_drop`).
+Agent-view live-daemon e2e (`tests/e2e/acp_focus_isolation_e2e.rs`) stands up a real `aoe serve --daemon` and attaches the native TUI structured view against it. It reuses the shared Node fake-ACP agent (`web/tests/helpers/fakeAcpAgent.mjs`) to drive a deterministic pending approval, so it needs Node on `PATH` (it auto-skips via `require_node!` otherwise). The harness installs the fake as the `claude` / `claude-agent-acp` / `aoe-agent` shims (`install_acp_shim`), roots `$HOME` under `/tmp` (`new_in_tmp`, keeping the worker unix socket under the macOS `sun_path` limit), and stops the worker plus daemon on `Drop` (`stop_daemon_on_drop`).
 
 Recording (for PR reviews): `RECORD_E2E=1 cargo test --features e2e-tests --test e2e -- --nocapture` locally (needs `asciinema` + `agg`, outputs to `target/e2e-recordings/`), or add the `needs-recording` label in CI.
 
@@ -170,7 +171,7 @@ the mobile/touch recipe are in `web/AGENTS.md`.
 
 Before requesting review, every PR must clear:
 
-1. **`cargo fmt`, `cargo clippy`, `cargo test`** all clean (`--features serve` if the change touches the web dashboard or structured view). For any `web/` change, also **`cd web && npm run format:check && npm run lint`** (oxfmt + ESLint; both are CI gates, and neither ESLint nor tsc catches formatting).
+1. **`cargo fmt`, `cargo clippy`, `cargo test`** all clean. For any `web/` change, also **`cd web && npm run format:check && npm run lint`** (oxfmt + ESLint; both are CI gates, and neither ESLint nor tsc catches formatting).
 2. **Web tests when applicable.** If the change touches a user-facing dashboard flow listed in the coverage matrix mandate (auth, wizard, settings, profiles, sessions / sidebar, right panel / diff / notifications, directory browser, devices, git clone, connectivity, read-only), update `web/tests/coverage-matrix.json` and add or modify the appropriate Vitest / Playwright test. CI fails on a missing matrix entry.
 3. **Codecov checks.** See below.
 
