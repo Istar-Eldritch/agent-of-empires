@@ -205,9 +205,6 @@ test-support = []
 # Naming the target explicitly (`cargo test --test e2e`) without the feature
 # errors loudly rather than skipping silently.
 e2e-tests = []
-# Temporary shim so this commit is green while `--features serve` still appears
-# in CI, the flake, and xtask. Removed with those call sites.
-serve = []
 
 [dev-dependencies]
 serial_test = "4.0"

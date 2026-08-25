@@ -98,7 +98,7 @@ jobs:
             echo "**Old:** \`${OLD_HASH}\`  "
             echo "**New:** \`${NEW_HASH}\`"
             echo
-            echo "Auto-merge squashes this onto main once the required checks pass. The \`Nix Build Web\` PR-CI job re-runs \`nix build .#aoe-with-web\` against the merged tree."
+            echo "Auto-merge squashes this onto main once the required checks pass. The \`Nix Build Web\` PR-CI job re-runs \`nix build\` against the merged tree."
             echo
             echo "## Checklist"
             echo

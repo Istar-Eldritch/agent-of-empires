@@ -26,11 +26,9 @@ set -euo pipefail
 #                 CARGO_TARGET_DIRs through kache against an isolated temporary
 #                 store, then reads kache's restore counters and asserts the
 #                 second (warm) build restored its dependency artifacts as
-#                 reflinks/hardlinks (shared blocks) rather than copies. Also
-#                 builds --no-default-features into a third dir to prove serve and
-#                 non-serve builds coexist against one store. Needs kache
-#                 installed and a single filesystem under $TMPDIR; skips cleanly
-#                 otherwise.
+#                 reflinks/hardlinks (shared blocks) rather than copies. Needs
+#                 kache installed and a single filesystem under $TMPDIR; skips
+#                 cleanly otherwise.
 #
 # Usage:
 #   scripts/verify-shared-target.sh --self-test
@@ -149,7 +147,7 @@ full_run() {
   export CARGO_INCREMENTAL=0
   mkdir -p "$KACHE_CACHE_DIR"
 
-  local target_a="$base/target-a" target_b="$base/target-b" target_serve="$base/target-serve"
+  local target_a="$base/target-a" target_b="$base/target-b"
 
   info "building workspace into target-a (cold, populates the kache store)..."
   cargo build --manifest-path "$ROOT_DIR/Cargo.toml" --target-dir "$target_a" >/dev/null
@@ -167,11 +165,6 @@ full_run() {
   else
     fail "kache copied dependency artifacts instead of sharing them; no disk dedup across worktrees"
   fi
-
-  info "building --no-default-features into a third dir (serve + non-serve coexist)..."
-  cargo build --manifest-path "$ROOT_DIR/Cargo.toml" --no-default-features --target-dir "$target_serve" >/dev/null ||
-    fail "--no-default-features build failed against the shared store"
-  ok "--no-default-features builds against the same store as the default (serve) builds"
 
   trap - EXIT
   rm -rf "$base"

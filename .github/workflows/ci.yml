@@ -124,7 +124,7 @@ jobs:
         run: |
           mkdir -p target/ci-web-dist
           printf '<!doctype html><title>aoe docs placeholder</title>\n' > target/ci-web-dist/index.html
-          AOE_WEB_DIST="$PWD/target/ci-web-dist" cargo doc --no-deps --features serve
+          AOE_WEB_DIST="$PWD/target/ci-web-dist" cargo doc --no-deps
 
   skill:
     name: Skill Check
@@ -188,7 +188,7 @@ jobs:
           for system in $SYSTEMS; do
             echo ""
             echo "--- $system ---"
-            for pkg in default aoe-with-web; do
+            for pkg in default; do
               printf "  %s: " "$pkg"
               if output=$(nix eval ".#packages.$system.$pkg.drvPath" --raw 2>&1); then
                 echo "✓"
