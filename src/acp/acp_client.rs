@@ -1889,10 +1889,9 @@ fn runner_socket_deadline() -> std::time::Duration {
     if let Ok(raw) = std::env::var("AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS") {
         if let Ok(ms) = raw.parse::<u64>() {
             // Clamp to a floor of 100ms so a typo like
-            // `AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS=0` does not make
-            // wait_for_socket fail immediately and surface as a
-            // mysterious "runner socket did not appear" without ever
-            // polling.
+            // `AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS=0` does not make the
+            // control dial fail before it has retried even once, surfacing
+            // as a mysterious "does not speak control protocol".
             return std::time::Duration::from_millis(ms.max(100));
         }
     }
@@ -2701,14 +2700,13 @@ impl AcpClient {
         default_mode: Option<String>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<Self, AcpError> {
-        // Poll for the runner to finish binding its socket. As of #2977
-        // that is the control socket: a v3 runner binds no byte relay, so
-        // waiting on `socket_path` itself would time out forever. The runner
-        // binds before it spawns the agent so this is usually fast (a few ms)
-        // but bound the wait so a wedged runner returns a typed error
-        // instead of parking the supervisor.
+        // As of #2977 the control socket is the only one a runner binds, so
+        // that is what the daemon dials. The wait for it to appear happens
+        // inside `connect_runner_control_v3` below rather than here: probing
+        // with a throwaway connection would look to the runner like a daemon
+        // attaching and immediately detaching, churning its attach
+        // bookkeeping and running a spurious disconnect sweep.
         let control_path = crate::process::worker::control_socket_sibling(&socket_path);
-        let stream = wait_for_socket(&control_path, runner_socket_deadline()).await?;
         // #1890 regression hook (debug-only): simulate a fresh-spawn whose
         // daemon-side handshake fails after the runner is already up and
         // registered. Dropping the socket closes the daemon's end cleanly; the
@@ -2718,15 +2716,10 @@ impl AcpClient {
         // and budgeted by the env var so only the first spawn trips.
         #[cfg(debug_assertions)]
         if matches!(mode, ConnectMode::Fresh { .. }) && take_injected_fresh_handshake_failure() {
-            drop(stream);
             return Err(AcpError::Spawn(
                 "injected fresh-handshake failure (AOE_ACP_TEST_FAIL_FIRST_HANDSHAKES)".into(),
             ));
         }
-        // The readiness probe's own connection is not the protocol
-        // connection; `connect_runner_control_v3` dials its own so the Hello
-        // exchange starts from a clean stream.
-        drop(stream);
 
         let mut roots = vec![cwd.clone()];
         roots.extend(additional_dirs);
@@ -4015,37 +4008,6 @@ fn apply_env_filter(cmd: &mut std::process::Command, config: &SpawnConfig) {
     }
 }
 
-/// Poll the socket file's existence with `connect()` until a deadline.
-/// Used by `connect_via_socket` to wait for the runner to finish binding
-/// before the daemon dials in.
-async fn wait_for_socket(
-    path: &std::path::Path,
-    deadline: std::time::Duration,
-) -> Result<tokio::net::UnixStream, AcpError> {
-    let started = std::time::Instant::now();
-    let mut delay_ms = 20_u64;
-    loop {
-        if path.exists() {
-            match tokio::net::UnixStream::connect(path).await {
-                Ok(s) => return Ok(s),
-                Err(e) if matches!(e.kind(), std::io::ErrorKind::ConnectionRefused) => {
-                    // Listener not yet ready; back off and retry.
-                }
-                Err(e) => return Err(AcpError::Spawn(format!("connect {}: {e}", path.display()))),
-            }
-        }
-        if started.elapsed() >= deadline {
-            return Err(AcpError::Spawn(format!(
-                "runner socket {} did not appear within {}s",
-                path.display(),
-                deadline.as_secs()
-            )));
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-        delay_ms = (delay_ms * 2).min(200);
-    }
-}
-
 /// Bidirectional client for the runner's sibling control socket
 /// (#2976 Phase B). The runner owns the ACP handshake and the turn, so the
 /// daemon drives `initialize` / `session/*` / `session/prompt` /
@@ -4235,13 +4197,21 @@ async fn connect_runner_control_v3(
     terminal_claim: Arc<TerminalClaim>,
     prompt_in_flight: Arc<std::sync::atomic::AtomicBool>,
 ) -> Option<(Arc<DaemonControlClient>, tokio::io::DuplexStream)> {
-    // A single deadline covers connect plus the Hello read. The caller has
-    // already waited for this socket to appear, so both steps are
-    // effectively immediate; the bound only caps a wedged runner that bound
-    // the socket but never greets.
-    let bound = std::time::Duration::from_secs(2);
+    // One deadline covers waiting for the runner to bind, connecting, and
+    // reading its Hello. The runner binds before it spawns the agent, so in
+    // practice this resolves in milliseconds; the bound is what turns a
+    // wedged or too-old runner into a typed error instead of parking the
+    // supervisor.
+    let bound = runner_socket_deadline();
     let dial = async {
-        let stream = tokio::net::UnixStream::connect(control_path).await.ok()?;
+        let stream = loop {
+            match tokio::net::UnixStream::connect(control_path).await {
+                Ok(stream) => break stream,
+                // Not bound yet (or bound but not yet listening). Retry until
+                // the outer timeout gives up.
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        };
         let (mut read_half, mut write_half) = stream.into_split();
         match control_protocol::read_frame(&mut read_half).await {
             Ok(Some(ControlBody::Hello {
