@@ -7,11 +7,9 @@
 // Behavior:
 // - If `AOE_E2E_BINARY` is set and the file exists, do nothing.
 // - Else if `<repo>/target/release/aoe` exists, do nothing.
-// - Else run `cargo build --release --features serve` from the repo root.
-//   `serve` is NOT a default feature (a plain build needs no Node/npm), and
-//   every live spec spawns `aoe serve`, so building without it yields a
-//   binary whose serve subcommand doesn't exist and every spec fails with
-//   "aoe serve died before ready (exit=2)".
+// - Else run `cargo build --release` from the repo root. Every binary embeds
+//   the dashboard (#2170), so no feature flag is needed; the build does need
+//   Node/npm on PATH.
 //
 // CI sets `AOE_E2E_BINARY` (see `.github/workflows/ci.yml`) so the build
 // happens in a dedicated job step where the output is visible. Local dev
@@ -43,8 +41,8 @@ export default async function globalSetup(): Promise<void> {
     return;
   }
 
-  process.stdout.write(`[liveGlobalSetup] building aoe via 'cargo build --release --features serve'...\n`);
-  const result = spawnSync("cargo", ["build", "--release", "--features", "serve"], {
+  process.stdout.write(`[liveGlobalSetup] building aoe via 'cargo build --release'...\n`);
+  const result = spawnSync("cargo", ["build", "--release"], {
     cwd: repoRoot,
     stdio: "inherit",
   });
