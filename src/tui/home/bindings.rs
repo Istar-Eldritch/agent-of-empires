@@ -163,8 +163,6 @@ pub struct PaletteMeta {
     pub title: &'static str,
     pub keywords: &'static [&'static str],
     pub group: PaletteGroup,
-    /// Only included when the `serve` feature is on (just the Serve command).
-    pub serve_only: bool,
 }
 
 pub struct Binding {
@@ -399,7 +397,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Toggle favorite",
             keywords: &["star", "pin", "fav"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
     Binding {
@@ -415,7 +412,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Toggle snooze",
             keywords: &["later", "defer", "wait"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
     // --- terminal-view only ---
@@ -455,7 +451,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Show keyboard shortcuts",
             keywords: &["keys", "shortcuts"],
             group: PaletteGroup::Settings,
-            serve_only: false,
         }),
     },
     Binding {
@@ -468,7 +463,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Toggle system health strip",
             keywords: &["system", "health", "memory", "cpu", "pressure"],
             group: PaletteGroup::Settings,
-            serve_only: false,
         }),
     },
     Binding {
@@ -481,7 +475,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Open System Health",
             keywords: &["system", "health", "memory", "cpu", "agents", "processes"],
             group: PaletteGroup::Views,
-            serve_only: false,
         }),
     },
     Binding {
@@ -519,7 +512,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "New session",
             keywords: &["create", "add", "spawn"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
     Binding {
@@ -535,7 +527,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "New session from selection",
             keywords: &["create", "duplicate", "clone"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
     // New session from a saved project. Follows the bare->Shift relocation
@@ -553,7 +544,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "New session from saved project",
             keywords: &["project", "saved", "registry", "create"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
     Binding {
@@ -569,7 +559,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Attach to paired terminal",
             keywords: &["shell", "host"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
     Binding {
@@ -585,7 +574,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Toggle Agent / Terminal view",
             keywords: &["switch", "shell"],
             group: PaletteGroup::Views,
-            serve_only: false,
         }),
     },
     Binding {
@@ -601,7 +589,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Send message to agent",
             keywords: &["prompt", "tell", "say"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
     Binding {
@@ -617,7 +604,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Respond to permission prompt",
             keywords: &["allow", "deny", "approve", "permission"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
     Binding {
@@ -633,7 +619,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Stop session / kill terminal",
             keywords: &["kill", "end", "halt", "terminal"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
     Binding {
@@ -649,7 +634,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Delete session or group",
             keywords: &["remove", "trash"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
     Binding {
@@ -665,7 +649,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Rename or move to group",
             keywords: &["title", "label", "move", "regroup"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
     Binding {
@@ -681,7 +664,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Edit worktree workdir name",
             keywords: &["worktree", "workdir", "directory", "branch", "rename"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
     Binding {
@@ -699,7 +681,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Add project to this session",
             keywords: &["repo", "attach", "worktree", "multi-repo", "workspace"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
     Binding {
@@ -715,7 +696,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Open diff view",
             keywords: &["git", "changes"],
             group: PaletteGroup::Views,
-            serve_only: false,
         }),
     },
     Binding {
@@ -731,7 +711,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Open serve (LAN / Tunnel)",
             keywords: &["web", "remote", "phone", "tunnel"],
             group: PaletteGroup::Settings,
-            serve_only: true,
         }),
     },
     Binding {
@@ -747,7 +726,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Open settings",
             keywords: &["preferences", "config"],
             group: PaletteGroup::Settings,
-            serve_only: false,
         }),
     },
     // Pin toggle shares `p` (Shift+P in strict) with Projects, but only fires
@@ -783,7 +761,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Manage projects",
             keywords: &["registry", "repos", "multi-repo", "workspace"],
             group: PaletteGroup::Settings,
-            serve_only: false,
         }),
     },
     Binding {
@@ -799,7 +776,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Switch profile",
             keywords: &["account", "switch"],
             group: PaletteGroup::Settings,
-            serve_only: false,
         }),
     },
     Binding {
@@ -815,7 +791,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Restart session",
             keywords: &["reload", "respawn", "reset"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
     // `U` toggles read/unread, pinned to Shift+u in BOTH modes (matches the
@@ -837,7 +812,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Toggle read/unread",
             keywords: &["read", "unread", "seen", "flag", "viewed"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
     Binding {
@@ -864,7 +838,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Toggle archive",
             keywords: &["park", "stash", "done", "zzz"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
     Binding {
@@ -880,7 +853,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Toggle preview info header",
             keywords: &["hide", "show", "info", "header", "preview"],
             group: PaletteGroup::Views,
-            serve_only: false,
         }),
     },
     Binding {
@@ -897,7 +869,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Sort order",
             keywords: &["order", "sort", "pick"],
             group: PaletteGroup::Views,
-            serve_only: false,
         }),
     },
     Binding {
@@ -913,7 +884,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Group by",
             keywords: &["group", "project", "pick"],
             group: PaletteGroup::Views,
-            serve_only: false,
         }),
     },
     Binding {
@@ -929,7 +899,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Jump to next waiting / idle session",
             keywords: &["jump", "next", "waiting", "idle"],
             group: PaletteGroup::Views,
-            serve_only: false,
         }),
     },
     // Tips overlay. No key chords: it's reached from the palette, the badge,
@@ -946,7 +915,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Show tips",
             keywords: &["tips", "hints", "learn", "discover", "did you know"],
             group: PaletteGroup::Settings,
-            serve_only: false,
         }),
     },
     // Palette-only: no default chord in either mode; the manager opens from
@@ -961,7 +929,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Manage plugins",
             keywords: &["plugin", "extension", "enable", "disable"],
             group: PaletteGroup::Settings,
-            serve_only: false,
         }),
     },
     // Palette-only: no default chord in either mode; the manager opens from
@@ -976,7 +943,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Manage skills",
             keywords: &["skill", "skills", "prompt"],
             group: PaletteGroup::Settings,
-            serve_only: false,
         }),
     },
     // Palette-only: Shift+F collides with strict-mode ToggleFavorite under
@@ -992,7 +958,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Fork session (resume context, diverge)",
             keywords: &["fork", "branch", "duplicate", "clone", "context", "resume"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
     // The mnemonic keys (a/A, n/N, r/R, t/T) are all taken and the home
@@ -1011,7 +976,6 @@ pub static BINDINGS: &[Binding] = &[
             title: "Auto-name now",
             keywords: &["rename", "title", "name", "auto", "smart", "generate"],
             group: PaletteGroup::Actions,
-            serve_only: false,
         }),
     },
 ];

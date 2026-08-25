@@ -3744,8 +3744,7 @@ impl HomeView {
     }
 
     fn open_command_palette(&mut self) {
-        let serve_enabled = cfg!(feature = "serve");
-        let mut entries: Vec<PaletteCommand> = builtin_commands(serve_enabled, self.strict_hotkeys);
+        let mut entries: Vec<PaletteCommand> = builtin_commands(self.strict_hotkeys);
 
         // Quit lives in the registry but is excluded from `builtin_commands`
         // (no palette metadata) so it can sit in the Settings group at the end;
