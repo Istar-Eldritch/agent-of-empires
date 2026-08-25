@@ -2701,11 +2701,14 @@ impl AcpClient {
         default_mode: Option<String>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<Self, AcpError> {
-        // Poll for the runner to finish binding the socket. The runner
-        // binds before it spawns the agent so this is usually fast (a
-        // few ms) but bound the wait so a wedged runner returns a typed
-        // error instead of parking the supervisor.
-        let stream = wait_for_socket(&socket_path, runner_socket_deadline()).await?;
+        // Poll for the runner to finish binding its socket. As of #2977
+        // that is the control socket: a v3 runner binds no byte relay, so
+        // waiting on `socket_path` itself would time out forever. The runner
+        // binds before it spawns the agent so this is usually fast (a few ms)
+        // but bound the wait so a wedged runner returns a typed error
+        // instead of parking the supervisor.
+        let control_path = crate::process::worker::control_socket_sibling(&socket_path);
+        let stream = wait_for_socket(&control_path, runner_socket_deadline()).await?;
         // #1890 regression hook (debug-only): simulate a fresh-spawn whose
         // daemon-side handshake fails after the runner is already up and
         // registered. Dropping the socket closes the daemon's end cleanly; the
@@ -2720,8 +2723,10 @@ impl AcpClient {
                 "injected fresh-handshake failure (AOE_ACP_TEST_FAIL_FIRST_HANDSHAKES)".into(),
             ));
         }
-        let (read_half, write_half) = stream.into_split();
-        let transport = ByteStreams::new(write_half.compat_write(), read_half.compat());
+        // The readiness probe's own connection is not the protocol
+        // connection; `connect_runner_control_v3` dials its own so the Hello
+        // exchange starts from a clean stream.
+        drop(stream);
 
         let mut roots = vec![cwd.clone()];
         roots.extend(additional_dirs);
@@ -2744,27 +2749,40 @@ impl AcpClient {
         let pending_for_task = pending_responders.clone();
         let expected_agent = ExpectedAgent::from_command(&install_binary);
 
-        // #2976 Phase B: dial the runner's sibling control socket. A v2
-        // runner returns a control client the connection task uses to drive
-        // the handshake and every turn (the runner owns the ACP client side
-        // now). The shared terminal guard lets the client's reader deliver
-        // an adopted turn's completion on a mid-flight resume, so the
-        // resume-idle / between-prompt watchdogs stand down. An absent or
-        // older (v1) runner returns None: the task falls back to the
-        // byte-relay handshake and, for a mid-flight resume, the resume-idle
-        // watchdog (guard left None so it still fires).
+        // #2977: dial the control socket, which is now the whole transport.
+        // The returned duplex is what the crate connection speaks over: the
+        // runner owns the handshake, the turn, and every JSON-RPC id toward
+        // the agent, and the shim translates the rest. The shared terminal
+        // guard lets the client's reader deliver an adopted turn's completion
+        // on a mid-flight resume, so the resume-idle / between-prompt
+        // watchdogs stand down.
+        //
+        // A runner too old to speak v3 yields None. There is no byte relay to
+        // fall back to any more, so this is a hard failure for that runner
+        // rather than a downgrade; the reconciler's runner-version migration
+        // is what keeps a v1 worker on its legacy path until it drains.
         let guard = Arc::new(TerminalClaim::new());
         // Shared with the connection task so the control reader can hand idle
         // ownership back when it surfaces a waiterless completion (#3190).
         let prompt_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let control_client = connect_runner_control_v2(
-            &socket_path,
+        let Some((control_client, crate_transport)) = connect_runner_control_v3(
+            &control_path,
             event_tx.clone(),
             session_label.clone(),
             guard.clone(),
             prompt_in_flight.clone(),
         )
-        .await;
+        .await
+        else {
+            return Err(AcpError::Spawn(format!(
+                "runner at {} does not speak control protocol v{}",
+                control_path.display(),
+                control_protocol::CONTROL_PROTOCOL_VERSION
+            )));
+        };
+        let control_client = Some(control_client);
+        let (read_half, write_half) = tokio::io::split(crate_transport);
+        let transport = ByteStreams::new(write_half.compat_write(), read_half.compat());
         let external_terminal_guard = control_client.as_ref().map(|_| guard);
         let external_prompt_in_flight = control_client.as_ref().map(|_| prompt_in_flight);
 
@@ -4040,9 +4058,72 @@ async fn wait_for_socket(
 /// mid-flight resume, where this daemon never issued the prompt) the reader
 /// CAS-claims the terminal guard and fires `Stopped` so the UI clears.
 struct DaemonControlClient {
-    write: Mutex<tokio::net::unix::OwnedWriteHalf>,
+    write: Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
     handshake_rx: Mutex<mpsc::Receiver<ControlBody>>,
     completion: Arc<std::sync::Mutex<Option<oneshot::Sender<control_protocol::PromptOutcome>>>>,
+}
+
+/// Correlation state for the control-channel transport shim (#2977).
+///
+/// With `<id>.sock` retired there is no byte stream for the crate
+/// connection to speak over, but everything it does on the runner path
+/// besides the handshake and the turn is still ordinary ACP: nine incoming
+/// request handlers, the `session/update` notification handler, and five
+/// outgoing methods the runner does not own. Rather than rewrite the
+/// 2,800-line connection task around a second driver, the shim gives the
+/// crate a synthetic in-process duplex and translates at the boundary. The
+/// crate is unchanged, the direct-stdio path is untouched, and the relay
+/// socket is still gone.
+///
+/// Two independent id spaces meet here, and neither side may see the
+/// other's:
+///
+/// - **Reverse** (runner -> crate): the runner's `call_id` is mapped onto a
+///   synthetic integer JSON-RPC id, because the crate needs an id to route
+///   a request to a handler and hand back a `Responder`.
+/// - **Forward** (crate -> runner): the crate allocates its own (UUID
+///   string) request id, which is mapped onto a `call_id` for the runner.
+#[derive(Default)]
+struct ShimCorrelation {
+    /// Synthetic JSON-RPC id -> the runner's `call_id`, for answering a
+    /// reverse call once a crate handler has produced a response.
+    reverse: HashMap<i64, u64>,
+    /// The runner's forward `call_id` -> the crate's own request id, for
+    /// handing an `AgentResult` back to the waiting `send_request`.
+    forward: HashMap<u64, serde_json::Value>,
+    /// Allocator for synthetic reverse ids. Negative and descending so a
+    /// synthetic id can never be mistaken for one the crate minted, which
+    /// would silently cross the two lanes.
+    next_synthetic: i64,
+    /// Allocator for forward `call_id`s.
+    next_forward: u64,
+}
+
+impl ShimCorrelation {
+    fn synthetic_id(&mut self) -> i64 {
+        self.next_synthetic -= 1;
+        self.next_synthetic
+    }
+
+    fn forward_id(&mut self) -> u64 {
+        self.next_forward += 1;
+        self.next_forward
+    }
+}
+
+/// Serialize one ndjson line into the crate-facing duplex. Returns false
+/// once the crate side has hung up.
+async fn shim_write_line(
+    duplex: &Mutex<tokio::io::WriteHalf<tokio::io::DuplexStream>>,
+    value: &serde_json::Value,
+) -> bool {
+    use tokio::io::AsyncWriteExt;
+    let Ok(mut bytes) = serde_json::to_vec(value) else {
+        return false;
+    };
+    bytes.push(b'\n');
+    let mut w = duplex.lock().await;
+    w.write_all(&bytes).await.is_ok() && w.flush().await.is_ok()
 }
 
 impl DaemonControlClient {
@@ -4064,13 +4145,23 @@ impl DaemonControlClient {
         self.send(ControlBody::Initialize { request })
             .await
             .map_err(|e| acp_internal_error(format!("control write failed: {e}")))?;
-        match self.handshake_rx.lock().await.recv().await {
+        let initialized = match self.handshake_rx.lock().await.recv().await {
             Some(ControlBody::Initialized { result }) => Ok(result),
             Some(ControlBody::HandshakeFailed { error }) => Err(acp_error_from_value(error)),
             _ => Err(acp_internal_error(
                 "control channel closed during initialize".into(),
             )),
+        }?;
+        // Release the runner's backlog. `initialize` is the one handshake
+        // step every attach path runs (a mid-flight Resume deliberately skips
+        // `session/new|load`), so gating the flush here covers resume as well
+        // as a cold start, and the daemon has its capabilities and session
+        // resources by this point. A failed send is not fatal; the caller
+        // surfaces the dead channel on its next use.
+        if let Err(e) = self.send(ControlBody::Ready).await {
+            warn!(target: "acp.protocol", "control Ready write failed: {e}");
         }
+        Ok(initialized)
     }
 
     /// Run the session-creation request the runner owns; returns
@@ -4147,23 +4238,20 @@ impl DaemonControlClient {
 /// protocol v2 (#2976), return a [`DaemonControlClient`] and spawn its
 /// reader. Returns None for an absent or older (v1) runner, whose caller
 /// falls back to the byte-relay handshake plus the resume-idle watchdog.
-async fn connect_runner_control_v2(
-    main_socket: &std::path::Path,
+async fn connect_runner_control_v3(
+    control_path: &std::path::Path,
     event_tx: mpsc::Sender<Event>,
     session_label: String,
     terminal_claim: Arc<TerminalClaim>,
     prompt_in_flight: Arc<std::sync::atomic::AtomicBool>,
-) -> Option<Arc<DaemonControlClient>> {
-    let control_path = crate::process::worker::control_socket_sibling(main_socket);
-    // A single deadline covers connect plus the Hello read. The runner
-    // binds the control socket before the main relay socket the caller
-    // already waited for, so both steps are effectively immediate; the
-    // bound only caps a wedged runner that bound the socket but never
-    // greets. An old socketless runner fails connect at once and falls
-    // back to the byte-relay handshake.
+) -> Option<(Arc<DaemonControlClient>, tokio::io::DuplexStream)> {
+    // A single deadline covers connect plus the Hello read. The caller has
+    // already waited for this socket to appear, so both steps are
+    // effectively immediate; the bound only caps a wedged runner that bound
+    // the socket but never greets.
     let bound = std::time::Duration::from_secs(2);
     let dial = async {
-        let stream = tokio::net::UnixStream::connect(&control_path).await.ok()?;
+        let stream = tokio::net::UnixStream::connect(control_path).await.ok()?;
         let (mut read_half, mut write_half) = stream.into_split();
         match control_protocol::read_frame(&mut read_half).await {
             Ok(Some(ControlBody::Hello {
@@ -4188,7 +4276,7 @@ async fn connect_runner_control_v2(
             debug!(
                 target: "acp.protocol",
                 session = %session_label,
-                "no usable v2 runner control socket; using byte-relay handshake + watchdog"
+                "no usable v3 runner control socket; treating the runner as unusable"
             );
             return None;
         }
@@ -4197,8 +4285,19 @@ async fn connect_runner_control_v2(
     info!(
         target: "acp.protocol",
         session = %session_label,
-        "runner control channel v2 attached; runner owns handshake + turn"
+        "runner control channel v3 attached; runner owns the ACP protocol"
     );
+
+    // The crate connection's synthetic transport. `crate_side` is handed to
+    // `ByteStreams`; `shim_side` is split so the reader can inject inbound
+    // ACP lines and the pump can read the crate's outbound ones. 64 KiB
+    // matches the pipe size the stdio path gets.
+    let (crate_side, shim_side) = tokio::io::duplex(64 * 1024);
+    let (shim_read, shim_write) = tokio::io::split(shim_side);
+    let shim_write = Arc::new(Mutex::new(shim_write));
+    let correlation = Arc::new(Mutex::new(ShimCorrelation::default()));
+
+    let write_half = Arc::new(Mutex::new(write_half));
 
     let reader_prompt_in_flight = prompt_in_flight.clone();
     let (hs_tx, hs_rx) = mpsc::channel::<ControlBody>(8);
@@ -4207,6 +4306,8 @@ async fn connect_runner_control_v2(
     > = Arc::new(std::sync::Mutex::new(None));
     let reader_completion = completion.clone();
     let reader_session = session_label.clone();
+    let reader_shim_write = shim_write.clone();
+    let reader_correlation = correlation.clone();
     tokio::spawn(async move {
         loop {
             match control_protocol::read_frame(&mut read_half).await {
@@ -4272,6 +4373,70 @@ async fn connect_runner_control_v2(
                         }
                     }
                 }
+                // #2977 reverse lane: an agent-to-client request. Injected
+                // into the crate transport as an ordinary JSON-RPC request
+                // under a synthetic id, so the nine `on_receive_request`
+                // handlers serve it exactly as they did off the relay. The
+                // crate spawns each handler, so a permission parked for
+                // minutes never blocks this reader or the frames behind it.
+                Ok(Some(ControlBody::ServerCall {
+                    call_id,
+                    method,
+                    params,
+                })) => {
+                    let synthetic = {
+                        let mut c = reader_correlation.lock().await;
+                        let id = c.synthetic_id();
+                        c.reverse.insert(id, call_id);
+                        id
+                    };
+                    let line = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": synthetic,
+                        "method": method,
+                        "params": params,
+                    });
+                    if !shim_write_line(&reader_shim_write, &line).await {
+                        return;
+                    }
+                }
+                // #2977: a fire-and-forget agent notification (session/update
+                // and anything else the adapter emits), replayed verbatim.
+                Ok(Some(ControlBody::Notify { method, params })) => {
+                    let line = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": method,
+                        "params": params,
+                    });
+                    if !shim_write_line(&reader_shim_write, &line).await {
+                        return;
+                    }
+                }
+                // #2977 forward lane: the runner's answer to a request the
+                // crate connection made. Handed back under the crate's own
+                // id so its `send_request` future resolves.
+                Ok(Some(ControlBody::AgentResult { call_id, result })) => {
+                    let id = reader_correlation.lock().await.forward.remove(&call_id);
+                    if let Some(id) = id {
+                        let line = serde_json::json!({
+                            "jsonrpc": "2.0", "id": id, "result": result,
+                        });
+                        if !shim_write_line(&reader_shim_write, &line).await {
+                            return;
+                        }
+                    }
+                }
+                Ok(Some(ControlBody::AgentError { call_id, error })) => {
+                    let id = reader_correlation.lock().await.forward.remove(&call_id);
+                    if let Some(id) = id {
+                        let line = serde_json::json!({
+                            "jsonrpc": "2.0", "id": id, "error": error,
+                        });
+                        if !shim_write_line(&reader_shim_write, &line).await {
+                            return;
+                        }
+                    }
+                }
                 Ok(Some(_)) => {}
                 Ok(None) => return,
                 Err(e) => {
@@ -4286,11 +4451,99 @@ async fn connect_runner_control_v2(
         }
     });
 
-    Some(Arc::new(DaemonControlClient {
-        write: Mutex::new(write_half),
-        handshake_rx: Mutex::new(hs_rx),
-        completion,
-    }))
+    // Pump the other direction: everything the crate connection writes to
+    // the synthetic transport. A line with a `method` is one of the five
+    // client-to-agent requests the runner does not own, so it becomes an
+    // `AgentCall`; a line without one answers a reverse call the crate just
+    // handled, so it becomes a `ServerResult` / `ServerError`.
+    let pump_write = write_half.clone();
+    let pump_correlation = correlation.clone();
+    let pump_session = session_label.clone();
+    tokio::spawn(async move {
+        let mut reader = tokio::io::BufReader::new(shim_read);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line).await {
+                Ok(0) => return,
+                Ok(_) => {}
+                Err(e) => {
+                    debug!(
+                        target: "acp.protocol",
+                        session = %pump_session,
+                        "shim transport read ended: {e}"
+                    );
+                    return;
+                }
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+                continue;
+            };
+            let frame = if let Some(method) = value.get("method").and_then(|m| m.as_str()) {
+                let Some(id) = value.get("id").cloned() else {
+                    // A notification from the crate. Nothing outbound today
+                    // uses one, and the runner owns `session/cancel`, so
+                    // there is no lane for it.
+                    continue;
+                };
+                let call_id = {
+                    let mut c = pump_correlation.lock().await;
+                    let call_id = c.forward_id();
+                    c.forward.insert(call_id, id);
+                    call_id
+                };
+                ControlBody::AgentCall {
+                    call_id,
+                    method: method.to_string(),
+                    params: value
+                        .get("params")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                }
+            } else {
+                let Some(synthetic) = value.get("id").and_then(|i| i.as_i64()) else {
+                    continue;
+                };
+                let Some(call_id) = pump_correlation.lock().await.reverse.remove(&synthetic) else {
+                    continue;
+                };
+                match value.get("error") {
+                    Some(err) if !err.is_null() => ControlBody::ServerError {
+                        call_id,
+                        error: serde_json::from_value(err.clone()).unwrap_or_else(|_| {
+                            control_protocol::JsonRpcError::new(
+                                control_protocol::METHOD_NOT_FOUND,
+                                "handler produced a malformed error",
+                            )
+                        }),
+                    },
+                    _ => ControlBody::ServerResult {
+                        call_id,
+                        result: value
+                            .get("result")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                    },
+                }
+            };
+            let mut w = pump_write.lock().await;
+            if control_protocol::write_frame(&mut *w, &frame)
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
+
+    Some((
+        Arc::new(DaemonControlClient {
+            write: write_half,
+            handshake_rx: Mutex::new(hs_rx),
+            completion,
+        }),
+        crate_side,
+    ))
 }
 
 /// Map a runner-reported prompt outcome to an `Event::Stopped` reason. A
@@ -4301,15 +4554,28 @@ async fn connect_runner_control_v2(
 /// to `prompt_complete` as well; the turn is over either way.
 ///
 /// The other ACP stop reasons (`cancelled`, `max_tokens`, `refusal`,
-/// `max_turn_requests`) collapse into `prompt_complete`, since they all
-/// render Idle today. Preserving their identity for the UI is tracked as a
-/// follow-up on the Phase C runner-terminator work (#2977).
+/// `max_turn_requests`) are preserved verbatim as of #2977 rather than
+/// collapsing into `prompt_complete`. They all still render Idle, so nothing
+/// downstream had to change, but the reason now reaches the UI and the event
+/// log, where "the agent hit its token ceiling" and "the turn ended normally"
+/// stop looking identical after the fact.
 fn control_outcome_reason(outcome: &crate::acp::control_protocol::PromptOutcome) -> String {
     use crate::acp::control_protocol::PromptOutcome;
     match outcome {
         PromptOutcome::Completed {
             stop_reason: Some(r),
-        } if r == "rate_limited" || r == "rate_limit" => "rate_limited".to_string(),
+        } => match r.as_str() {
+            // The one reason with special downstream handling; the adapter
+            // spells it both ways.
+            "rate_limited" | "rate_limit" => "rate_limited".to_string(),
+            "cancelled" | "max_tokens" | "refusal" | "max_turn_requests" => r.clone(),
+            // An unrecognized stop reason still renders Idle; report the
+            // generic terminal rather than inventing a reason string the UI
+            // has no mapping for.
+            _ => "prompt_complete".to_string(),
+        },
+        // No stop reason, an agent error envelope, or a runner-side abort:
+        // the turn is over either way.
         _ => "prompt_complete".to_string(),
     }
 }
@@ -9352,24 +9618,12 @@ where
     }
 }
 
-/// Everything the nine agent-to-client handlers need, so one value can be
-/// threaded through [`dispatch_server_method`] instead of a nine-argument
-/// call. Cheap to clone: every field is an `Arc` or a small handle.
-#[derive(Clone)]
-struct ServerDispatchCtx {
-    resources: SessionResources,
-    event_tx: mpsc::Sender<Event>,
-    pending: PendingResponders,
-    profile: &'static agent_profiles::AgentProfile,
-    tool_context_cache: ToolContextCache,
-}
-
 /// Bridge a handler's `Result<Response, Error>` onto a crate [`Responder`].
 ///
-/// The direct-stdio path keeps its typed `on_receive_request` closures, but
-/// each one now calls the same handler the control-channel dispatcher does,
-/// so there is exactly one implementation of every method (#2977). Without
-/// this the two transports would drift.
+/// Separating the work from the reply keeps each handler transport-agnostic:
+/// it computes an answer and does not know whether the request arrived over
+/// the direct-stdio pipe or was injected by the control-channel shim
+/// (#2977). One implementation serves both.
 fn reply<T: agent_client_protocol::JsonRpcResponse>(
     responder: Responder<T>,
     outcome: Result<T, agent_client_protocol::Error>,
@@ -9378,113 +9632,6 @@ fn reply<T: agent_client_protocol::JsonRpcResponse>(
         Ok(value) => responder.respond(value),
         Err(e) => responder.respond_with_error(e),
     }
-}
-
-/// One dispatch arm: parse the opaque params into the crate request type,
-/// run the handler, serialize the response back to JSON.
-///
-/// Deliberately uses the crate's own `parse_message` / `into_json` rather
-/// than bare serde, so a payload crossing the control channel is shaped
-/// exactly as the crate would have shaped it on the byte relay. A serde
-/// round trip would be *nearly* identical, and the near-misses (untagged
-/// enums, skipped `None`s, method-sensitive response bodies) are precisely
-/// the ones that would surface as an adapter-specific bug in the field.
-async fn dispatch_arm<Req, Fut>(
-    method: &str,
-    params: serde_json::Value,
-    run: impl FnOnce(Req) -> Fut,
-) -> Result<serde_json::Value, agent_client_protocol::Error>
-where
-    Req: agent_client_protocol::JsonRpcRequest,
-    Fut: std::future::Future<Output = Result<Req::Response, agent_client_protocol::Error>>,
-{
-    let request = Req::parse_message(method, &params)?;
-    run(request).await?.into_json(method)
-}
-
-/// Service one agent-to-client request that arrived over the control channel
-/// as opaque JSON (#2977). The runner-path counterpart of the nine typed
-/// `on_receive_request` closures the direct-stdio path registers; both funnel
-/// into the same `handle_*` functions.
-///
-/// Method identity comes from the crate's `matches_method` rather than
-/// hardcoded strings, so a crate-side rename cannot silently turn a live
-/// method into a "not found".
-async fn dispatch_server_method(
-    method: &str,
-    params: serde_json::Value,
-    ctx: ServerDispatchCtx,
-) -> Result<serde_json::Value, agent_client_protocol::Error> {
-    use agent_client_protocol::JsonRpcMessage;
-
-    if RequestPermissionRequest::matches_method(method) {
-        return dispatch_arm(method, params, |req| {
-            handle_permission_request(
-                req,
-                ctx.event_tx.clone(),
-                ctx.pending.clone(),
-                ctx.profile,
-                ctx.tool_context_cache.clone(),
-            )
-        })
-        .await;
-    }
-    if CreateElicitationRequest::matches_method(method) {
-        return dispatch_arm(method, params, |req| {
-            handle_elicitation_request(req, ctx.event_tx.clone(), ctx.pending.clone())
-        })
-        .await;
-    }
-    if ReadTextFileRequest::matches_method(method) {
-        return dispatch_arm(method, params, |req| {
-            handle_read_text_file(req, ctx.resources.clone())
-        })
-        .await;
-    }
-    if WriteTextFileRequest::matches_method(method) {
-        return dispatch_arm(method, params, |req| {
-            handle_write_text_file(req, ctx.resources.clone())
-        })
-        .await;
-    }
-    if CreateTerminalRequest::matches_method(method) {
-        return dispatch_arm(method, params, |req| {
-            handle_create_terminal(req, ctx.resources.clone())
-        })
-        .await;
-    }
-    if TerminalOutputRequest::matches_method(method) {
-        return dispatch_arm(method, params, |req| {
-            handle_terminal_output(req, ctx.resources.clone())
-        })
-        .await;
-    }
-    if WaitForTerminalExitRequest::matches_method(method) {
-        return dispatch_arm(method, params, |req| {
-            handle_wait_for_terminal_exit(req, ctx.resources.clone())
-        })
-        .await;
-    }
-    if KillTerminalRequest::matches_method(method) {
-        return dispatch_arm(method, params, |req| {
-            handle_kill_terminal(req, ctx.resources.clone())
-        })
-        .await;
-    }
-    if ReleaseTerminalRequest::matches_method(method) {
-        return dispatch_arm(method, params, |req| {
-            handle_release_terminal(req, ctx.resources.clone())
-        })
-        .await;
-    }
-    // An unhandled request MUST get an error, never a silent drop: the agent
-    // is parked on this id and would wait forever.
-    warn!(
-        target: "acp.protocol",
-        method,
-        "agent issued an unsupported client method; answering method_not_found"
-    );
-    Err(agent_client_protocol::Error::method_not_found())
 }
 
 async fn handle_read_text_file(
@@ -15818,9 +15965,9 @@ done
         }
     }
 
-    /// Daemon-side control consumer (#2976 Phase B): a v2 runner that greets
-    /// with a matching `Hello` and then reports `PromptCompleted` for an
-    /// adopted turn (no prompt awaiting on this daemon) drives an
+    /// Daemon-side control consumer: a runner that greets with a matching
+    /// `Hello` and then reports `PromptCompleted` for an adopted turn (no
+    /// prompt awaiting on this daemon) drives an
     /// `Event::Stopped { reason: "prompt_complete" }` and claims the shared
     /// terminal guard so the resume-idle watchdog stands down.
     #[tokio::test]
@@ -15867,15 +16014,16 @@ done
         // Set, as a stranded prompt loop would leave it: the reader must hand
         // idle ownership back when it surfaces the waiterless completion.
         let prompt_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let client = connect_runner_control_v2(
-            &main_socket,
+        let client = connect_runner_control_v3(
+            &crate::process::worker::control_socket_sibling(&main_socket),
             event_tx,
             "s".into(),
             guard.clone(),
             prompt_in_flight.clone(),
         )
         .await
-        .expect("v2 control client");
+        .expect("v3 control client")
+        .0;
 
         let ev = tokio::time::timeout(std::time::Duration::from_secs(5), event_rx.recv())
             .await
@@ -15919,8 +16067,8 @@ done
 
         let (event_tx, mut event_rx) = mpsc::channel::<Event>(8);
         let guard = Arc::new(TerminalClaim::new());
-        let client = connect_runner_control_v2(
-            &main_socket,
+        let client = connect_runner_control_v3(
+            &crate::process::worker::control_socket_sibling(&main_socket),
             event_tx,
             "s".into(),
             guard.clone(),
@@ -15930,7 +16078,7 @@ done
 
         assert!(
             client.is_none(),
-            "unknown control version must not yield a v2 client"
+            "unknown control version must not yield a control client"
         );
         assert!(
             !guard.claimed(),
@@ -15977,9 +16125,10 @@ done
         assert!(claim.claim());
     }
 
-    /// The load-bearing backward-compat path: an old runner that never binds
-    /// the control socket leaves the guard unclaimed, so the resume-idle
-    /// watchdog remains the terminal authority.
+    /// A runner that never binds the control socket yields no client and
+    /// leaves the guard unclaimed. As of #2977 there is no relay to fall back
+    /// to, so the caller turns this into a typed spawn error; the reconciler's
+    /// runner-version migration is what keeps a live v1 worker usable.
     #[tokio::test]
     async fn runner_control_absent_socket_leaves_guard_unclaimed() {
         let tmp = tempfile::tempdir().unwrap();
@@ -15988,8 +16137,8 @@ done
 
         let (event_tx, mut event_rx) = mpsc::channel::<Event>(8);
         let guard = Arc::new(TerminalClaim::new());
-        let client = connect_runner_control_v2(
-            &main_socket,
+        let client = connect_runner_control_v3(
+            &crate::process::worker::control_socket_sibling(&main_socket),
             event_tx,
             "s".into(),
             guard.clone(),
@@ -15999,11 +16148,11 @@ done
 
         assert!(
             client.is_none(),
-            "absent control socket must fall back to the watchdog"
+            "absent control socket must not yield a control client"
         );
         assert!(
             !guard.claimed(),
-            "absent control socket must fall back to the watchdog"
+            "absent control socket must not yield a control client"
         );
         assert!(event_rx.try_recv().is_err());
     }
