@@ -1,6 +1,7 @@
 //! Typed control channel between the daemon and the `aoe __acp-runner`
-//! shim, carried on a sibling `<id>.control.sock` alongside the raw ACP
-//! byte relay on `<id>.sock`.
+//! shim, carried on `<id>.control.sock`. As of Phase C (#2977) this is
+//! the ONLY channel: the raw ACP byte relay on `<id>.sock` is retired and
+//! the runner is the sole ACP protocol terminator.
 //!
 //! Phase A of #1054 (runner-side ACP protocol termination): the runner
 //! observes the agent's response to the daemon-issued `session/prompt`
@@ -19,15 +20,32 @@
 //! Prompts and cancels move here too ([`ControlBody::Prompt`] /
 //! [`ControlBody::Cancel`]); the runner assigns the canonical
 //! `session/prompt` JSON-RPC id and reports the typed
-//! [`ControlBody::PromptCompleted`] outcome. Agent `session/update`
-//! notifications and server->client callbacks (permission / fs /
-//! terminal) still flow over the raw byte relay on `<id>.sock`.
+//! [`ControlBody::PromptCompleted`] outcome.
+//!
+//! Phase C (#2977) moves the remaining traffic here and retires the relay,
+//! adding two generic correlated lanes carrying opaque JSON-RPC payloads:
+//!
+//! - **Reverse** (agent -> daemon): [`ControlBody::ServerCall`] for the
+//!   nine agent-to-client requests (permission, elicitation, fs read/write,
+//!   terminal create/output/wait/kill/release), answered by
+//!   [`ControlBody::ServerResult`] / [`ControlBody::ServerError`]; and
+//!   [`ControlBody::Notify`] for fire-and-forget agent notifications
+//!   (`session/update`, the whole event stream).
+//! - **Forward** (daemon -> agent): [`ControlBody::AgentCall`] for the
+//!   client-to-agent requests the runner does not itself own (`session/set_mode`,
+//!   `session/set_config_option`, `session/delete`, `_session/steering`, and
+//!   a conversation-reset `session/new`), answered by
+//!   [`ControlBody::AgentResult`] / [`ControlBody::AgentError`].
+//!
+//! Because notifications and turn completion now share one FIFO socket and
+//! the runner enqueues them in agent-stdout order, a `PromptCompleted` can
+//! no longer overtake the `session/update` frames that preceded it. That
+//! closes the cross-socket watermark hazard Phase B had to defer.
 //!
 //! Wire format: each frame is a 4-byte big-endian length prefix followed
-//! by that many bytes of JSON (a serialized [`ControlBody`]). The byte
-//! relay on `<id>.sock` stays newline-delimited JSON; this channel uses
-//! length framing so a future opaque, possibly-nested payload cannot be
-//! confused with a newline in the body.
+//! by that many bytes of JSON (a serialized [`ControlBody`]). Length
+//! framing rather than newline delimiting, so an opaque nested payload
+//! cannot be confused with a newline in the body.
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -36,12 +54,15 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// Bumped when the frame set changes in a wire-incompatible way. The
 /// runner announces it in [`ControlBody::Hello`]; a daemon that does not
 /// recognize the version keeps the legacy resume-idle watchdog rather
-/// than trusting the channel. v2 (#2976) adds the runner-owned handshake
+/// than trusting the channel. v2 (#2976) added the runner-owned handshake
 /// and typed prompt/cancel frames; the [`ControlBody::PromptCompleted`]
 /// shape changed, so v1 and v2 are wire-incompatible and the version gate
 /// is what keeps a mixed-version daemon/runner pair from misreading each
-/// other.
-pub const CONTROL_PROTOCOL_VERSION: u32 = 2;
+/// other. v3 (#2977) adds the reverse/forward call lanes and the
+/// [`ControlBody::Ready`] attach barrier; a v3 runner no longer binds
+/// `<id>.sock` at all, so a pre-v3 daemon cannot drive it and the gate is
+/// load-bearing rather than merely defensive.
+pub const CONTROL_PROTOCOL_VERSION: u32 = 3;
 
 /// Hard cap on a single control frame. Phase A frames are tiny; reject
 /// anything larger as a framing error instead of allocating a huge
@@ -93,6 +114,40 @@ pub enum ControlBody {
         prompt_req_id: i64,
         outcome: PromptOutcome,
     },
+    /// An agent-to-client request the daemon must service (permission,
+    /// elicitation, fs, terminal). `params` is the raw JSON-RPC params;
+    /// the daemon deserializes it into the crate request type keyed by
+    /// `method`. `call_id` is allocated by the runner and is the sole
+    /// correlation handle: the agent's own JSON-RPC id stays inside the
+    /// runner, which alone knows its JSON type (a string id from one
+    /// adapter and a numeric id from another must both round-trip).
+    ///
+    /// Answered by exactly one [`ControlBody::ServerResult`] or
+    /// [`ControlBody::ServerError`] carrying the same `call_id`.
+    ServerCall {
+        call_id: u64,
+        method: String,
+        params: serde_json::Value,
+    },
+    /// A fire-and-forget agent notification, forwarded verbatim. Today
+    /// that is `session/update` (the entire event stream); an unrecognized
+    /// notification method is forwarded too rather than dropped, so a
+    /// newly-emitting adapter shows up in the daemon's logs instead of
+    /// vanishing.
+    Notify {
+        method: String,
+        params: serde_json::Value,
+    },
+    /// The runner's answer to a [`ControlBody::AgentCall`]: the agent's
+    /// raw JSON-RPC `result`.
+    AgentResult {
+        call_id: u64,
+        result: serde_json::Value,
+    },
+    /// The agent answered a [`ControlBody::AgentCall`] with an error
+    /// envelope, or the runner could not complete it (agent gone, deadline
+    /// expired).
+    AgentError { call_id: u64, error: JsonRpcError },
 
     // ---- daemon -> runner ----
     /// First frame the daemon sends after [`ControlBody::Hello`],
@@ -117,6 +172,69 @@ pub enum ControlBody {
     Prompt { request: serde_json::Value },
     /// Cancel the in-flight turn (maps to a `session/cancel` notification).
     Cancel,
+    /// The daemon has finished the work that must precede inbound agent
+    /// traffic on a fresh attach: rehydrating session resources and running
+    /// the orphaned-approval sweep. Until this arrives the runner holds its
+    /// buffered notifications and undelivered results, so the sweep can
+    /// never race a flushed frame and clear a card that belongs to the new
+    /// connection. Sent once per control connection, after
+    /// [`ControlBody::Attach`].
+    Ready,
+    /// A client-to-agent request the runner does not own: `session/set_mode`,
+    /// `session/set_config_option`, `session/delete`, `_session/steering`,
+    /// or a conversation-reset `session/new`. The runner injects its own
+    /// JSON-RPC envelope and id, correlates the agent's response, and
+    /// answers with [`ControlBody::AgentResult`] / [`ControlBody::AgentError`]
+    /// carrying the same `call_id`. `call_id` is allocated by the daemon;
+    /// the two lanes have independent id spaces and never collide because
+    /// each is only ever matched against its own pending map.
+    AgentCall {
+        call_id: u64,
+        method: String,
+        params: serde_json::Value,
+    },
+    /// The daemon's answer to a [`ControlBody::ServerCall`]: the JSON-RPC
+    /// `result` to hand back to the agent.
+    ServerResult {
+        call_id: u64,
+        result: serde_json::Value,
+    },
+    /// The daemon could not service a [`ControlBody::ServerCall`]. The
+    /// runner forwards this as the request's JSON-RPC error envelope.
+    ServerError { call_id: u64, error: JsonRpcError },
+}
+
+/// A JSON-RPC error object. Typed rather than a bare `Value` so neither
+/// side can emit a malformed envelope that the other has to guess at; the
+/// agent-facing wire form is exactly these three fields.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JsonRpcError {
+    pub code: i64,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+}
+
+/// JSON-RPC "method not found". Answers a [`ControlBody::ServerCall`] for
+/// a method this daemon has no handler for, so the agent gets a real
+/// error instead of parking on a request nobody will ever answer.
+pub const METHOD_NOT_FOUND: i64 = -32601;
+
+/// Reserved-range code for "the daemon went away before answering". Shared
+/// by the runner's disconnect sweep and its deadline expiry so an agent
+/// sees one consistent code for an unanswerable reverse call. Matches the
+/// code the pre-Phase-C relay sweep used, so adapter-side handling of it is
+/// unchanged.
+pub const DAEMON_GONE: i64 = -32001;
+
+impl JsonRpcError {
+    pub fn new(code: i64, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            data: None,
+        }
+    }
 }
 
 /// Typed result of a runner-owned turn. Replaces Phase A's
@@ -263,6 +381,60 @@ mod tests {
         ] {
             assert_eq!(roundtrip(body.clone()), body);
         }
+    }
+
+    #[test]
+    fn v3_lane_frames_roundtrip() {
+        for body in [
+            ControlBody::ServerCall {
+                call_id: 1,
+                method: "session/request_permission".into(),
+                params: serde_json::json!({"sessionId": "s"}),
+            },
+            ControlBody::ServerResult {
+                call_id: 1,
+                result: serde_json::json!({"outcome": {"outcome": "cancelled"}}),
+            },
+            ControlBody::ServerError {
+                call_id: 1,
+                error: JsonRpcError::new(METHOD_NOT_FOUND, "no handler"),
+            },
+            ControlBody::Notify {
+                method: "session/update".into(),
+                params: serde_json::json!({"sessionId": "s"}),
+            },
+            ControlBody::AgentCall {
+                call_id: 2,
+                method: "session/set_mode".into(),
+                params: serde_json::json!({"modeId": "default"}),
+            },
+            ControlBody::AgentResult {
+                call_id: 2,
+                result: serde_json::json!({}),
+            },
+            ControlBody::AgentError {
+                call_id: 2,
+                error: JsonRpcError {
+                    code: DAEMON_GONE,
+                    message: "gone".into(),
+                    data: Some(serde_json::json!({"errorKind": "rate_limit"})),
+                },
+            },
+            ControlBody::Ready,
+        ] {
+            assert_eq!(roundtrip(body.clone()), body);
+        }
+    }
+
+    #[test]
+    fn json_rpc_error_omits_absent_data() {
+        // The agent-facing envelope must not carry `"data": null`; some
+        // adapters treat a present-but-null data field as a payload.
+        let encoded = serde_json::to_value(JsonRpcError::new(DAEMON_GONE, "gone")).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({"code": -32001, "message": "gone"})
+        );
     }
 
     #[tokio::test]
