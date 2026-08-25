@@ -34,9 +34,20 @@ use crate::util::now_secs;
 // across the ACP code (and its tests) keep resolving here.
 pub use crate::process::worker::{is_pid_alive, validate_id as validate_session_id};
 
-/// Bump when the on-disk schema changes incompatibly. Older entries with
-/// a smaller `runner_version` are swept on startup instead of dialed.
-pub const RUNNER_VERSION: u32 = 1;
+/// Generation of the runner protocol/topology this daemon speaks. Bumped
+/// when a runner of the previous generation cannot serve this daemon.
+///
+/// v2 (#2977) retires the `<id>.sock` byte relay: a v2 runner binds only
+/// `<id>.control.sock` and terminates ACP itself, so a v2 daemon cannot
+/// drive a v1 runner over the control channel and vice versa.
+///
+/// This is deliberately NOT folded into [`is_record_live`]. A live worker of
+/// the wrong generation is still *live*, and calling it dead would push the
+/// reconciler into `FreshSpawn`, orphaning an in-flight turn. It pairs with
+/// [`is_build_current`] as a second staleness axis: the reconciler adopts a
+/// mismatched worker for the duration of its turn and replaces it at the next
+/// idle boundary.
+pub const RUNNER_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerRecord {
@@ -272,6 +283,29 @@ pub fn list() -> Result<Vec<WorkerRecord>> {
 /// value and is swept so a crash loop doesn't litter the workers dir with
 /// dead empty logs. See #1945.
 pub fn delete(session_id: &str) -> Result<()> {
+    // Never drop a record whose runner is still alive without signalling it
+    // first. `terminate` resolves the PID by re-reading the record, so a
+    // delete-then-terminate ordering silently no-ops and strands the runner
+    // plus its whole agent tree with no daemon left to reap it. That is
+    // reachable whenever a daemon classifies a live worker as unusable: a
+    // generation mismatch either way (#2977), a corrupt record, an
+    // unrecognized future schema. Terminating here makes the ordering
+    // impossible to get wrong at the call sites.
+    if let Ok(Some(rec)) = load(session_id) {
+        if is_pid_alive(rec.pid) {
+            tracing::info!(
+                target: "acp.supervisor",
+                session = %session_id,
+                pid = rec.pid,
+                runner_version = rec.runner_version,
+                "terminating live runner before deleting its record"
+            );
+            crate::process::worker::reap_group_escalating(
+                rec.pid,
+                std::time::Duration::from_secs(2),
+            );
+        }
+    }
     if let Ok(p) = record_path(session_id) {
         let _ = std::fs::remove_file(&p);
     }
@@ -352,7 +386,27 @@ pub fn update_stored_acp_session_id(session_id: &str, acp_id: Option<&str>) {
 /// truly unlucky PID/socket collision still falls back to a fresh
 /// spawn rather than wedging the session.
 pub fn is_record_live(rec: &WorkerRecord) -> bool {
-    rec.runner_version == RUNNER_VERSION && is_pid_alive(rec.pid) && socket_exists(&rec.socket_path)
+    is_pid_alive(rec.pid) && socket_exists(&expected_socket(rec))
+}
+
+/// The socket a record of this generation actually binds. A v2 runner
+/// (#2977) binds only the control socket, so probing `socket_path` would
+/// report every live v2 worker as dead; a v1 runner binds the byte relay at
+/// `socket_path` itself. `socket_path` remains the derivation base for both,
+/// which is why the record needed no new field.
+fn expected_socket(rec: &WorkerRecord) -> std::path::PathBuf {
+    if rec.runner_version >= 2 {
+        crate::process::worker::control_socket_sibling(&rec.socket_path)
+    } else {
+        rec.socket_path.clone()
+    }
+}
+
+/// Whether the worker's runner generation matches this daemon's. Mirrors
+/// [`is_build_current`]: a mismatch means "adopt for the current turn, then
+/// replace", never "treat as dead".
+pub fn is_runner_current(rec: &WorkerRecord) -> bool {
+    rec.runner_version == RUNNER_VERSION
 }
 
 /// Whether the worker's recorded binary build matches the running

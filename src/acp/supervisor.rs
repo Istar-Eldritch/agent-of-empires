@@ -353,6 +353,34 @@ pub(crate) enum ResumeReservationOutcome {
     AlreadyPresent,
 }
 
+/// Remove both of a runner's socket files, given the relay path that is
+/// still the derivation base for the control sibling. A pre-#2977 runner
+/// bound the relay path itself; a v2 runner binds only the sibling. Removing
+/// both keeps a respawn from colliding with either generation's leftovers.
+fn remove_runner_sockets(socket_path: &std::path::Path) {
+    for path in [
+        socket_path.to_path_buf(),
+        crate::process::worker::control_socket_sibling(socket_path),
+    ] {
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Why an adopted worker is scheduled for replacement at its next idle
+/// boundary. Both causes have the same remedy (drain the turn, then reap and
+/// respawn), but they are distinct events an operator reading the logs needs
+/// to tell apart, and they can fire together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RespawnReason {
+    /// The runner is executing an older binary than the daemon (#1754).
+    BuildStale,
+    /// The runner speaks an older protocol generation than the daemon
+    /// (#2977): it binds a byte relay this daemon no longer speaks.
+    RunnerStale,
+}
+
 pub struct Supervisor<S: BroadcastSink> {
     sink: Arc<S>,
     registry: Arc<Mutex<AgentRegistry>>,
@@ -415,13 +443,16 @@ pub struct Supervisor<S: BroadcastSink> {
     /// just after the spawn handshake finishes resumes within a
     /// scheduler tick instead of waiting up to 50 ms.
     worker_notify: Arc<tokio::sync::Notify>,
-    /// Sessions whose adopted worker is running an older binary than the
-    /// daemon (detected at reconcile after `aoe update`) and carried an
+    /// Sessions whose adopted worker is stale in some way and carried an
     /// in-flight turn, so the reconciler attached to drain it rather than
-    /// hard-killing the turn. The reconciler's per-tick drain check
-    /// respawns these on the current binary once the turn finishes. See
-    /// #1754.
-    build_respawn_pending: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// hard-killing the turn. The reconciler's per-tick drain check respawns
+    /// these once the turn finishes.
+    ///
+    /// The value records WHY, because there are two independent causes with
+    /// the same remedy: an older binary (#1754) and an older runner
+    /// generation (#2977). A bare set would work only while the remedies stay
+    /// identical, and would leave the logs unable to say which one fired.
+    respawn_pending: Arc<std::sync::Mutex<HashMap<String, Vec<RespawnReason>>>>,
     /// Sessions currently parked on a per-adapter compatibility rejection,
     /// mapped to the binary that failed the check. Populated at every
     /// `IncompatibleAgent` publish site, cleared on a successful (re)spawn.
@@ -748,33 +779,41 @@ impl<S: BroadcastSink> Supervisor<S> {
             warmed_up_agents: Arc::new(std::sync::Mutex::new(HashSet::new())),
             agent_warmup_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             worker_notify: Arc::new(tokio::sync::Notify::new()),
-            build_respawn_pending: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            respawn_pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
             incompatible_binaries: Arc::new(std::sync::Mutex::new(HashMap::new())),
             force_respawn: Arc::new(std::sync::Mutex::new(HashSet::new())),
             max_concurrent_workers,
         }
     }
 
-    /// Flag a session whose build-stale worker was adopted to drain an
-    /// in-flight turn; the reconciler respawns it on the current binary
-    /// at the next idle boundary. Idempotent. See #1754.
-    pub fn mark_build_respawn_pending(&self, session_id: &str) {
-        lock_recover(&self.build_respawn_pending).insert(session_id.to_string());
+    /// Flag a session whose stale worker was adopted to drain an in-flight
+    /// turn; the reconciler respawns it at the next idle boundary.
+    /// Idempotent, and merges reasons so a worker that is both build-stale
+    /// and runner-stale is drained once and reported as both.
+    pub fn mark_respawn_pending(&self, session_id: &str, reasons: &[RespawnReason]) {
+        let mut pending = lock_recover(&self.respawn_pending);
+        let entry = pending.entry(session_id.to_string()).or_default();
+        for reason in reasons {
+            if !entry.contains(reason) {
+                entry.push(*reason);
+            }
+        }
     }
 
-    /// Snapshot the sessions awaiting a post-drain respawn. The reconciler
-    /// polls this each tick and respawns those that have gone idle.
-    pub fn build_respawn_pending_ids(&self) -> Vec<String> {
-        lock_recover(&self.build_respawn_pending)
+    /// Snapshot the sessions awaiting a post-drain respawn, with the reasons
+    /// each is pending. The reconciler polls this each tick and respawns
+    /// those that have gone idle.
+    pub fn respawn_pending_ids(&self) -> Vec<(String, Vec<RespawnReason>)> {
+        lock_recover(&self.respawn_pending)
             .iter()
-            .cloned()
+            .map(|(id, reasons)| (id.clone(), reasons.clone()))
             .collect()
     }
 
     /// Drop a session from the pending set once it has been respawned (or
     /// is gone). Idempotent.
-    pub fn clear_build_respawn_pending(&self, session_id: &str) {
-        lock_recover(&self.build_respawn_pending).remove(session_id);
+    pub fn clear_respawn_pending(&self, session_id: &str) {
+        lock_recover(&self.respawn_pending).remove(session_id);
     }
 
     /// Record that a session is parked on a compatibility rejection for
@@ -1263,15 +1302,15 @@ impl<S: BroadcastSink> Supervisor<S> {
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
-            // Best-effort socket file removal: the new spawn will bind
-            // <workers_dir>/<session_id>.sock, so a stale inode from
-            // the old runner would collide. terminate_runner_for_session
-            // already removed the registry entry; this cleans up the
-            // socket. Failures (already gone, no perms) are non-fatal.
+            // Best-effort socket file removal: a stale inode from the old
+            // runner would collide with the new spawn's bind.
+            // terminate_runner_for_session already removed the registry
+            // entry; this cleans up the sockets. Both paths, because #2977
+            // moved the live socket to the control sibling and a v2 runner
+            // binds only that one; leaving it behind is what would actually
+            // collide now. Failures (already gone, no perms) are non-fatal.
             if let Ok(socket_path) = crate::process::worker_registry::socket_path_for(session_id) {
-                if socket_path.exists() {
-                    let _ = std::fs::remove_file(&socket_path);
-                }
+                remove_runner_sockets(&socket_path);
             }
         }
         // Acp currently runs over Unix sockets only; reaching this
@@ -2194,9 +2233,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                             if let Ok(socket_path) =
                                 crate::process::worker_registry::socket_path_for(&session_id)
                             {
-                                if socket_path.exists() {
-                                    let _ = std::fs::remove_file(&socket_path);
-                                }
+                                remove_runner_sockets(&socket_path);
                             }
                         }
                         // Acp's runner transport is UNIX-socket-only today

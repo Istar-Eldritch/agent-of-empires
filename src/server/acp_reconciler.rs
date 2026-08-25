@@ -29,6 +29,7 @@ use tokio::time::timeout;
 
 use super::session_service::SessionService;
 use super::AppState;
+use crate::acp::supervisor::RespawnReason;
 
 /// Reconciler-side respawn budget. The reconciler is the only respawner
 /// for sessions with no live in-memory handle (fresh spawns and
@@ -1013,7 +1014,7 @@ async fn reap_idle_workers(state: &Arc<AppState>) {
 /// after, which tears down the attached handle and clears `attempted`, so
 /// the resume pass fresh-spawns on the current binary. See #1754.
 async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
-    for id in state.acp_supervisor.build_respawn_pending_ids() {
+    for (id, reasons) in state.acp_supervisor.respawn_pending_ids() {
         let store = Arc::clone(&state.acp_event_store);
         let id_probe = id.clone();
         let in_flight =
@@ -1037,11 +1038,12 @@ async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
         tracing::info!(
             target: "acp.supervisor",
             session = %id,
-            "build-stale structured view worker drained; respawning on current binary"
+            reasons = ?reasons,
+            "stale structured view worker drained; respawning"
         );
         crate::process::worker_registry::mark_restart_pending(&id);
         crate::process::worker_registry::terminate(&id);
-        state.acp_supervisor.clear_build_respawn_pending(&id);
+        state.acp_supervisor.clear_respawn_pending(&id);
     }
 }
 
@@ -1077,10 +1079,26 @@ fn should_readopt_orphan_runner(running: bool, has_live_runner: bool) -> bool {
     !running && has_live_runner
 }
 
-fn adopt_decision(live: bool, build_current: bool, in_flight_turn: bool) -> AdoptDecision {
+/// Two independent staleness axes, either of which means "this worker
+/// cannot serve this daemon indefinitely":
+///
+/// - `build_current`: the runner is executing an older binary (#1754).
+/// - `runner_current`: the runner speaks an older protocol generation
+///   (#2977; a v1 runner binds a byte relay this daemon no longer speaks).
+///
+/// Both get identical treatment, because the safe move is the same either
+/// way: never call a live worker dead, adopt it for the duration of any
+/// in-flight turn, and replace it at the next idle boundary. The reasons are
+/// tracked separately downstream so operators see which one fired.
+fn adopt_decision(
+    live: bool,
+    build_current: bool,
+    runner_current: bool,
+    in_flight_turn: bool,
+) -> AdoptDecision {
     if !live {
         AdoptDecision::FreshSpawn
-    } else if build_current {
+    } else if build_current && runner_current {
         AdoptDecision::Attach
     } else if in_flight_turn {
         AdoptDecision::AdoptStaleForDrain
@@ -1320,9 +1338,12 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
     // of spawning a fresh agent. Bounded by the registry probe — no
     // network IO unless we have a live PID + socket on disk.
     if let Ok(Some(record)) = crate::process::worker_registry::load(&id) {
+        let build_current = crate::process::worker_registry::is_build_current(&record);
+        let runner_current = crate::process::worker_registry::is_runner_current(&record);
         let decision = adopt_decision(
             crate::process::worker_registry::is_record_live(&record),
-            crate::process::worker_registry::is_build_current(&record),
+            build_current,
+            runner_current,
             in_flight_turn,
         );
         if decision == AdoptDecision::FreshSpawn {
@@ -1338,9 +1359,13 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
             tracing::info!(
                 target: "acp.supervisor",
                 session = %id,
+                build_stale = !build_current,
+                runner_stale = !runner_current,
                 old_build = %record.build_version,
                 new_build = crate::build_info::BUILD_VERSION,
-                "respawning idle build-stale structured view worker on current binary"
+                old_runner_version = record.runner_version,
+                new_runner_version = crate::process::worker_registry::RUNNER_VERSION,
+                "respawning idle stale structured view worker"
             );
             crate::process::worker_registry::terminate(&id);
         } else {
@@ -1354,11 +1379,22 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
                 tracing::info!(
                     target: "acp.supervisor",
                     session = %id,
+                    build_stale = !build_current,
+                    runner_stale = !runner_current,
                     old_build = %record.build_version,
                     new_build = crate::build_info::BUILD_VERSION,
-                    "adopting build-stale structured view worker to drain in-flight turn before respawn"
+                    old_runner_version = record.runner_version,
+                    new_runner_version = crate::process::worker_registry::RUNNER_VERSION,
+                    "adopting stale structured view worker to drain in-flight turn before respawn"
                 );
-                state.acp_supervisor.mark_build_respawn_pending(&id);
+                let mut reasons = Vec::new();
+                if !build_current {
+                    reasons.push(RespawnReason::BuildStale);
+                }
+                if !runner_current {
+                    reasons.push(RespawnReason::RunnerStale);
+                }
+                state.acp_supervisor.mark_respawn_pending(&id, &reasons);
             }
             let supervisor = Arc::clone(&state.acp_supervisor);
             let cwd = PathBuf::from(&project_path);
@@ -1817,6 +1853,7 @@ pub(crate) async fn trigger_resume_background(
     service: &Arc<SessionService>,
     id: &str,
 ) -> Result<ResumeTrigger, crate::acp::supervisor::SupervisorError> {
+    use crate::acp::supervisor::RespawnReason;
     use crate::acp::supervisor::{ResumeKind, ResumeReservationOutcome};
     let reservation = match service
         .acp_supervisor
@@ -2160,47 +2197,46 @@ mod tests {
         assert!(!should_readopt_orphan_runner(true, false));
     }
 
-    // --- build-version respawn policy (#1754) ---
+    // --- staleness respawn policy (#1754 build, #2977 runner generation) ---
 
-    /// Story 1: a live worker whose build differs from the daemon and is
-    /// NOT mid-turn is respawned (terminate + fresh spawn), not adopted.
+    /// The whole policy as a truth table over
+    /// `(live, build_current, runner_current, in_flight_turn)`.
+    ///
+    /// The load-bearing rows are the stale ones: a live worker of the wrong
+    /// build OR the wrong runner generation must never be classified dead,
+    /// because `FreshSpawn` deletes the record and would orphan an in-flight
+    /// turn. Both axes get identical treatment, and a worker stale on BOTH
+    /// drains once rather than being reaped twice.
     #[test]
-    fn stale_build_idle_worker_respawns() {
-        assert_eq!(
-            adopt_decision(true, false, false),
-            AdoptDecision::RespawnStaleIdle
-        );
-    }
-
-    /// Story 2: a live worker whose build differs from the daemon but is
-    /// mid-turn is adopted to drain, not hard-killed. The reconciler's
-    /// per-tick drain check respawns it once the turn finishes.
-    #[test]
-    fn stale_build_busy_worker_adopts_to_drain() {
-        assert_eq!(
-            adopt_decision(true, false, true),
-            AdoptDecision::AdoptStaleForDrain
-        );
-    }
-
-    /// A live worker on the current build is reattached regardless of
-    /// in-flight state: the survive-restart contract (#1037) is unchanged
-    /// for same-version restarts.
-    #[test]
-    fn current_build_worker_attaches() {
-        assert_eq!(adopt_decision(true, true, false), AdoptDecision::Attach);
-        assert_eq!(adopt_decision(true, true, true), AdoptDecision::Attach);
-    }
-
-    /// A dead record fresh-spawns no matter the build/turn state; build
-    /// currency only matters for a live worker.
-    #[test]
-    fn dead_record_fresh_spawns() {
-        assert_eq!(
-            adopt_decision(false, false, false),
-            AdoptDecision::FreshSpawn
-        );
-        assert_eq!(adopt_decision(false, true, true), AdoptDecision::FreshSpawn);
+    fn adopt_decision_truth_table() {
+        use AdoptDecision::*;
+        let cases = [
+            // A dead record fresh-spawns regardless of the other axes.
+            ((false, false, false, false), FreshSpawn),
+            ((false, true, true, true), FreshSpawn),
+            // Current on both axes: reattach, in-flight or not. The
+            // survive-restart contract (#1037) is unchanged.
+            ((true, true, true, false), Attach),
+            ((true, true, true, true), Attach),
+            // Build-stale only (#1754).
+            ((true, false, true, false), RespawnStaleIdle),
+            ((true, false, true, true), AdoptStaleForDrain),
+            // Runner-generation-stale only (#2977): a v1 runner meeting a v2
+            // daemon. Same treatment as a build mismatch.
+            ((true, true, false, false), RespawnStaleIdle),
+            ((true, true, false, true), AdoptStaleForDrain),
+            // Stale on both axes at once, e.g. an `aoe update` that also
+            // crossed the runner generation. One drain, one respawn.
+            ((true, false, false, false), RespawnStaleIdle),
+            ((true, false, false, true), AdoptStaleForDrain),
+        ];
+        for ((live, build_current, runner_current, in_flight), expected) in cases {
+            assert_eq!(
+                adopt_decision(live, build_current, runner_current, in_flight),
+                expected,
+                "live={live} build_current={build_current} runner_current={runner_current} in_flight={in_flight}"
+            );
+        }
     }
 
     #[test]
