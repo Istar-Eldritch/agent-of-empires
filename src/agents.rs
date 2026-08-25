@@ -278,11 +278,41 @@ pub struct SidecarHooks {
     /// regardless of which agent is selected. See
     /// `crate::session::Instance::install_agent_status_hooks`.
     pub selected_agent_hooks: Option<SelectedAgentHooks>,
+    /// Resolve the host config path from the home directory and the session's
+    /// host `environment` list, for agents whose config dir is not a fixed
+    /// home-relative path (opencode honors `XDG_CONFIG_HOME`). `None` resolves
+    /// to `home.join(host_config_subpath)`, which stays the declared fallback
+    /// for the no-override case. Only the host path is resolved this way: the
+    /// sandbox path is a staging directory whose location is fixed by the
+    /// agent's `AgentConfigMount`, so it must stay home-relative to keep the
+    /// two in sync.
+    ///
+    /// Not combinable with `selected_agent_hooks`, which derives its agents
+    /// directory from `host_config_subpath`; no agent declares both, and
+    /// `test_sidecar_path_resolver_not_combined_with_selected_agent` pins it.
+    pub resolve_host_config_path: Option<fn(&std::path::Path, &[String]) -> std::path::PathBuf>,
     /// On-disk format of the sidecar's config file. Drives marker-presence
     /// walker dispatch in `crate::hooks::has_aoe_marker`.
     pub format: SidecarFormat,
     /// Default hook events and statuses for this sidecar format.
     pub events: &'static [SidecarHookEvent],
+}
+
+impl SidecarHooks {
+    /// Where this sidecar's hooks live on the host: the agent's own resolver
+    /// when it declares one, else the home-relative `host_config_subpath`.
+    /// `host_env` is the session's resolved `environment` list, so a config-dir
+    /// override set per profile wins over one in AoE's own process env.
+    pub fn host_config_path(
+        &self,
+        home: &std::path::Path,
+        host_env: &[String],
+    ) -> std::path::PathBuf {
+        match self.resolve_host_config_path {
+            Some(resolve) => resolve(home, host_env),
+            None => home.join(self.host_config_subpath),
+        }
+    }
 }
 
 /// How to install status hooks into a user-selected named agent, for CLIs
@@ -1102,6 +1132,7 @@ pub const AGENTS: &[AgentDef] = &[
             uninstall: crate::hooks::uninstall_settl_hooks,
             post_install_host: None,
             selected_agent_hooks: None,
+            resolve_host_config_path: None,
             format: SidecarFormat::SettlToml,
             events: SETTL_SIDECAR_EVENTS,
         }),
@@ -1143,6 +1174,7 @@ pub const AGENTS: &[AgentDef] = &[
             uninstall: crate::hooks::uninstall_hermes_hooks,
             post_install_host: None,
             selected_agent_hooks: None,
+            resolve_host_config_path: None,
             format: SidecarFormat::HermesYaml,
             events: HERMES_SIDECAR_EVENTS,
         }),
@@ -1192,6 +1224,7 @@ pub const AGENTS: &[AgentDef] = &[
                 flag: "--agent",
                 resolve_config_file: crate::hooks::resolve_kiro_agent_file,
             }),
+            resolve_host_config_path: None,
             format: SidecarFormat::KiroJson,
             events: KIRO_SIDECAR_EVENTS,
         }),
@@ -1283,6 +1316,7 @@ pub const AGENTS: &[AgentDef] = &[
             uninstall: crate::hooks::uninstall_kimi_hooks,
             post_install_host: None,
             selected_agent_hooks: None,
+            resolve_host_config_path: None,
             format: SidecarFormat::KimiToml,
             events: KIMI_SIDECAR_EVENTS,
         }),
@@ -2418,6 +2452,45 @@ mod tests {
             parse_selected_agent("--profile prod", "--profile"),
             Some("prod".to_string())
         );
+    }
+
+    #[test]
+    fn test_sidecar_path_resolver_not_combined_with_selected_agent() {
+        // `selected_agent_hooks` derives its agents directory from
+        // `host_config_subpath` (see `install_sidecar_host_hooks`), which a
+        // custom `resolve_host_config_path` bypasses. Pairing them would send
+        // the standalone install to the resolved path and the selected-agent
+        // install to the home-relative one. Nothing needs the combination
+        // today, so reject it here instead of growing the install site.
+        for agent in AGENTS {
+            let Some(sidecar) = agent.sidecar_hooks.as_ref() else {
+                continue;
+            };
+            assert!(
+                !(sidecar.selected_agent_hooks.is_some()
+                    && sidecar.resolve_host_config_path.is_some()),
+                "agent '{}' combines selected_agent_hooks with resolve_host_config_path; \
+                 teach install_sidecar_host_hooks to resolve the agents dir first",
+                agent.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_sidecar_host_config_path_falls_back_to_home_relative() {
+        // Agents without a resolver keep the declared home-relative path, env
+        // list or not.
+        let home = std::path::Path::new("/home/tester");
+        for name in ["settl", "hermes", "kiro", "kimi"] {
+            let sidecar = get_agent(name).unwrap().sidecar_hooks.as_ref().unwrap();
+            let expected = home.join(sidecar.host_config_subpath);
+            assert_eq!(sidecar.host_config_path(home, &[]), expected, "{name}");
+            assert_eq!(
+                sidecar.host_config_path(home, &["XDG_CONFIG_HOME=/elsewhere".to_string()]),
+                expected,
+                "{name} must ignore env overrides it does not declare"
+            );
+        }
     }
 
     #[test]

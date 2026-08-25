@@ -4776,7 +4776,7 @@ impl Instance {
             }
         }
 
-        let config_path = home.join(sidecar.host_config_subpath);
+        let config_path = sidecar.host_config_path(home, &self.resolved_host_environment());
         match (sidecar.install)(&config_path, crate::hooks::HookInstallTarget::Host, events) {
             Ok(()) => {
                 tracing::info!(target: "session.store",

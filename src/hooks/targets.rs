@@ -108,12 +108,23 @@ pub(crate) fn iter_hook_targets_in(home: &Path, env_lists: &[Vec<String>]) -> Ve
                 &crate::session::config::Config::default(),
             )
             .unwrap_or_default();
-            out.push(HookTarget {
-                agent_name: agent.name,
-                kind: HookTargetKind::Sidecar(sidecar),
-                path: home.join(sidecar.host_config_subpath),
-                events,
-            });
+            // Mirror the `hook_config` branch above: a sidecar whose config dir
+            // follows an env var (opencode / `XDG_CONFIG_HOME`) is reachable at
+            // more than one path, and uninstall plus the hook-rewrite
+            // migrations have to see every one of them.
+            let mut paths: Vec<PathBuf> = Vec::new();
+            push_unique_target_path(&mut paths, sidecar.host_config_path(home, &[]));
+            for env in env_lists {
+                push_unique_target_path(&mut paths, sidecar.host_config_path(home, env));
+            }
+            for path in paths {
+                out.push(HookTarget {
+                    agent_name: agent.name,
+                    kind: HookTargetKind::Sidecar(sidecar),
+                    path,
+                    events: events.clone(),
+                });
+            }
         }
     }
     out
