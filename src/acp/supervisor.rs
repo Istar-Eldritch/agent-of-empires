@@ -4293,7 +4293,7 @@ cursor-acp-bridge = "agent acp"
         let result = async {
             let sup = Supervisor::new(VecSink::new());
             let socket = crate::process::worker_registry::socket_path_for("s-policy").unwrap();
-            std::fs::write(&socket, b"").unwrap();
+            crate::process::worker_registry::touch_live_socket(&socket);
             let mut record = crate::process::worker_registry::WorkerRecord::new(
                 "s-policy".into(),
                 fake_runner.id(),
@@ -6533,7 +6533,7 @@ cursor-acp-bridge = "agent acp"
         // socket_exists is true).
         let registry_dir = crate::process::worker_registry::workers_dir().unwrap();
         let socket_path = registry_dir.join("detached-1.sock");
-        std::fs::write(&socket_path, b"").unwrap();
+        crate::process::worker_registry::touch_live_socket(&socket_path);
         let record = crate::process::worker_registry::WorkerRecord::new(
             "detached-1".into(),
             std::process::id(),

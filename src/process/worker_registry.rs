@@ -283,29 +283,6 @@ pub fn list() -> Result<Vec<WorkerRecord>> {
 /// value and is swept so a crash loop doesn't litter the workers dir with
 /// dead empty logs. See #1945.
 pub fn delete(session_id: &str) -> Result<()> {
-    // Never drop a record whose runner is still alive without signalling it
-    // first. `terminate` resolves the PID by re-reading the record, so a
-    // delete-then-terminate ordering silently no-ops and strands the runner
-    // plus its whole agent tree with no daemon left to reap it. That is
-    // reachable whenever a daemon classifies a live worker as unusable: a
-    // generation mismatch either way (#2977), a corrupt record, an
-    // unrecognized future schema. Terminating here makes the ordering
-    // impossible to get wrong at the call sites.
-    if let Ok(Some(rec)) = load(session_id) {
-        if is_pid_alive(rec.pid) {
-            tracing::info!(
-                target: "acp.supervisor",
-                session = %session_id,
-                pid = rec.pid,
-                runner_version = rec.runner_version,
-                "terminating live runner before deleting its record"
-            );
-            crate::process::worker::reap_group_escalating(
-                rec.pid,
-                std::time::Duration::from_secs(2),
-            );
-        }
-    }
     if let Ok(p) = record_path(session_id) {
         let _ = std::fs::remove_file(&p);
     }
@@ -400,6 +377,31 @@ fn expected_socket(rec: &WorkerRecord) -> std::path::PathBuf {
     } else {
         rec.socket_path.clone()
     }
+}
+
+/// Create the socket file a record of the CURRENT generation must have for
+/// [`is_record_live`] to see it, so a fixture does not have to know which
+/// path that is. Test-only: production runners bind a real listener.
+#[cfg(test)]
+pub(crate) fn touch_live_socket(socket_path: &Path) {
+    let rec_shaped = WorkerRecord {
+        runner_version: RUNNER_VERSION,
+        socket_path: socket_path.to_path_buf(),
+        ..WorkerRecord::new(
+            "probe".into(),
+            0,
+            socket_path.to_path_buf(),
+            String::new(),
+            String::new(),
+            PathBuf::new(),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        )
+    };
+    std::fs::write(expected_socket(&rec_shaped), b"").expect("touch live socket");
 }
 
 /// Whether the worker's runner generation matches this daemon's. Mirrors
@@ -812,7 +814,7 @@ mod tests {
         with_temp_home(|| {
             let dir = workers_dir().unwrap();
             let sock = dir.join("sess.sock");
-            std::fs::write(&sock, b"").unwrap();
+            touch_live_socket(&sock);
             let rec = WorkerRecord::new(
                 "sess".into(),
                 1,
@@ -827,10 +829,12 @@ mod tests {
                 None,
             );
             save(&rec).unwrap();
+            let control = crate::process::worker::control_socket_sibling(&sock);
             assert!(record_path("sess").unwrap().exists());
-            assert!(sock.exists());
+            assert!(control.exists(), "fixture created the live socket");
             delete("sess").unwrap();
             assert!(!record_path("sess").unwrap().exists());
+            assert!(!control.exists(), "delete sweeps the control socket too");
         });
     }
 

@@ -1347,9 +1347,16 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
             in_flight_turn,
         );
         if decision == AdoptDecision::FreshSpawn {
-            // Dead PID or missing socket: sweep the orphan registry entry
-            // so the fall-through below is a clean fresh spawn.
-            crate::process::worker_registry::delete(&id).ok();
+            // Dead PID or missing socket: sweep the orphan registry entry so
+            // the fall-through below is a clean fresh spawn.
+            //
+            // `terminate` rather than a bare `delete`, because "not live" here
+            // can still mean a live PID whose socket vanished. `terminate`
+            // resolves the PID by re-reading the record, so deleting first
+            // would leave it with nothing to signal and strand the runner plus
+            // its whole agent tree with no daemon left to reap it. On a truly
+            // dead record it degrades to the same cleanup `delete` did.
+            crate::process::worker_registry::terminate(&id);
         } else if decision == AdoptDecision::RespawnStaleIdle {
             // The runner survived a daemon restart but is executing an
             // older binary (e.g. after `aoe update`) and has no in-flight
