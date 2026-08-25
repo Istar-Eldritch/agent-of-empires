@@ -20,14 +20,11 @@
 //! `AOE_SILENT_ORPHAN_FAST_GRACE_MS` only under `cfg(debug_assertions)`;
 //! release builds would wait the full 60s production default.
 
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use agent_of_empires::acp::acp_client::AcpClient;
 use agent_of_empires::acp::state::{AcpSessionId, Event};
 use serial_test::serial;
-use tokio::net::UnixListener;
-use tokio::process::Command;
 
 use crate::common::{shim_ready, spawn_runner_with_shim};
 

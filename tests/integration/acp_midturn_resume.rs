@@ -20,7 +20,6 @@
 //! `src/structured view/acp_client.rs`); release builds would wait the full
 //! 10s production default and fail the 3s assertion below.
 
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use agent_of_empires::acp::acp_client::AcpClient;
