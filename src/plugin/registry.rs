@@ -57,17 +57,15 @@ pub struct BuiltinPlugin {
 }
 
 /// First-party plugins bundled with the binary. Deliberately minimal while the
-/// system is proven out: just the `aoe.web` dashboard marker (under `serve`).
-/// More land as each piece is verified.
-pub static BUILTINS: &[BuiltinPlugin] = &[
-    // The web dashboard's management marker is present whenever the dashboard
-    // is compiled in (`feature = "serve"`), so serve and release builds always
-    // surface aoe.web; a TUI-only build has an empty builtin set.
-    #[cfg(feature = "serve")]
-    BuiltinPlugin {
-        manifest_toml: include_str!("../../plugins/aoe-web/aoe-plugin.toml"),
-    },
-];
+/// system is proven out: just the `aoe.web` dashboard marker. More land as each
+/// piece is verified.
+///
+/// Every binary carries this entry (#2170): the dashboard is not compile-time
+/// optional, so whether its surface is reachable is decided solely by the
+/// plugin's runtime `enabled` state.
+pub static BUILTINS: &[BuiltinPlugin] = &[BuiltinPlugin {
+    manifest_toml: include_str!("../../plugins/aoe-web/aoe-plugin.toml"),
+}];
 
 /// Whether `id` belongs to a compiled-in builtin plugin.
 pub fn is_builtin_id(id: &str) -> bool {
