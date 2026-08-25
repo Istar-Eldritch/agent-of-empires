@@ -58,8 +58,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// and typed prompt/cancel frames; the [`ControlBody::PromptCompleted`]
 /// shape changed, so v1 and v2 are wire-incompatible and the version gate
 /// is what keeps a mixed-version daemon/runner pair from misreading each
-/// other. v3 (#2977) adds the reverse/forward call lanes and the
-/// [`ControlBody::Ready`] attach barrier; a v3 runner no longer binds
+/// other. v3 (#2977) adds the reverse and forward call lanes; a v3 runner
+/// no longer binds
 /// `<id>.sock` at all, so a pre-v3 daemon cannot drive it and the gate is
 /// load-bearing rather than merely defensive.
 pub const CONTROL_PROTOCOL_VERSION: u32 = 3;
@@ -172,14 +172,6 @@ pub enum ControlBody {
     Prompt { request: serde_json::Value },
     /// Cancel the in-flight turn (maps to a `session/cancel` notification).
     Cancel,
-    /// The daemon has finished the work that must precede inbound agent
-    /// traffic on a fresh attach: rehydrating session resources and running
-    /// the orphaned-approval sweep. Until this arrives the runner holds its
-    /// buffered notifications and undelivered results, so the sweep can
-    /// never race a flushed frame and clear a card that belongs to the new
-    /// connection. Sent once per control connection, after
-    /// [`ControlBody::Attach`].
-    Ready,
     /// A client-to-agent request the runner does not own: `session/set_mode`,
     /// `session/set_config_option`, `session/delete`, `_session/steering`,
     /// or a conversation-reset `session/new`. The runner injects its own
@@ -420,7 +412,6 @@ mod tests {
                     data: Some(serde_json::json!({"errorKind": "rate_limit"})),
                 },
             },
-            ControlBody::Ready,
         ] {
             assert_eq!(roundtrip(body.clone()), body);
         }

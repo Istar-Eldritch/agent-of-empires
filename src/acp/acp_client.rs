@@ -4145,23 +4145,13 @@ impl DaemonControlClient {
         self.send(ControlBody::Initialize { request })
             .await
             .map_err(|e| acp_internal_error(format!("control write failed: {e}")))?;
-        let initialized = match self.handshake_rx.lock().await.recv().await {
+        match self.handshake_rx.lock().await.recv().await {
             Some(ControlBody::Initialized { result }) => Ok(result),
             Some(ControlBody::HandshakeFailed { error }) => Err(acp_error_from_value(error)),
             _ => Err(acp_internal_error(
                 "control channel closed during initialize".into(),
             )),
-        }?;
-        // Release the runner's backlog. `initialize` is the one handshake
-        // step every attach path runs (a mid-flight Resume deliberately skips
-        // `session/new|load`), so gating the flush here covers resume as well
-        // as a cold start, and the daemon has its capabilities and session
-        // resources by this point. A failed send is not fatal; the caller
-        // surfaces the dead channel on its next use.
-        if let Err(e) = self.send(ControlBody::Ready).await {
-            warn!(target: "acp.protocol", "control Ready write failed: {e}");
         }
-        Ok(initialized)
     }
 
     /// Run the session-creation request the runner owns; returns

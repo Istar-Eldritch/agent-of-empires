@@ -703,16 +703,16 @@ struct RunnerHandshake {
 ///
 /// The queue doubles as the detach buffer: frames produced with no daemon
 /// attached simply accumulate here and are flushed, in order, once one
-/// attaches and reports [`ControlBody::Ready`].
+/// attaches.
 #[derive(Default)]
 struct ControlChannel {
     /// Frames awaiting delivery, oldest first. Strictly agent-stdout order,
     /// which is what keeps a `PromptCompleted` behind the `session/update`
     /// frames that preceded it.
     queue: VecDeque<ControlBody>,
-    /// True once a v3 daemon has attached AND signalled `Ready`. The writer
-    /// task drains only while set, so the daemon's attach-time orphan sweep
-    /// cannot race a flushed frame.
+    /// True while a daemon connection owns the write half. The writer task
+    /// drains only while set; clearing it parks the writer and retains the
+    /// queue for the next attach.
     ready: bool,
 }
 
@@ -1143,9 +1143,9 @@ impl RunnerShared {
     /// slower than a queue push here would stall the drain of the agent's
     /// stdout pipe and eventually the agent itself.
     ///
-    /// Frames accumulate while no daemon is attached (or before one reports
-    /// `Ready`) and flush in order on attach, so this queue is also the
-    /// detach buffer that Phase A's notification ring used to be.
+    /// Frames accumulate while no daemon is attached and flush in order on
+    /// attach, so this queue is also the detach buffer that Phase A's
+    /// notification ring used to be.
     async fn emit_control(&self, body: ControlBody) {
         {
             let mut ch = self.control.lock().await;
@@ -1157,10 +1157,8 @@ impl RunnerShared {
         self.control_wake.notify_one();
     }
 
-    /// Mark the channel ready and wake the writer so the backlog flushes.
-    /// Called when the daemon's `Ready` frame arrives, i.e. once its
-    /// attach-time rehydration and orphan sweep are done and inbound traffic
-    /// cannot race them.
+    /// Open the channel and wake the writer so the backlog flushes. Called
+    /// once a connection's writer task owns the write half.
     async fn mark_control_ready(&self) {
         self.control.lock().await.ready = true;
         self.control_wake.notify_one();
@@ -1725,6 +1723,7 @@ async fn handle_control_connection(
         Arc::clone(&shared),
         session_id.clone(),
     ));
+    shared.mark_control_ready().await;
 
     loop {
         let body = match control_protocol::read_frame(&mut read_half).await {
@@ -1756,11 +1755,6 @@ async fn handle_control_connection(
                     );
                     break;
                 }
-            }
-            ControlBody::Ready => {
-                // The daemon's rehydration and orphan sweep are done, so the
-                // backlog can safely flush at it now.
-                shared.mark_control_ready().await;
             }
             ControlBody::Initialize { request } => {
                 let frame = match shared.run_or_replay_initialize(&agent_stdin, request).await {

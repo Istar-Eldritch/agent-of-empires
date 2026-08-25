@@ -25,10 +25,8 @@ use std::time::{Duration, Instant};
 
 use agent_of_empires::acp::acp_client::AcpClient;
 use agent_of_empires::acp::state::{AcpSessionId, Event};
-use tokio::net::UnixListener;
-use tokio::process::Command;
 
-use crate::common::{shim_path, shim_ready};
+use crate::common::{shim_ready, spawn_runner_with_shim};
 
 /// Spawn the shim and bridge its stdio to a UNIX listener. Mimics what
 /// `aoe __acp-runner` does in production: byte-proxy, no protocol
@@ -40,99 +38,6 @@ use crate::common::{shim_path, shim_ready};
 /// without going through `session/new`.
 ///
 /// Returns the listener path; the bridge task is detached.
-async fn spawn_shim_socket_bridge_with_preseed(
-    preseed_session_id: Option<&str>,
-) -> (PathBuf, tempfile::TempDir) {
-    let shim = shim_path();
-    let temp = tempfile::tempdir().unwrap();
-    let socket_path = temp.path().join("runner.sock");
-
-    let mut cmd = Command::new("node");
-    cmd.arg(&shim);
-    if let Some(id) = preseed_session_id {
-        cmd.env("SHIM_PRESEED_SESSION_ID", id);
-    }
-    let mut shim_proc = cmd
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn shim");
-    let shim_stdin = shim_proc.stdin.take().expect("shim stdin");
-    let shim_stdout = shim_proc.stdout.take().expect("shim stdout");
-
-    let listener = UnixListener::bind(&socket_path).expect("bind listener");
-
-    tokio::spawn(async move {
-        // Single accept — the test only attaches once. After the first
-        // connection closes we stop accepting; the shim process is then
-        // dropped via kill_on_drop when this task ends.
-        let _shim_proc = shim_proc;
-        let (stream, _) = match listener.accept().await {
-            Ok(pair) => pair,
-            Err(_) => return,
-        };
-        let (mut sock_read, mut sock_write) = stream.into_split();
-        let mut shim_in = shim_stdin;
-        let mut shim_out = shim_stdout;
-        let to_shim = async move { tokio::io::copy(&mut sock_read, &mut shim_in).await.ok() };
-        let from_shim = async move { tokio::io::copy(&mut shim_out, &mut sock_write).await.ok() };
-        let _ = tokio::join!(to_shim, from_shim);
-    });
-
-    (socket_path, temp)
-}
-
-async fn spawn_shim_socket_bridge() -> (PathBuf, tempfile::TempDir) {
-    spawn_shim_socket_bridge_with_preseed(None).await
-}
-
-/// Variant for the watchdog-disarm test: preseeds `session_id` AND tells
-/// the shim to emit one unsolicited `agent_message_chunk` after
-/// `emit_delay_ms`, then stay silent. Mimics a still-alive runner
-/// forwarding a single mid-turn notification right after reattach.
-async fn spawn_shim_socket_bridge_emitting_unsolicited(
-    session_id: &str,
-    emit_delay_ms: u64,
-) -> (PathBuf, tempfile::TempDir) {
-    let shim = shim_path();
-    let temp = tempfile::tempdir().unwrap();
-    let socket_path = temp.path().join("runner.sock");
-
-    let mut cmd = Command::new("node");
-    cmd.arg(&shim);
-    cmd.env("SHIM_PRESEED_SESSION_ID", session_id);
-    cmd.env("SHIM_EMIT_UNSOLICITED_NOTIF", emit_delay_ms.to_string());
-    let mut shim_proc = cmd
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn shim");
-    let shim_stdin = shim_proc.stdin.take().expect("shim stdin");
-    let shim_stdout = shim_proc.stdout.take().expect("shim stdout");
-
-    let listener = UnixListener::bind(&socket_path).expect("bind listener");
-
-    tokio::spawn(async move {
-        let _shim_proc = shim_proc;
-        let (stream, _) = match listener.accept().await {
-            Ok(pair) => pair,
-            Err(_) => return,
-        };
-        let (mut sock_read, mut sock_write) = stream.into_split();
-        let mut shim_in = shim_stdin;
-        let mut shim_out = shim_stdout;
-        let to_shim = async move { tokio::io::copy(&mut sock_read, &mut shim_in).await.ok() };
-        let from_shim = async move { tokio::io::copy(&mut shim_out, &mut sock_write).await.ok() };
-        let _ = tokio::join!(to_shim, from_shim);
-    });
-
-    (socket_path, temp)
-}
-
 async fn drain_for_stopped_reason(client: &mut AcpClient, deadline: Instant) -> Option<String> {
     while Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(200), client.next_event()).await {
@@ -157,7 +62,7 @@ async fn attach_in_flight_synthesizes_reattach_idle_stopped() {
     // instead of the 10s production default.
     std::env::set_var("AOE_RESUME_IDLE_GRACE_MS", "500");
 
-    let (socket_path, _tmp) = spawn_shim_socket_bridge().await;
+    let (socket_path, _runner) = spawn_runner_with_shim(&[]).await;
 
     let mut client = AcpClient::attach(
         socket_path,
@@ -194,7 +99,7 @@ async fn attach_idle_session_does_not_synthesize_stopped() {
 
     std::env::set_var("AOE_RESUME_IDLE_GRACE_MS", "500");
 
-    let (socket_path, _tmp) = spawn_shim_socket_bridge().await;
+    let (socket_path, _runner) = spawn_runner_with_shim(&[]).await;
 
     let mut client = AcpClient::attach(
         socket_path,
@@ -241,7 +146,11 @@ async fn attach_in_flight_disarms_after_first_inbound_notification() {
     std::env::set_var("AOE_RESUME_IDLE_GRACE_MS", "800");
 
     let session_id = "test-acp-session-id";
-    let (socket_path, _tmp) = spawn_shim_socket_bridge_emitting_unsolicited(session_id, 200).await;
+    let (socket_path, _runner) = spawn_runner_with_shim(&[
+        ("SHIM_PRESEED_SESSION_ID", session_id.to_string()),
+        ("SHIM_EMIT_UNSOLICITED_NOTIF", "200".to_string()),
+    ])
+    .await;
 
     let mut client = AcpClient::attach(
         socket_path,
@@ -285,7 +194,8 @@ async fn socket_transport_round_trips_prompt_via_attach() {
     }
 
     let preseed = "preseed-roundtrip-session";
-    let (socket_path, _tmp) = spawn_shim_socket_bridge_with_preseed(Some(preseed)).await;
+    let (socket_path, _runner) =
+        spawn_runner_with_shim(&[("SHIM_PRESEED_SESSION_ID", preseed.to_string())]).await;
 
     let mut client = AcpClient::attach(
         socket_path,

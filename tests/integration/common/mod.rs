@@ -4,7 +4,9 @@
 //! `use crate::common::...`.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
+use tokio::process::Command;
 
 /// Stable per-process tmux socket for integration tests. aoe now resolves an
 /// explicit `-S <socket>` (#2608) and caches it once per process, so tests
@@ -99,4 +101,84 @@ pub fn set_temp_home(path: &Path) {
     std::env::set_var("HOME", path);
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     std::env::set_var("XDG_CONFIG_HOME", path.join(".config"));
+}
+
+#[cfg(feature = "serve")]
+/// A live `aoe __acp-runner` whose agent is the Node ACP shim.
+///
+/// Before #2977 these tests fronted the shim with a hand-rolled byte proxy on
+/// a unix socket, which was a fair stand-in while the daemon spoke raw ACP
+/// over `<id>.sock`. That socket is gone: the daemon now speaks the typed
+/// control protocol, and a byte proxy cannot answer it. Rather than
+/// reimplement the runner side in the fixture, spawn the real runner. It
+/// costs a process and gives the attach path genuine end-to-end coverage
+/// instead of a mock of the peer it is being tested against.
+///
+/// Returns the `--socket` path (still the derivation base for the control
+/// sibling, which is what `AcpClient::attach` dials) and guards that keep the
+/// temp dir and the runner process alive for the test's duration.
+pub async fn spawn_runner_with_shim(env: &[(&str, String)]) -> (PathBuf, RunnerGuard) {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let xdg = temp.path().join("xdg");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&xdg).unwrap();
+
+    // `--socket` is an explicit path, so point it straight at the temp dir
+    // rather than deriving the app-dir layout (which varies by platform and
+    // by whether XDG_CONFIG_HOME is set). The runner still writes its
+    // registry record under the temp HOME; nothing here reads it.
+    let session_id = "midturn1";
+    let socket_path = temp.path().join(format!("{session_id}.sock"));
+    let control = temp.path().join(format!("{session_id}.control.sock"));
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aoe"));
+    cmd.args([
+        "__acp-runner",
+        "--socket",
+        socket_path.to_str().unwrap(),
+        "--session-id",
+        session_id,
+        "--agent-name",
+        "shim",
+        "--cwd",
+        home.to_str().unwrap(),
+        "--",
+        "node",
+        shim_path().to_str().unwrap(),
+    ])
+    .env("HOME", &home)
+    .env("XDG_CONFIG_HOME", &xdg)
+    .kill_on_drop(true);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let child = cmd.spawn().expect("spawn acp runner");
+
+    // The runner binds the control socket before spawning the agent, so its
+    // appearance is the readiness signal the daemon's own probe uses.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !control.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "runner never bound {}",
+            control.display()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    (
+        socket_path,
+        RunnerGuard {
+            _child: child,
+            _temp: temp,
+        },
+    )
+}
+
+/// Keeps the runner process and its temp HOME alive for the test. Dropping
+/// it kills the runner (`kill_on_drop`), which takes the shim with it.
+pub struct RunnerGuard {
+    _child: tokio::process::Child,
+    _temp: tempfile::TempDir,
 }

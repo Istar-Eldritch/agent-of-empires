@@ -158,8 +158,6 @@ fn runner_proxies_agent_requests_over_the_control_channel() {
         &mut ctl,
         &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
     );
-    // Release the runner's backlog, as the daemon does once it can serve.
-    write_frame(&mut ctl, &serde_json::json!({"kind": "ready"}));
 
     // Drive an agent-to-client request through cat. `session/set_mode` is a
     // forward-lane call, so the runner writes it to the agent; cat echoes it
@@ -368,10 +366,6 @@ for line in sys.stdin:
             &mut ctl,
             &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
         );
-        // #2977: the runner holds its outbound queue until the daemon says
-        // it is ready to receive, so a real daemon's attach-time rehydration
-        // cannot race a flushed frame.
-        write_frame(&mut ctl, &serde_json::json!({"kind": "ready"}));
         write_frame(
             &mut ctl,
             &serde_json::json!({"kind": "initialize", "request": {"protocolVersion": 1}}),
@@ -409,10 +403,6 @@ for line in sys.stdin:
             &mut ctl,
             &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
         );
-        // #2977: the runner holds its outbound queue until the daemon says
-        // it is ready to receive, so a real daemon's attach-time rehydration
-        // cannot race a flushed frame.
-        write_frame(&mut ctl, &serde_json::json!({"kind": "ready"}));
         write_frame(
             &mut ctl,
             &serde_json::json!({"kind": "initialize", "request": {"protocolVersion": 1}}),
@@ -516,10 +506,6 @@ fn runner_load_uses_requested_id_and_caches_response() {
             &mut ctl,
             &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
         );
-        // #2977: the runner holds its outbound queue until the daemon says
-        // it is ready to receive, so a real daemon's attach-time rehydration
-        // cannot race a flushed frame.
-        write_frame(&mut ctl, &serde_json::json!({"kind": "ready"}));
         write_frame(
             &mut ctl,
             &serde_json::json!({
@@ -547,10 +533,6 @@ fn runner_load_uses_requested_id_and_caches_response() {
             &mut ctl,
             &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
         );
-        // #2977: the runner holds its outbound queue until the daemon says
-        // it is ready to receive, so a real daemon's attach-time rehydration
-        // cannot race a flushed frame.
-        write_frame(&mut ctl, &serde_json::json!({"kind": "ready"}));
         write_frame(
             &mut ctl,
             &serde_json::json!({
@@ -690,8 +672,6 @@ for line in sys.stdin:
         &mut ctl,
         &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
     );
-    // #2977: release the runner's outbound queue.
-    write_frame(&mut ctl, &serde_json::json!({"kind": "ready"}));
     write_frame(
         &mut ctl,
         &serde_json::json!({"kind": "initialize", "request": {"protocolVersion": 1}}),
