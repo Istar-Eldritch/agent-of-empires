@@ -352,6 +352,11 @@ pub enum SidecarFormat {
     /// which also holds provider/oauth settings, so its installer preserves
     /// the surrounding document.
     KimiToml,
+    /// An AoE-generated opencode plugin (`plugin/aoe-status.js`). opencode has
+    /// no shell-hook surface, so the "hook" is JS that shells out to the same
+    /// canonical status writer; the whole file is AoE's, so its installer
+    /// replaces rather than merges. See `crate::hooks::opencode`.
+    OpencodePluginJs,
 }
 
 /// Everything we know about a single agent CLI.
@@ -800,6 +805,55 @@ pub(crate) const KIMI_SIDECAR_EVENTS: &[SidecarHookEvent] = &[
     },
 ];
 
+/// opencode plugin events, keyed by the event name AoE's generated plugin
+/// dispatches on (see `crate::hooks::opencode`). These are not shell hooks:
+/// opencode has no such surface, so the names are its plugin/bus event types.
+///
+/// `session.status` carries the state in its payload, so it fans out to one
+/// key per payload variant (`session.status:<type>`) and each is separately
+/// overridable through a profile `status_map`. `retry` is opencode waiting out
+/// a provider retry, which is the agent still working rather than a prompt for
+/// the user, so it maps to Running.
+///
+/// `session.idle` is deprecated upstream (it is derived from
+/// `session.status`), kept as the only idle signal older opencode builds emit.
+/// `tool.execute.before` is likewise a version-agnostic Running signal that
+/// predates `session.status`. Both are harmless duplicates on a current build:
+/// a repeated identical status write is idempotent.
+///
+/// No `session.error` mapping. AoE's Error status wants a `last_error` string
+/// alongside it, and error-reason surfacing for opencode is tracked in #3379.
+pub(crate) const OPENCODE_SIDECAR_EVENTS: &[SidecarHookEvent] = &[
+    SidecarHookEvent {
+        name: "session.status:busy",
+        status: HookStatus::Running,
+    },
+    SidecarHookEvent {
+        name: "session.status:retry",
+        status: HookStatus::Running,
+    },
+    SidecarHookEvent {
+        name: "tool.execute.before",
+        status: HookStatus::Running,
+    },
+    SidecarHookEvent {
+        name: "permission.replied",
+        status: HookStatus::Running,
+    },
+    SidecarHookEvent {
+        name: "permission.asked",
+        status: HookStatus::Waiting,
+    },
+    SidecarHookEvent {
+        name: "session.status:idle",
+        status: HookStatus::Idle,
+    },
+    SidecarHookEvent {
+        name: "session.idle",
+        status: HookStatus::Idle,
+    },
+];
+
 pub const AGENTS: &[AgentDef] = &[
     AgentDef {
         name: "claude",
@@ -853,10 +907,29 @@ pub const AGENTS: &[AgentDef] = &[
         yolo: Some(YoloMode::EnvVar("OPENCODE_PERMISSION", r#"{"*":"allow"}"#)),
         instruction_flag: None,
         set_default_command: true,
+        // Hook-first: the plugin's sidecar write wins in
+        // `update_status_with_metadata_inner`. This detector stays as the
+        // fallback for the window before the first plugin event, an opencode
+        // too old for plugins, and a session with `agent_status_hooks` off.
         detect_status: status_detection::detect_opencode_status,
         container_env: &[],
+        // opencode exposes no shell-hook surface at all (its config schema has
+        // no `hook` key), so status comes from an AoE-generated opencode
+        // plugin. The plugin is a whole AoE-owned file rather than entries
+        // merged into a user config, and its host directory follows
+        // `XDG_CONFIG_HOME`, hence `resolve_host_config_path`.
         hook_config: None,
-        sidecar_hooks: None,
+        sidecar_hooks: Some(SidecarHooks {
+            host_config_subpath: crate::hooks::OPENCODE_PLUGIN_SUBPATH,
+            sandbox_config_subpath: crate::hooks::OPENCODE_PLUGIN_SANDBOX_SUBPATH,
+            install: crate::hooks::install_opencode_plugin_with_events,
+            uninstall: crate::hooks::uninstall_opencode_plugin,
+            post_install_host: None,
+            selected_agent_hooks: None,
+            resolve_host_config_path: Some(crate::hooks::opencode_plugin_path_in),
+            format: SidecarFormat::OpencodePluginJs,
+            events: OPENCODE_SIDECAR_EVENTS,
+        }),
         resume_strategy: ResumeStrategy::Flag("--session"),
         fork_strategy: ForkStrategy::Flag("--fork"),
         host_only: false,
@@ -2642,6 +2715,7 @@ mod tests {
         // sidecar path. The dispatch in `crate::hooks::has_aoe_marker` is
         // keyed off this field.
         let expected: &[(&str, SidecarFormat)] = &[
+            ("opencode", SidecarFormat::OpencodePluginJs),
             ("settl", SidecarFormat::SettlToml),
             ("hermes", SidecarFormat::HermesYaml),
             ("kiro", SidecarFormat::KiroJson),

@@ -11959,9 +11959,11 @@ mod tests {
             status_hook_env_prefix("work", "abc123", crate::agents::get_agent("claude")),
             "AOE_PROFILE='work' AOE_INSTANCE_ID='abc123' "
         );
+        // opencode's status plugin reads AOE_INSTANCE_ID out of its own
+        // process env, so it needs the prefix like any other hook agent.
         assert_eq!(
             status_hook_env_prefix("work", "abc123", crate::agents::get_agent("opencode")),
-            ""
+            "AOE_PROFILE='work' AOE_INSTANCE_ID='abc123' "
         );
         assert_eq!(
             status_hook_env_prefix("work", "abc123", crate::agents::get_agent("kiro")),

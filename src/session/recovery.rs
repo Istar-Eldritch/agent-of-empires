@@ -853,6 +853,24 @@ mod tests {
         );
     }
 
+    /// Stand-in for "an agent with no status hooks" in the orphan-scan tests
+    /// below. Those tests exercise the `agent_session_id`-in-argv path, which
+    /// only runs for agents that have no hook env marker to match on instead,
+    /// so the agent named here has to stay hook-free.
+    /// `orphan_test_agent_really_has_no_hooks` fails if it ever gains hooks
+    /// (opencode used to be this stand-in until it grew a status plugin).
+    const ORPHAN_TEST_NON_HOOK_AGENT: &str = "vibe";
+
+    #[test]
+    fn orphan_test_agent_really_has_no_hooks() {
+        let agent = crate::agents::get_agent(ORPHAN_TEST_NON_HOOK_AGENT)
+            .expect("stand-in agent must exist");
+        assert!(
+            agent.hook_config.is_none() && agent.sidecar_hooks.is_none(),
+            "{ORPHAN_TEST_NON_HOOK_AGENT} gained status hooks;              point ORPHAN_TEST_NON_HOOK_AGENT at an agent that still has none",
+        );
+    }
+
     /// A valid, long session id that no live process carries returns `false`
     /// (the genuine post-reboot case: the agent processes are gone). Also
     /// covers the no-sid path, where only the `AOE_INSTANCE_ID` env needle is
@@ -868,7 +886,7 @@ mod tests {
         );
 
         // Non-hook agent so the sid needle is actually built and tested absent.
-        inst.tool = "opencode".to_string();
+        inst.tool = ORPHAN_TEST_NON_HOOK_AGENT.to_string();
         inst.agent_session_id = Some(format!(
             "11111111-1111-4111-8111-{:012}",
             std::process::id()
@@ -886,7 +904,7 @@ mod tests {
     fn orphaned_agent_process_alive_ignores_short_sid() {
         let mut inst = Instance::new("short-sid", "/tmp/test");
         inst.id = format!("shortsid{:012}", std::process::id());
-        inst.tool = "opencode".to_string();
+        inst.tool = ORPHAN_TEST_NON_HOOK_AGENT.to_string();
         inst.agent_session_id = Some("short".into());
         assert!(
             !orphaned_agent_process_alive(&inst),
@@ -903,7 +921,7 @@ mod tests {
         let sid = format!("22222222-2222-4222-8222-{:012}", std::process::id());
         let mut inst = Instance::new("orphan-sid", "/tmp/test");
         inst.id = format!("orphansid{:012}", std::process::id());
-        inst.tool = "opencode".to_string();
+        inst.tool = ORPHAN_TEST_NON_HOOK_AGENT.to_string();
         inst.agent_session_id = Some(sid.clone());
 
         // Stand in for the orphaned `<agent> --resume <sid>` child: the sid

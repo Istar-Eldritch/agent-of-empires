@@ -189,6 +189,9 @@ pub(crate) fn has_aoe_marker(target: &HookTarget) -> bool {
             // `{ event, command }` entries as settl, so the settl marker
             // walker identifies AoE-managed hooks in it unchanged.
             crate::agents::SidecarFormat::KimiToml => settl_config_has_aoe_marker(&target.path),
+            crate::agents::SidecarFormat::OpencodePluginJs => {
+                super::opencode::opencode_plugin_has_aoe_marker(&target.path)
+            }
         },
     }
 }

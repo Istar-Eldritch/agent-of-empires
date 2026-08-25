@@ -8,6 +8,7 @@
 //! Hook events are agent-specific and defined in `AgentHookConfig::events`.
 
 mod dir_guard;
+mod opencode;
 mod status_file;
 mod targets;
 
@@ -32,6 +33,12 @@ pub use status_file::{
 };
 pub(crate) use targets::{
     has_aoe_marker, iter_hook_targets, iter_hook_targets_in, HookTarget, HookTargetKind,
+};
+
+pub(crate) use opencode::opencode_plugin_path_in;
+pub use opencode::{
+    install_opencode_plugin_with_events, uninstall_opencode_plugin,
+    OPENCODE_PLUGIN_SANDBOX_SUBPATH, OPENCODE_PLUGIN_SUBPATH,
 };
 
 /// Single source of truth for the `aoe-hooks` identity token. Defined as a
@@ -2701,6 +2708,32 @@ mod tests {
 
         assert!(codex_paths.contains(&tmp.path().join(".codex").join("hooks.json")));
         assert!(codex_paths.contains(&codex_home.join("hooks.json")));
+    }
+
+    #[test]
+    fn test_iter_hook_targets_includes_profile_xdg_opencode_plugin() {
+        // The opencode plugin follows XDG_CONFIG_HOME, so a profile that
+        // overrides it puts the plugin somewhere the home-relative default
+        // never names. `aoe hooks uninstall` and the v015/v017 rewrite
+        // migrations both walk this enumerator, so a missing entry means an
+        // orphaned plugin that keeps reporting status after uninstall.
+        let home = Path::new("/home/tester");
+        let env_lists = vec![vec!["XDG_CONFIG_HOME=/xdg-profile".to_string()]];
+        let opencode_paths: Vec<_> = iter_hook_targets_in(home, &env_lists)
+            .into_iter()
+            .filter(|t| t.agent_name == "opencode")
+            .map(|t| t.path)
+            .collect();
+
+        assert!(
+            opencode_paths.contains(&PathBuf::from("/xdg-profile/opencode/plugin/aoe-status.js")),
+            "profile XDG override missing from enumerated targets: {opencode_paths:?}"
+        );
+        // The un-overridden default is enumerated too, so both are cleaned up.
+        assert!(
+            opencode_paths.len() >= 2,
+            "expected the default path alongside the override: {opencode_paths:?}"
+        );
     }
 
     #[test]
