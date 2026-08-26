@@ -172,9 +172,10 @@ fn render_opencode_plugin(
 // {AOE_PLUGIN_MARKER}
 //
 // Reports this opencode session's activity status to AoE. Outside an AoE
-// session AOE_INSTANCE_ID is unset and every command below exits without
-// writing anything, so this file is inert for your own opencode runs.
-// Remove it with `aoe hooks uninstall`.
+// session AOE_INSTANCE_ID is unset, so this registers no handlers at all and
+// costs nothing on your own opencode runs.
+//
+// Delete this file to remove it, or run `aoe uninstall`.
 
 const RUNNING = {running_json};
 const IDLE = {idle_json};
@@ -235,7 +236,14 @@ function report(keys, sessionId) {{
   return undefined;
 }}
 
-export const AoeStatus = async () => ({{
+// Register nothing outside an AoE session. The writer command bails on an
+// unset AOE_INSTANCE_ID too, but that guard is inside the spawned shell, so
+// without this early-out every non-AoE opencode run on the machine would still
+// fork a process per status transition. AoE injects the variable for opencode
+// (status_hook_env_prefix), so its absence means this is not our session.
+export const AoeStatus = async () => {{
+  if (!process.env.AOE_INSTANCE_ID) return {{}};
+  return {{
   event: async ({{ event }}) => {{
     try {{
       await report(keysFor(event), sessionIdOf(event));
@@ -250,7 +258,8 @@ export const AoeStatus = async () => ({{
       // As above.
     }}
   }},
-}});
+  }};
+}};
 "#
     ))
 }
@@ -437,7 +446,9 @@ globalThis.Bun = {
     return { exited: Promise.resolve(0) }
   },
 }
+process.env.AOE_INSTANCE_ID = "drivertest"
 const plugin = await (await import("./aoe-status.mjs")).AoeStatus({})
+if (!plugin.event) throw new Error("no handlers registered with AOE_INSTANCE_ID set")
 const status = (sessionID, type) =>
   plugin.event({ event: { type: "session.status", properties: { sessionID, status: { type } } } })
 
@@ -467,6 +478,51 @@ console.log(JSON.stringify(recorded))
             "stderr:\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    /// With `AOE_INSTANCE_ID` unset the plugin must register no handlers at
+    /// all, so a non-AoE opencode run on the same machine does not fork a
+    /// shell per status transition. The writer command bails on the unset
+    /// variable as well, but that guard lives inside the spawned process.
+    #[test]
+    fn test_rendered_plugin_registers_nothing_outside_an_aoe_session() {
+        let Ok(node) = which::which("node") else {
+            eprintln!("skipping: node not on PATH");
+            return;
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("aoe-status.mjs"),
+            render_opencode_plugin(HookInstallTarget::Host, &opencode_events()).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("driver.mjs"),
+            r#"
+delete process.env.AOE_INSTANCE_ID
+globalThis.Bun = {
+  spawn() {
+    throw new Error("spawned a shell outside an AoE session")
+  },
+}
+const hooks = await (await import("./aoe-status.mjs")).AoeStatus({})
+console.log(JSON.stringify(Object.keys(hooks)))
+"#,
+        )
+        .unwrap();
+
+        let out = std::process::Command::new(node)
+            .arg("driver.mjs")
+            .current_dir(dir.path())
+            .env_remove("AOE_INSTANCE_ID")
+            .output()
+            .expect("run the plugin driver");
+        assert!(
+            out.status.success(),
+            "driver failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "[]");
     }
 
     #[test]
