@@ -353,21 +353,6 @@ pub(crate) enum ResumeReservationOutcome {
     AlreadyPresent,
 }
 
-/// Remove both of a runner's socket files, given the relay path that is
-/// still the derivation base for the control sibling. A pre-#2977 runner
-/// bound the relay path itself; a v2 runner binds only the sibling. Removing
-/// both keeps a respawn from colliding with either generation's leftovers.
-fn remove_runner_sockets(socket_path: &std::path::Path) {
-    for path in [
-        socket_path.to_path_buf(),
-        crate::process::worker::control_socket_sibling(socket_path),
-    ] {
-        if path.exists() {
-            let _ = std::fs::remove_file(&path);
-        }
-    }
-}
-
 /// Why an adopted worker is scheduled for replacement at its next idle
 /// boundary. Both causes have the same remedy (drain the turn, then reap and
 /// respawn), but they are distinct events an operator reading the logs needs
@@ -1310,7 +1295,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             // binds only that one; leaving it behind is what would actually
             // collide now. Failures (already gone, no perms) are non-fatal.
             if let Ok(socket_path) = crate::process::worker_registry::socket_path_for(session_id) {
-                remove_runner_sockets(&socket_path);
+                crate::process::worker_registry::remove_runner_sockets(&socket_path);
             }
         }
         // Acp currently runs over Unix sockets only; reaching this
@@ -2233,7 +2218,9 @@ impl<S: BroadcastSink> Supervisor<S> {
                             if let Ok(socket_path) =
                                 crate::process::worker_registry::socket_path_for(&session_id)
                             {
-                                remove_runner_sockets(&socket_path);
+                                crate::process::worker_registry::remove_runner_sockets(
+                                    &socket_path,
+                                );
                             }
                         }
                         // Acp's runner transport is UNIX-socket-only today

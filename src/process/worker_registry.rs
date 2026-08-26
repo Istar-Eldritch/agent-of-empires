@@ -289,10 +289,7 @@ pub fn delete(session_id: &str) -> Result<()> {
         let _ = std::fs::remove_file(&p);
     }
     if let Ok(p) = socket_path_for(session_id) {
-        let _ = std::fs::remove_file(&p);
-        // Sibling control socket (Phase A of #1054); best-effort, absent
-        // for runners that predate the control channel.
-        let _ = std::fs::remove_file(crate::process::worker::control_socket_sibling(&p));
+        remove_runner_sockets(&p);
     }
     if let Ok(p) = log_path_for(session_id) {
         if matches!(std::fs::metadata(&p), Ok(m) if m.len() == 0) {
@@ -378,6 +375,23 @@ fn expected_socket(rec: &WorkerRecord) -> std::path::PathBuf {
         crate::process::worker::control_socket_sibling(&rec.socket_path)
     } else {
         rec.socket_path.clone()
+    }
+}
+
+/// Remove every socket file a runner could own, given the relay path that is
+/// still the derivation base for the control sibling. A pre-#2977 runner bound
+/// the relay path itself; a v2 runner binds only the sibling. Removing both
+/// keeps a respawn from colliding with either generation's leftovers.
+///
+/// One helper rather than the same two lines at each teardown site, so
+/// "which sockets does a runner of generation N own" has a single answer to
+/// update when a future generation changes the set.
+pub(crate) fn remove_runner_sockets(socket_path: &Path) {
+    for path in [
+        socket_path.to_path_buf(),
+        crate::process::worker::control_socket_sibling(socket_path),
+    ] {
+        let _ = std::fs::remove_file(&path);
     }
 }
 
