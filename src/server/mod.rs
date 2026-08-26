@@ -6867,14 +6867,15 @@ mod tests {
         }
 
         // Scan case: a distinct id_b (never attempted) whose agent is positively
-        // alive must be excluded by the process scan. Uses a non-hook agent
-        // (opencode) whose sid the decoy carries in argv, so detection goes
-        // through the cross-platform cmdline needle rather than `ps -E` env
-        // visibility, which a hardened macOS can hide (#3006 review).
+        // alive must be excluded by the process scan. Uses a hook-free agent
+        // whose sid the decoy carries in argv, so detection goes through the
+        // cross-platform cmdline needle rather than `ps -E` env visibility,
+        // which a hardened macOS can hide (#3006 review). The agent name comes
+        // from the shared constant so it cannot silently stop being hook-free.
         let sid_b = format!("66666666-6666-4666-8666-{unique}");
         let mut inst_b = crate::session::Instance::new("orphan-wire-b", "/tmp/aoe-test-2994");
         inst_b.id = format!("wireB{unique}");
-        inst_b.tool = "opencode".to_string();
+        inst_b.tool = crate::session::recovery::ORPHAN_TEST_NON_HOOK_AGENT.to_string();
         inst_b.agent_session_id = Some(sid_b.clone());
         let id_b = inst_b.id.clone();
         assert!(

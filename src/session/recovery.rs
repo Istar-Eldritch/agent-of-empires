@@ -605,6 +605,19 @@ impl Drop for HookTimeoutScope {
     }
 }
 
+/// Stand-in for "an agent with no status hooks" in the orphan-scan tests, here
+/// and in `server::tests::daemon_recovery_ledger_and_scan_exclude_candidates`.
+/// Those tests exercise the `agent_session_id`-in-argv path, which
+/// `orphan_needles` only builds for agents with no hook env marker to match on
+/// instead, so the agent named here has to stay hook-free.
+///
+/// Lives outside `mod tests` so both call sites share one definition and
+/// `orphan_test_agent_really_has_no_hooks` fails for either of them if it ever
+/// gains hooks. opencode was this stand-in until it grew a status plugin, and
+/// the server-side copy was a hardcoded string the guard could not reach.
+#[cfg(test)]
+pub(crate) const ORPHAN_TEST_NON_HOOK_AGENT: &str = "vibe";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -852,14 +865,6 @@ mod tests {
             "expired snooze must restore recovery eligibility"
         );
     }
-
-    /// Stand-in for "an agent with no status hooks" in the orphan-scan tests
-    /// below. Those tests exercise the `agent_session_id`-in-argv path, which
-    /// only runs for agents that have no hook env marker to match on instead,
-    /// so the agent named here has to stay hook-free.
-    /// `orphan_test_agent_really_has_no_hooks` fails if it ever gains hooks
-    /// (opencode used to be this stand-in until it grew a status plugin).
-    const ORPHAN_TEST_NON_HOOK_AGENT: &str = "vibe";
 
     #[test]
     fn orphan_test_agent_really_has_no_hooks() {
