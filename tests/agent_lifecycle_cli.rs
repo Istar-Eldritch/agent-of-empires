@@ -129,7 +129,6 @@ fn aoe_agents_lists_deprecated_notice() {
     assert_eq!(stdout.matches("deprecated since").count(), 1, "{stdout}");
 }
 
-#[cfg(feature = "serve")]
 #[test]
 fn acp_doctor_text_emits_amber_lifecycle_notice() {
     let (_tmp, home, xdg) = isolated_dirs();

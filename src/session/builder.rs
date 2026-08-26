@@ -2430,7 +2430,6 @@ mod tests {
         const RULE_AGENT: &str = "fork-seed-registry-rule";
         let cases: &[(&str, fn())] = &[
             ("terminal", build_instance_applies_terminal_fork_seed),
-            #[cfg(feature = "serve")]
             ("structured", build_instance_applies_structured_fork_seed),
         ];
 
