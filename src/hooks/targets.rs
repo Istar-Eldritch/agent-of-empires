@@ -28,8 +28,9 @@ pub(crate) enum HookTargetKind {
     /// the path is resolved through `codex_hooks_json_path_in`
     /// (`CODEX_HOME` aware).
     CodexJson,
-    /// settl/hermes/kiro: a config format the JSON path cannot emit; install
-    /// goes through the agent's bundled `AgentStatusIntegration` function pointers.
+    /// settl/hermes/kiro/kimi/opencode: a config format the JSON path cannot
+    /// emit, or a generated plugin; install goes through the agent's bundled
+    /// `AgentStatusIntegration` function pointers.
     Integration(&'static crate::agents::AgentStatusIntegration),
 }
 
@@ -49,8 +50,8 @@ pub(crate) struct HookTarget {
 
 /// Enumerate every hook target reachable from the running AoE process: the
 /// home-relative default for each agent, plus every profile-overridden path
-/// (CLAUDE_CONFIG_DIR / CODEX_HOME / etc.) from the global config and each
-/// profile's `environment` list. Deduplicated by `(kind discriminant, path)`.
+/// (CLAUDE_CONFIG_DIR / CODEX_HOME / XDG_CONFIG_HOME / etc.) from the global
+/// config and each profile's `environment` list. Deduplicated by `(kind discriminant, path)`.
 ///
 /// Used by [`uninstall_all_hooks`] (read-modify-write removal) and the v015
 /// migration (read-modify-write rewrite). Both share this enumerator so a
@@ -113,6 +114,13 @@ pub(crate) fn iter_hook_targets_in(home: &Path, env_lists: &[Vec<String>]) -> Ve
             // more than one path, and uninstall plus the hook-rewrite
             // migrations have to see every one of them.
             let mut paths: Vec<PathBuf> = Vec::new();
+            // The declared home-relative subpath always counts as a target. A
+            // resolver also reads AoE's own process env, so an `XDG_CONFIG_HOME`
+            // exported in the uninstalling shell would otherwise hide a plugin
+            // installed before it was set: `aoe uninstall` would sweep only the
+            // resolved path and leave the old one to reanimate the moment the
+            // variable goes away. No-op for the integrations with no resolver.
+            push_unique_target_path(&mut paths, home.join(integration.host_config_subpath));
             push_unique_target_path(&mut paths, integration.host_config_path(home, &[]));
             for env in env_lists {
                 push_unique_target_path(&mut paths, integration.host_config_path(home, env));

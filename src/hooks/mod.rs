@@ -2716,29 +2716,58 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(shell_env)]
     fn test_iter_hook_targets_includes_profile_xdg_opencode_plugin() {
         // The opencode plugin follows XDG_CONFIG_HOME, so a profile that
         // overrides it puts the plugin somewhere the home-relative default
-        // never names. `aoe hooks uninstall` and the v015/v017 rewrite
-        // migrations both walk this enumerator, so a missing entry means an
-        // orphaned plugin that keeps reporting status after uninstall.
+        // never names. `aoe uninstall` and the v015/v017 rewrite migrations
+        // both walk this enumerator, so a missing entry means an orphaned
+        // plugin that keeps reporting status after uninstall.
+        let _guard = EnvGuard::unset(&["XDG_CONFIG_HOME"]);
         let home = Path::new("/home/tester");
-        let env_lists = vec![vec!["XDG_CONFIG_HOME=/xdg-profile".to_string()]];
-        let opencode_paths: Vec<_> = iter_hook_targets_in(home, &env_lists)
+        let default = PathBuf::from("/home/tester/.config/opencode/plugin/aoe-status.js");
+        let profile = PathBuf::from("/xdg-profile/opencode/plugin/aoe-status.js");
+
+        let opencode_paths = |env_lists: &[Vec<String>]| -> Vec<PathBuf> {
+            iter_hook_targets_in(home, env_lists)
+                .into_iter()
+                .filter(|t| t.agent_name == "opencode")
+                .map(|t| t.path)
+                .collect()
+        };
+
+        let paths = opencode_paths(&[vec!["XDG_CONFIG_HOME=/xdg-profile".to_string()]]);
+        assert!(
+            paths.contains(&profile),
+            "profile XDG override missing: {paths:?}"
+        );
+        assert!(
+            paths.contains(&default),
+            "home-relative default missing: {paths:?}"
+        );
+
+        // Regression: the resolver also honors AoE's own process env, so a
+        // shell that exports XDG_CONFIG_HOME must not hide a plugin installed
+        // before it was set. Both paths stay enumerated so uninstall sweeps the
+        // stale one instead of leaving it to reanimate when the var goes away.
+        std::env::set_var("XDG_CONFIG_HOME", "/proc-xdg");
+        let paths = opencode_paths(&[]);
+        assert!(
+            paths.contains(&PathBuf::from("/proc-xdg/opencode/plugin/aoe-status.js")),
+            "process XDG path missing: {paths:?}"
+        );
+        assert!(
+            paths.contains(&default),
+            "home-relative default hidden by a process-env XDG override: {paths:?}"
+        );
+
+        // An integration with no resolver is unaffected: one path, the default.
+        let hermes: Vec<_> = iter_hook_targets_in(home, &[])
             .into_iter()
-            .filter(|t| t.agent_name == "opencode")
+            .filter(|t| t.agent_name == "hermes")
             .map(|t| t.path)
             .collect();
-
-        assert!(
-            opencode_paths.contains(&PathBuf::from("/xdg-profile/opencode/plugin/aoe-status.js")),
-            "profile XDG override missing from enumerated targets: {opencode_paths:?}"
-        );
-        // The un-overridden default is enumerated too, so both are cleaned up.
-        assert!(
-            opencode_paths.len() >= 2,
-            "expected the default path alongside the override: {opencode_paths:?}"
-        );
+        assert_eq!(hermes, vec![home.join(".hermes/config.yaml")]);
     }
 
     #[test]
