@@ -202,12 +202,10 @@ fn split_bracketed_paste(text: &str) -> Vec<live_send::TmuxKey> {
 /// report at all, so it is dropped rather than clamped to the nearest edge,
 /// which would otherwise synthesise a click or hover on pane 0's border.
 ///
-/// Pane 0 usually sits at the window origin, so the sub-rectangle shares the
-/// preview's top-left corner and only its extent differs. A window option
-/// like `pane-border-status top` can shift it down (`pane_top == 1`, #3515);
-/// this mapping still assumes the shared corner, so a composited preview with
-/// a shifted pane 0 clamps against the wrong row. Known residual: the TUI
-/// side of #3515 was never reproduced there.
+/// Pane 0 does not always sit at the window origin: a window option like
+/// `pane-border-status top` reserves a border row above every pane and shifts
+/// it to `pane_top == 1` (#3515), so the sub-rectangle carries pane 0's origin
+/// as well as its extent and a pointer over the border row falls outside it.
 fn mouse_target_rect(
     cursor: &crate::tmux::PaneCursor,
     pane: ratatui::layout::Rect,
@@ -235,16 +233,24 @@ fn mouse_target_rect(
 /// is deliberately not position-gated so a gesture that began on pane 0 still
 /// completes, and those events need a clamped coordinate even after the pointer
 /// has wandered off pane 0.
+///
+/// The origin is what [`map_pane_cell`] subtracts to reach the app's own
+/// coordinates, so it must be pane 0's corner within the preview rather than
+/// the preview's: painting the cursor ADDS the origin (see
+/// `map_live_preview_cursor`) while forwarding a pointer removes it again.
+/// The extent is clamped to what is left of the preview past that corner, so a
+/// pane 0 wider or taller than the area it is shown in cannot admit cells
+/// outside the rect.
 fn mouse_pane_rect(
     cursor: &crate::tmux::PaneCursor,
     pane: ratatui::layout::Rect,
 ) -> ratatui::layout::Rect {
     match cursor.composite_pane0 {
         Some(rect) => ratatui::layout::Rect {
-            x: pane.x,
-            y: pane.y,
-            width: rect.width.min(pane.width),
-            height: rect.height.min(pane.height),
+            x: pane.x.saturating_add(rect.left),
+            y: pane.y.saturating_add(rect.top),
+            width: rect.width.min(pane.width.saturating_sub(rect.left)),
+            height: rect.height.min(pane.height.saturating_sub(rect.top)),
         },
         None => pane,
     }
@@ -7170,24 +7176,68 @@ mod tests {
         );
     }
 
-    /// A pane 0 extent larger than the preview rect (the window is bigger than
-    /// the area it is being shown in, e.g. an attached client keeping its own
-    /// size) must clamp to the rect rather than admitting cells outside it.
+    /// Pane 0's sub-rectangle within the preview: it starts at pane 0's own
+    /// origin (#3515: `pane-border-status top` puts it a row below the
+    /// preview's corner) and its extent clamps to whatever is left of the
+    /// preview past that corner, so a window bigger than the area it is shown
+    /// in (an attached client keeping its own size) cannot admit cells outside
+    /// the rect.
     #[test]
-    fn composite_pane_rect_clamps_to_the_preview() {
+    fn composite_pane_rect_carries_the_origin_and_clamps_to_the_preview() {
         use ratatui::layout::Rect;
         let pane = Rect::new(2, 3, 20, 10);
-        let mut cursor = cursor_for(true, true, true);
-        cursor.composite_pane0 = Some(crate::tmux::PaneGeom {
+        // (pane 0's rect, the sub-rectangle it must produce inside `pane`).
+        let cases = [
+            // Oversized pane 0 at the corner: clamps to the whole preview.
+            ((0, 0, 999, 999), Rect::new(2, 3, 20, 10)),
+            // A borderless split: origin at the corner, extent honoured.
+            ((0, 0, 8, 6), Rect::new(2, 3, 8, 6)),
+            // `pane-border-status top`: one row down, and the height clamp
+            // must shrink with it or the rect would run past the preview.
+            ((0, 1, 8, 9), Rect::new(2, 4, 8, 9)),
+            ((0, 1, 999, 999), Rect::new(2, 4, 20, 9)),
+            // Both axes, oversized: `left` shrinks the width the same way.
+            ((3, 1, 999, 999), Rect::new(5, 4, 17, 9)),
+        ];
+        for (geom, want) in cases {
+            let mut cursor = cursor_for(true, true, true);
+            cursor.composite_pane0 = Some(crate::tmux::PaneGeom {
+                left: geom.0,
+                top: geom.1,
+                width: geom.2,
+                height: geom.3,
+            });
+            assert_eq!(mouse_pane_rect(&cursor, pane), want, "{geom:?}");
+        }
+
+        // The origin is honoured by the containment test too: with pane 0 at
+        // the preview's corner, a cell above/left of the rect is outside.
+        let mut corner = cursor_for(true, true, true);
+        corner.composite_pane0 = Some(crate::tmux::PaneGeom {
             left: 0,
             top: 0,
             width: 999,
             height: 999,
         });
-        assert_eq!(mouse_pane_rect(&cursor, pane), pane);
-        // And the origin is honoured: a cell above/left of the rect is outside.
-        assert_eq!(mouse_target_rect(&cursor, pane, 1, 3), None);
-        assert!(mouse_target_rect(&cursor, pane, 2, 3).is_some());
+        assert_eq!(mouse_target_rect(&corner, pane, 1, 3), None);
+        assert!(mouse_target_rect(&corner, pane, 2, 3).is_some());
+
+        // #3515: a border-status row belongs to no pane, so a pointer on it is
+        // dropped rather than forwarded as pane 0's first row, and the row
+        // below it reports the app's own row 1 instead of row 2.
+        let mut shifted = cursor_for(true, true, true);
+        shifted.mouse_all = true;
+        shifted.composite_pane0 = Some(crate::tmux::PaneGeom {
+            left: 0,
+            top: 1,
+            width: 20,
+            height: 9,
+        });
+        assert_eq!(hover_forward_bytes(&shifted, pane, 2, 3), None);
+        assert_eq!(
+            hover_forward_bytes(&shifted, pane, 2, 4).as_deref(),
+            Some(b"\x1b[<35;1;1M".as_slice())
+        );
     }
 
     /// The fix for #2407: a full-screen pane with no mouse tracking must

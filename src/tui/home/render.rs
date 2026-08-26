@@ -132,12 +132,13 @@ const READING_CAPTURE_LINES: u16 = 2000;
 /// BELOW the text the user typed (#2742); clamping to `line_count` keeps them
 /// aligned. A hidden cursor, or one that maps outside `output`, yields `None`.
 ///
-/// Residual #3515 (TUI side, never reproduced): `y` is pane relative, while
-/// on a COMPOSITED preview the painted grid is the whole window and a
-/// `pane-border-status` row shifts pane 0 down. Indexing that grid with the
-/// untranslated `y` would paint one row high; consumers of
-/// [`crate::tmux::PaneCursor::composite_pane0`] are supposed to translate by
-/// `(left, top)`. This path does not yet.
+/// On a COMPOSITED preview the painted grid is the whole window while `(x, y)`
+/// stay pane 0 relative, so they are translated by the origin carried on
+/// [`crate::tmux::PaneCursor::composite_pane0`] before being anchored: a
+/// `pane-border-status top` row shifts pane 0 to `top == 1`, and indexing the
+/// composite with the untranslated `y` painted the cursor one row high
+/// (#3515). The origin is `(0, 0)` on an unsplit preview and on any split
+/// whose pane 0 sits at the corner, where this is the identity.
 fn map_live_preview_cursor(
     output: Rect,
     visible_rows: usize,
@@ -147,9 +148,12 @@ fn map_live_preview_cursor(
     if !cursor.visible {
         return None;
     }
+    let (origin_x, origin_y) = cursor
+        .composite_pane0
+        .map_or((0, 0), |p| (p.left as i32, p.top as i32));
     let anchor = line_count.min(visible_rows) as i32;
-    let row = output.y as i32 + (anchor - cursor.pane_height as i32) + cursor.y as i32;
-    let col = output.x as i32 + cursor.x as i32;
+    let row = output.y as i32 + (anchor - cursor.pane_height as i32) + cursor.y as i32 + origin_y;
+    let col = output.x as i32 + cursor.x as i32 + origin_x;
     if row < output.y as i32
         || row >= output.y as i32 + output.height as i32
         || col < output.x as i32
@@ -4256,6 +4260,42 @@ mod tests {
             map_live_preview_cursor(output, 24, 23, pane_cursor(0, 0, true, 23)),
             Some(Position::new(0, 0)),
         );
+    }
+
+    /// #3515: on a composited preview the painted grid is the whole window
+    /// while the cursor stays pane 0 relative, so it is translated by pane 0's
+    /// origin before anchoring. `pane-border-status top` is the trigger in the
+    /// wild (it shifts pane 0 to `top == 1`); the zero-origin rows are the
+    /// ones that must not move, since an unsplit preview is the common case.
+    #[test]
+    fn live_cursor_translates_by_pane_zero_origin_on_a_composite() {
+        let output = Rect::new(40, 5, 80, 24);
+        // (pane 0's rect, expected position) for a cursor at pane cell (3, 2)
+        // over a 24-row composite that fills the output.
+        let cases = [
+            // Unsplit: no composite at all, the pre-#3515 mapping verbatim.
+            (None, Position::new(43, 7)),
+            // A borderless split: pane 0 IS at the corner, so still identity.
+            (Some((0, 0, 40, 24)), Position::new(43, 7)),
+            // `pane-border-status top`: one row down, nothing sideways.
+            (Some((0, 1, 40, 23)), Position::new(43, 8)),
+            // Both axes, to pin that `left` is not silently ignored.
+            (Some((2, 1, 38, 23)), Position::new(45, 8)),
+        ];
+        for (geom, want) in cases {
+            let mut cursor = pane_cursor(3, 2, true, 24);
+            cursor.composite_pane0 = geom.map(|(left, top, width, height)| crate::tmux::PaneGeom {
+                left,
+                top,
+                width,
+                height,
+            });
+            assert_eq!(
+                map_live_preview_cursor(output, 24, 200, cursor),
+                Some(want),
+                "{geom:?}"
+            );
+        }
     }
 
     #[test]
