@@ -146,7 +146,7 @@ const ORPHAN_SCAN_MIN_SID_LEN: usize = 8;
 /// the agents whose live process carries the anchored env marker.
 fn agent_injects_instance_id_env(tool: &str) -> bool {
     crate::agents::get_agent(tool)
-        .is_some_and(|a| a.hook_config.is_some() || a.sidecar_hooks.is_some())
+        .is_some_and(|a| a.hook_config.is_some() || a.status_integration.is_some())
 }
 
 /// The identity needles used to detect a live agent process for `inst`: the
@@ -866,7 +866,7 @@ mod tests {
         let agent = crate::agents::get_agent(ORPHAN_TEST_NON_HOOK_AGENT)
             .expect("stand-in agent must exist");
         assert!(
-            agent.hook_config.is_none() && agent.sidecar_hooks.is_none(),
+            agent.hook_config.is_none() && agent.status_integration.is_none(),
             "{ORPHAN_TEST_NON_HOOK_AGENT} gained status hooks;              point ORPHAN_TEST_NON_HOOK_AGENT at an agent that still has none",
         );
     }

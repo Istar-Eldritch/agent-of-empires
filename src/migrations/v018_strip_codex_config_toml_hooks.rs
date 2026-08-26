@@ -3,7 +3,7 @@
 //! ## Background
 //!
 //! PR #2187 replaced the agent string-based hook dispatch with the
-//! `HookFormat` / `SidecarFormat` enums. The follow-up
+//! `HookFormat` / `StatusIntegrationFormat` enums. The follow-up
 //! `feat/codex-hooks-json-migration` PR flips Codex from
 //! `config.toml` to `hooks.json` as the on-disk hook location: the codex
 //! `AgentHookConfig` declares `HookFormat::CodexJson` with

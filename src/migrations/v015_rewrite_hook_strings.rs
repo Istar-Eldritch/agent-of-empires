@@ -39,7 +39,7 @@
 //! ### TOCTOU on the gate path (all formats, including Codex)
 //!
 //! `has_aoe_marker` is read lock-free for every format. The rewrite is
-//! locked only for Codex (`with_codex_config_lock`); JSON / sidecar run
+//! locked only for Codex (`with_codex_config_lock`); JSON / integration run
 //! unlocked end-to-end. Three race windows:
 //!
 //! 1. **Gate -> write** (all formats): concurrent `aoe uninstall` between
@@ -47,11 +47,11 @@
 //! 2. **Codex snapshot -> install gap**: `snapshot_codex_hooks_state`
 //!    drops the lock before `install_codex_hooks_with_preserved_state`
 //!    re-acquires it. A locked writer in the gap loses its state.
-//! 3. **JSON / sidecar gate-vs-write**: no lock at all. Same as (1).
+//! 3. **JSON / integration gate-vs-write**: no lock at all. Same as (1).
 //!
 //! Window is the few hundred ms of v015 execution. Recovery: re-run
 //! `aoe uninstall`. Defense-in-depth fix (gate inside the rewrite lock,
-//! plus locks for JSON / sidecar) tracked as a follow-up.
+//! plus locks for JSON / integration) tracked as a follow-up.
 //!
 //! ### Mixed user+AoE matcher groups
 //!
@@ -170,12 +170,12 @@ fn rewrite_one(target: &HookTarget) -> Result<()> {
                 HookInstallTarget::Host,
             )
         }
-        HookTargetKind::Sidecar(sidecar) => {
-            // We deliberately do NOT invoke `sidecar.post_install_host`:
+        HookTargetKind::Integration(integration) => {
+            // We deliberately do NOT invoke `integration.post_install_host`:
             // Kiro's `set_kiro_default_agent_if_builtin` shells out to
             // `kiro-cli`, which is launcher-state mutation, not file-content
             // reconciliation.
-            (sidecar.install)(&target.path, HookInstallTarget::Host, &target.events)
+            (integration.install)(&target.path, HookInstallTarget::Host, &target.events)
         }
     }
 }

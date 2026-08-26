@@ -192,10 +192,10 @@ pub struct ResolvedHookEvent {
     pub waiting_tools: Vec<String>,
 }
 
-/// Sidecar hook defaults for agents whose config format is not the generic
+/// Status-integration event defaults for agents whose config format is not the generic
 /// JSON hook schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SidecarHookEvent {
+pub struct StatusIntegrationEvent {
     pub name: &'static str,
     pub status: HookStatus,
 }
@@ -244,9 +244,9 @@ pub struct AgentHookConfig {
 /// sandbox path, and the install/uninstall function pointers here lets every
 /// call site (`status_hook_env_prefix`, host install, sandbox install,
 /// `uninstall_all_hooks`) dispatch through one field instead of matching agent
-/// names. An agent has at most one of `hook_config` or `sidecar_hooks`.
+/// names. An agent has at most one of `hook_config` or `status_integration`.
 #[derive(Debug)]
-pub struct SidecarHooks {
+pub struct AgentStatusIntegration {
     /// Config path relative to the home directory for a host session
     /// (e.g. `.hermes/config.yaml`).
     pub host_config_subpath: &'static str,
@@ -289,17 +289,17 @@ pub struct SidecarHooks {
     ///
     /// Not combinable with `selected_agent_hooks`, which derives its agents
     /// directory from `host_config_subpath`; no agent declares both, and
-    /// `test_sidecar_path_resolver_not_combined_with_selected_agent` pins it.
+    /// `test_status_integration_path_resolver_not_combined_with_selected_agent` pins it.
     pub resolve_host_config_path: Option<fn(&std::path::Path, &[String]) -> std::path::PathBuf>,
-    /// On-disk format of the sidecar's config file. Drives marker-presence
+    /// On-disk format of the integration's config file. Drives marker-presence
     /// walker dispatch in `crate::hooks::has_aoe_marker`.
-    pub format: SidecarFormat,
-    /// Default hook events and statuses for this sidecar format.
-    pub events: &'static [SidecarHookEvent],
+    pub format: StatusIntegrationFormat,
+    /// Default events and statuses for this integration format.
+    pub events: &'static [StatusIntegrationEvent],
 }
 
-impl SidecarHooks {
-    /// Where this sidecar's hooks live on the host: the agent's own resolver
+impl AgentStatusIntegration {
+    /// Where this integration writes on the host: the agent's own resolver
     /// when it declares one, else the home-relative `host_config_subpath`.
     /// `host_env` is the session's resolved `environment` list, so a config-dir
     /// override set per profile wins over one in AoE's own process env.
@@ -317,7 +317,7 @@ impl SidecarHooks {
 
 /// How to install status hooks into a user-selected named agent, for CLIs
 /// whose hooks are scoped to the selected agent (see
-/// [`SidecarHooks::selected_agent_hooks`]). Keeps the flag and path convention
+/// [`AgentStatusIntegration::selected_agent_hooks`]). Keeps the flag and path convention
 /// as data on the agent definition rather than a per-agent string match at the
 /// install site.
 #[derive(Debug)]
@@ -334,10 +334,10 @@ pub struct SelectedAgentHooks {
     pub resolve_config_file: fn(&std::path::Path, &str) -> std::path::PathBuf,
 }
 
-/// On-disk format of a sidecar agent's config file. Drives
+/// On-disk format an integration writes. Drives
 /// marker-presence walker dispatch in `crate::hooks::has_aoe_marker`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SidecarFormat {
+pub enum StatusIntegrationFormat {
     /// Settl `[[hooks]]` table in `.settl/config.toml`.
     SettlToml,
     /// Hermes `hooks: { event: [...] }` map in `.hermes/config.yaml` (or
@@ -360,6 +360,29 @@ pub enum SidecarFormat {
 }
 
 /// Everything we know about a single agent CLI.
+///
+/// # Status mechanisms and their order
+///
+/// Three independent ways an agent's activity status can reach AoE, declared
+/// separately here because they are separate mechanisms, not layers of one:
+///
+/// 1. `hook_config`: shell hooks in a JSON settings file.
+/// 2. `status_integration`: shell hooks in some other config format, or an
+///    AoE-generated in-process plugin for an agent with no shell-hook surface.
+/// 3. `detect_status`: parse the tmux pane.
+///
+/// (1) and (2) are mutually exclusive, since an agent has one config shape to
+/// write into. Both deliver through the sidecar status file, and that file is
+/// what makes the precedence explicit: `update_status_with_metadata_inner`
+/// reads it first and only consults `detect_status` when it is absent or when a
+/// documented reconciler needs the pane to disambiguate. So (3) is the declared
+/// fallback for every agent, not dead weight on the ones that also have (1) or
+/// (2): the sidecar is missing before the first event of a session, when the
+/// user turns `agent_status_hooks` off, and when the agent build is too old for
+/// the artifact AoE installed.
+///
+/// An agent whose pane cannot be read at all declares `detect_status` as an
+/// `Idle` stub rather than pretending; #3371 tracks those.
 pub struct AgentDef {
     /// Canonical name: `"claude"`, `"opencode"`, etc.
     pub name: &'static str,
@@ -398,18 +421,31 @@ pub struct AgentDef {
     pub oneshot_flag: Option<&'static str>,
     /// If true, `builder.rs` sets `instance.command = binary` for this agent.
     pub set_default_command: bool,
-    /// Status detection function pointer. Takes raw (non-lowercased) pane content.
+    /// Pane-content detector, and the lowest-precedence status mechanism. See
+    /// the status-mechanism note below. Takes raw (non-lowercased) pane content.
     pub detect_status: fn(&str) -> Status,
     /// Environment variables always injected into the container for this agent.
     pub container_env: &'static [(&'static str, &'static str)],
-    /// Hook configuration for file-based status detection. If set, AoE installs
-    /// hooks into the agent's settings file so status is written to a file instead
-    /// of being parsed from tmux pane content.
+    /// Shell hooks in a JSON settings file: AoE writes command entries the
+    /// agent executes at lifecycle points. Mutually exclusive with
+    /// `status_integration`.
     pub hook_config: Option<AgentHookConfig>,
-    /// Sidecar hook installer for agents whose config format the generic
-    /// `hook_config` path cannot emit (settl/hermes/kiro). Mutually exclusive
-    /// with `hook_config`.
-    pub sidecar_hooks: Option<SidecarHooks>,
+    /// Any other way an agent reports status out-of-band, for the agents whose
+    /// on-disk shape the generic `hook_config` writer cannot emit. Covers two
+    /// genuinely different mechanisms, distinguished by
+    /// [`StatusIntegrationFormat`]: shell hooks in a non-JSON config
+    /// (settl TOML, hermes YAML, kiro per-agent JSON, kimi TOML), and an
+    /// AoE-generated in-process plugin for an agent with no shell-hook surface
+    /// at all (opencode). Mutually exclusive with `hook_config`.
+    ///
+    /// The two are not variants of one idea, and neither subsumes the other: a
+    /// hook is a command the agent shells out to, a plugin is code the agent
+    /// loads. What they share is only the delivery contract, the sidecar status
+    /// file, plus the install/uninstall/marker lifecycle around getting the
+    /// artifact onto disk, which is what this field carries. A future third
+    /// mechanism (opencode also exposes an SSE event endpoint, see #3379/#3380)
+    /// slots in as another format without disturbing the other two.
+    pub status_integration: Option<AgentStatusIntegration>,
     /// How this agent resumes a prior session.
     pub resume_strategy: ResumeStrategy,
     /// How this agent forks a prior session into a new, independent one.
@@ -716,58 +752,58 @@ const CODEX_HOOK_EVENTS: &[HookEvent] = &[
     },
 ];
 
-pub(crate) const SETTL_SIDECAR_EVENTS: &[SidecarHookEvent] = &[
-    SidecarHookEvent {
+pub(crate) const SETTL_STATUS_EVENTS: &[StatusIntegrationEvent] = &[
+    StatusIntegrationEvent {
         name: "TurnStarted",
         status: HookStatus::Running,
     },
-    SidecarHookEvent {
+    StatusIntegrationEvent {
         name: "WaitingForHuman",
         status: HookStatus::Waiting,
     },
-    SidecarHookEvent {
+    StatusIntegrationEvent {
         name: "GameWon",
         status: HookStatus::Idle,
     },
 ];
 
-pub(crate) const HERMES_SIDECAR_EVENTS: &[SidecarHookEvent] = &[
-    SidecarHookEvent {
+pub(crate) const HERMES_STATUS_EVENTS: &[StatusIntegrationEvent] = &[
+    StatusIntegrationEvent {
         name: "pre_llm_call",
         status: HookStatus::Running,
     },
-    SidecarHookEvent {
+    StatusIntegrationEvent {
         name: "pre_tool_call",
         status: HookStatus::Running,
     },
-    SidecarHookEvent {
+    StatusIntegrationEvent {
         name: "post_llm_call",
         status: HookStatus::Idle,
     },
-    SidecarHookEvent {
+    StatusIntegrationEvent {
         name: "pre_approval_request",
         status: HookStatus::Waiting,
     },
-    SidecarHookEvent {
+    StatusIntegrationEvent {
         name: "post_approval_response",
         status: HookStatus::Running,
     },
-    SidecarHookEvent {
+    StatusIntegrationEvent {
         name: "on_session_end",
         status: HookStatus::Idle,
     },
 ];
 
-pub(crate) const KIRO_SIDECAR_EVENTS: &[SidecarHookEvent] = &[
-    SidecarHookEvent {
+pub(crate) const KIRO_STATUS_EVENTS: &[StatusIntegrationEvent] = &[
+    StatusIntegrationEvent {
         name: "preToolUse",
         status: HookStatus::Running,
     },
-    SidecarHookEvent {
+    StatusIntegrationEvent {
         name: "userPromptSubmit",
         status: HookStatus::Running,
     },
-    SidecarHookEvent {
+    StatusIntegrationEvent {
         name: "stop",
         status: HookStatus::Idle,
     },
@@ -778,28 +814,28 @@ pub(crate) const KIRO_SIDECAR_EVENTS: &[SidecarHookEvent] = &[
 /// (`PermissionRequest` / `PermissionResult`), so the waiting/running
 /// transition needs no `Notification` matcher the way Claude's does.
 /// `StopFailure` backstops `Stop` for the API-error turn-end path.
-pub(crate) const KIMI_SIDECAR_EVENTS: &[SidecarHookEvent] = &[
-    SidecarHookEvent {
+pub(crate) const KIMI_STATUS_EVENTS: &[StatusIntegrationEvent] = &[
+    StatusIntegrationEvent {
         name: "UserPromptSubmit",
         status: HookStatus::Running,
     },
-    SidecarHookEvent {
+    StatusIntegrationEvent {
         name: "PreToolUse",
         status: HookStatus::Running,
     },
-    SidecarHookEvent {
+    StatusIntegrationEvent {
         name: "PermissionRequest",
         status: HookStatus::Waiting,
     },
-    SidecarHookEvent {
+    StatusIntegrationEvent {
         name: "PermissionResult",
         status: HookStatus::Running,
     },
-    SidecarHookEvent {
+    StatusIntegrationEvent {
         name: "Stop",
         status: HookStatus::Idle,
     },
-    SidecarHookEvent {
+    StatusIntegrationEvent {
         name: "StopFailure",
         status: HookStatus::Idle,
     },
@@ -823,32 +859,32 @@ pub(crate) const KIMI_SIDECAR_EVENTS: &[SidecarHookEvent] = &[
 ///
 /// No `session.error` mapping. AoE's Error status wants a `last_error` string
 /// alongside it, and error-reason surfacing for opencode is tracked in #3379.
-pub(crate) const OPENCODE_SIDECAR_EVENTS: &[SidecarHookEvent] = &[
-    SidecarHookEvent {
+pub(crate) const OPENCODE_STATUS_EVENTS: &[StatusIntegrationEvent] = &[
+    StatusIntegrationEvent {
         name: "session.status:busy",
         status: HookStatus::Running,
     },
-    SidecarHookEvent {
+    StatusIntegrationEvent {
         name: "session.status:retry",
         status: HookStatus::Running,
     },
-    SidecarHookEvent {
+    StatusIntegrationEvent {
         name: "tool.execute.before",
         status: HookStatus::Running,
     },
-    SidecarHookEvent {
+    StatusIntegrationEvent {
         name: "permission.replied",
         status: HookStatus::Running,
     },
-    SidecarHookEvent {
+    StatusIntegrationEvent {
         name: "permission.asked",
         status: HookStatus::Waiting,
     },
-    SidecarHookEvent {
+    StatusIntegrationEvent {
         name: "session.status:idle",
         status: HookStatus::Idle,
     },
-    SidecarHookEvent {
+    StatusIntegrationEvent {
         name: "session.idle",
         status: HookStatus::Idle,
     },
@@ -873,7 +909,7 @@ pub const AGENTS: &[AgentDef] = &[
             events: CLAUDE_HOOK_EVENTS,
             format: HookFormat::JsonSettings,
         }),
-        sidecar_hooks: None,
+        status_integration: None,
         resume_strategy: ResumeStrategy::FlagPair {
             existing: "--resume",
             new_session: "--session-id",
@@ -919,7 +955,7 @@ pub const AGENTS: &[AgentDef] = &[
         // merged into a user config, and its host directory follows
         // `XDG_CONFIG_HOME`, hence `resolve_host_config_path`.
         hook_config: None,
-        sidecar_hooks: Some(SidecarHooks {
+        status_integration: Some(AgentStatusIntegration {
             host_config_subpath: crate::hooks::OPENCODE_PLUGIN_SUBPATH,
             sandbox_config_subpath: crate::hooks::OPENCODE_PLUGIN_SANDBOX_SUBPATH,
             install: crate::hooks::install_opencode_plugin_with_events,
@@ -927,8 +963,8 @@ pub const AGENTS: &[AgentDef] = &[
             post_install_host: None,
             selected_agent_hooks: None,
             resolve_host_config_path: Some(crate::hooks::opencode_plugin_path_in),
-            format: SidecarFormat::OpencodePluginJs,
-            events: OPENCODE_SIDECAR_EVENTS,
+            format: StatusIntegrationFormat::OpencodePluginJs,
+            events: OPENCODE_STATUS_EVENTS,
         }),
         resume_strategy: ResumeStrategy::Flag("--session"),
         fork_strategy: ForkStrategy::Flag("--fork"),
@@ -968,7 +1004,7 @@ pub const AGENTS: &[AgentDef] = &[
         detect_status: status_detection::detect_vibe_status,
         container_env: &[],
         hook_config: None,
-        sidecar_hooks: None,
+        status_integration: None,
         resume_strategy: ResumeStrategy::Flag("--resume"),
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
@@ -1000,7 +1036,7 @@ pub const AGENTS: &[AgentDef] = &[
             events: CODEX_HOOK_EVENTS,
             format: HookFormat::CodexJson,
         }),
-        sidecar_hooks: None,
+        status_integration: None,
         resume_strategy: ResumeStrategy::Subcommand("resume"),
         fork_strategy: ForkStrategy::CodexFork,
         host_only: false,
@@ -1064,7 +1100,7 @@ pub const AGENTS: &[AgentDef] = &[
             ],
             format: HookFormat::JsonSettings,
         }),
-        sidecar_hooks: None,
+        status_integration: None,
         resume_strategy: ResumeStrategy::Flag("--resume"),
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
@@ -1096,7 +1132,7 @@ pub const AGENTS: &[AgentDef] = &[
             events: CURSOR_HOOK_EVENTS,
             format: HookFormat::JsonSettings,
         }),
-        sidecar_hooks: None,
+        status_integration: None,
         resume_strategy: ResumeStrategy::Unsupported,
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
@@ -1119,7 +1155,7 @@ pub const AGENTS: &[AgentDef] = &[
         detect_status: status_detection::detect_copilot_status,
         container_env: &[("COPILOT_CONFIG_DIR", "/root/.copilot")],
         hook_config: None,
-        sidecar_hooks: None,
+        status_integration: None,
         // Copilot records its live session id (a UUID) in the `sessions` table
         // of `~/.copilot/session-store.db`; the poller captures it and resumes
         // with `copilot --session-id <id>`. `--session-id` takes a required
@@ -1149,7 +1185,7 @@ pub const AGENTS: &[AgentDef] = &[
         detect_status: status_detection::detect_pi_status,
         container_env: &[("PI_CODING_AGENT_DIR", "/root/.pi/agent")],
         hook_config: None,
-        sidecar_hooks: None,
+        status_integration: None,
         resume_strategy: ResumeStrategy::Flag("--session"),
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
@@ -1172,7 +1208,7 @@ pub const AGENTS: &[AgentDef] = &[
         detect_status: status_detection::detect_droid_status,
         container_env: &[],
         hook_config: None,
-        sidecar_hooks: None,
+        status_integration: None,
         resume_strategy: ResumeStrategy::Unsupported,
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
@@ -1195,10 +1231,10 @@ pub const AGENTS: &[AgentDef] = &[
         detect_status: status_detection::detect_settl_status,
         container_env: &[],
         // settl uses TOML config (`[[hooks]]` entries), not the JSON
-        // settings.json schema, so it installs via a sidecar hook. host_only,
+        // settings.json schema, so it installs via a status integration. host_only,
         // so the sandbox subpath is unused.
         hook_config: None,
-        sidecar_hooks: Some(SidecarHooks {
+        status_integration: Some(AgentStatusIntegration {
             host_config_subpath: ".settl/config.toml",
             sandbox_config_subpath: "",
             install: crate::hooks::install_settl_hooks_with_events,
@@ -1206,8 +1242,8 @@ pub const AGENTS: &[AgentDef] = &[
             post_install_host: None,
             selected_agent_hooks: None,
             resolve_host_config_path: None,
-            format: SidecarFormat::SettlToml,
-            events: SETTL_SIDECAR_EVENTS,
+            format: StatusIntegrationFormat::SettlToml,
+            events: SETTL_STATUS_EVENTS,
         }),
         resume_strategy: ResumeStrategy::Unsupported,
         fork_strategy: ForkStrategy::Unsupported,
@@ -1238,9 +1274,9 @@ pub const AGENTS: &[AgentDef] = &[
         container_env: &[("HERMES_ACCEPT_HOOKS", "1")],
         // Hermes uses YAML (`hooks: { event: [...] }`) rather than the
         // JSON settings.json schema shared by Claude/Cursor/Gemini, so it
-        // installs via a sidecar hook rather than hook_config.
+        // installs via a status integration rather than hook_config.
         hook_config: None,
-        sidecar_hooks: Some(SidecarHooks {
+        status_integration: Some(AgentStatusIntegration {
             host_config_subpath: ".hermes/config.yaml",
             sandbox_config_subpath: ".hermes/sandbox/config.yaml",
             install: crate::hooks::install_hermes_hooks_with_events,
@@ -1248,8 +1284,8 @@ pub const AGENTS: &[AgentDef] = &[
             post_install_host: None,
             selected_agent_hooks: None,
             resolve_host_config_path: None,
-            format: SidecarFormat::HermesYaml,
-            events: HERMES_SIDECAR_EVENTS,
+            format: StatusIntegrationFormat::HermesYaml,
+            events: HERMES_STATUS_EVENTS,
         }),
         resume_strategy: ResumeStrategy::Flag("--resume"),
         fork_strategy: ForkStrategy::Unsupported,
@@ -1278,12 +1314,12 @@ pub const AGENTS: &[AgentDef] = &[
         container_env: &[("KIRO_CONFIG_DIR", "/root/.kiro")],
         // Kiro uses a per-agent JSON config (lowercase event names, flat
         // {command} objects) rather than the JSON settings.json schema shared
-        // by Claude/Cursor/Gemini, so it installs via a sidecar hook. Status
+        // by Claude/Cursor/Gemini, so it installs via a status integration. Status
         // comes from the hook sidecar file written by install_kiro_hooks; the
         // pane stub is unused. post_install_host promotes the aoe-hooks agent
         // to Kiro's active default.
         hook_config: None,
-        sidecar_hooks: Some(SidecarHooks {
+        status_integration: Some(AgentStatusIntegration {
             host_config_subpath: crate::hooks::KIRO_HOOKS_AGENT_FILE,
             sandbox_config_subpath: ".kiro/sandbox/agents/aoe-hooks.json",
             install: crate::hooks::install_kiro_hooks_with_events,
@@ -1298,8 +1334,8 @@ pub const AGENTS: &[AgentDef] = &[
                 resolve_config_file: crate::hooks::resolve_kiro_agent_file,
             }),
             resolve_host_config_path: None,
-            format: SidecarFormat::KiroJson,
-            events: KIRO_SIDECAR_EVENTS,
+            format: StatusIntegrationFormat::KiroJson,
+            events: KIRO_STATUS_EVENTS,
         }),
         resume_strategy: ResumeStrategy::Flag("--resume-id"),
         fork_strategy: ForkStrategy::Unsupported,
@@ -1328,7 +1364,7 @@ pub const AGENTS: &[AgentDef] = &[
             events: QWEN_HOOK_EVENTS,
             format: HookFormat::JsonSettings,
         }),
-        sidecar_hooks: None,
+        status_integration: None,
         resume_strategy: ResumeStrategy::FlagPair {
             existing: "--resume",
             new_session: "--session-id",
@@ -1354,7 +1390,7 @@ pub const AGENTS: &[AgentDef] = &[
         detect_status: status_detection::detect_antigravity_status,
         container_env: &[],
         hook_config: None,
-        sidecar_hooks: None,
+        status_integration: None,
         resume_strategy: ResumeStrategy::Unsupported,
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
@@ -1378,11 +1414,11 @@ pub const AGENTS: &[AgentDef] = &[
         container_env: &[("KIMI_CODE_HOME", "/root/.kimi-code")],
         // Kimi Code stores hooks as `[[hooks]]` entries in its runtime
         // `config.toml` (which also holds provider/oauth settings), so it
-        // installs via a sidecar hook rather than the JSON settings.json
+        // installs via a status integration rather than the JSON settings.json
         // path. Status comes from the hook sidecar file; the pane stub is
         // unused.
         hook_config: None,
-        sidecar_hooks: Some(SidecarHooks {
+        status_integration: Some(AgentStatusIntegration {
             host_config_subpath: ".kimi-code/config.toml",
             sandbox_config_subpath: ".kimi-code/sandbox/config.toml",
             install: crate::hooks::install_kimi_hooks_with_events,
@@ -1390,8 +1426,8 @@ pub const AGENTS: &[AgentDef] = &[
             post_install_host: None,
             selected_agent_hooks: None,
             resolve_host_config_path: None,
-            format: SidecarFormat::KimiToml,
-            events: KIMI_SIDECAR_EVENTS,
+            format: StatusIntegrationFormat::KimiToml,
+            events: KIMI_STATUS_EVENTS,
         }),
         // `kimi --session <id>` resumes a prior conversation. On the host the id
         // is captured from `~/.kimi-code/session_index.jsonl` (see
@@ -1419,7 +1455,7 @@ pub const AGENTS: &[AgentDef] = &[
         detect_status: status_detection::detect_omp_status,
         container_env: &[("PI_CODING_AGENT_DIR", "/root/.omp/agent")],
         hook_config: None,
-        sidecar_hooks: None,
+        status_integration: None,
         resume_strategy: ResumeStrategy::Flag("--resume"),
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
@@ -1607,8 +1643,8 @@ fn default_status_map_for_agent(agent: &AgentDef) -> BTreeMap<String, HookStatus
             }
         }
     }
-    if let Some(sidecar) = &agent.sidecar_hooks {
-        for event in sidecar.events {
+    if let Some(integration) = &agent.status_integration {
+        for event in integration.events {
             map.entry(event.name.to_string()).or_insert(event.status);
         }
     }
@@ -1689,15 +1725,15 @@ pub fn resolved_hook_events(
     Ok(events)
 }
 
-pub fn resolved_sidecar_hook_events(
+pub fn resolved_status_integration_events(
     agent: &AgentDef,
     config: &crate::session::config::Config,
 ) -> anyhow::Result<Vec<ResolvedHookEvent>> {
-    let Some(sidecar) = &agent.sidecar_hooks else {
+    let Some(integration) = &agent.status_integration else {
         return Ok(Vec::new());
     };
     let overrides = configured_status_map(config, agent.name);
-    let mut events = sidecar
+    let mut events = integration
         .events
         .iter()
         .map(|event| ResolvedHookEvent {
@@ -2528,38 +2564,42 @@ mod tests {
     }
 
     #[test]
-    fn test_sidecar_path_resolver_not_combined_with_selected_agent() {
+    fn test_status_integration_path_resolver_not_combined_with_selected_agent() {
         // `selected_agent_hooks` derives its agents directory from
-        // `host_config_subpath` (see `install_sidecar_host_hooks`), which a
+        // `host_config_subpath` (see `install_status_integration_host`), which a
         // custom `resolve_host_config_path` bypasses. Pairing them would send
         // the standalone install to the resolved path and the selected-agent
         // install to the home-relative one. Nothing needs the combination
         // today, so reject it here instead of growing the install site.
         for agent in AGENTS {
-            let Some(sidecar) = agent.sidecar_hooks.as_ref() else {
+            let Some(integration) = agent.status_integration.as_ref() else {
                 continue;
             };
             assert!(
-                !(sidecar.selected_agent_hooks.is_some()
-                    && sidecar.resolve_host_config_path.is_some()),
+                !(integration.selected_agent_hooks.is_some()
+                    && integration.resolve_host_config_path.is_some()),
                 "agent '{}' combines selected_agent_hooks with resolve_host_config_path; \
-                 teach install_sidecar_host_hooks to resolve the agents dir first",
+                 teach install_status_integration_host to resolve the agents dir first",
                 agent.name
             );
         }
     }
 
     #[test]
-    fn test_sidecar_host_config_path_falls_back_to_home_relative() {
+    fn test_status_integration_host_config_path_falls_back_to_home_relative() {
         // Agents without a resolver keep the declared home-relative path, env
         // list or not.
         let home = std::path::Path::new("/home/tester");
         for name in ["settl", "hermes", "kiro", "kimi"] {
-            let sidecar = get_agent(name).unwrap().sidecar_hooks.as_ref().unwrap();
-            let expected = home.join(sidecar.host_config_subpath);
-            assert_eq!(sidecar.host_config_path(home, &[]), expected, "{name}");
+            let integration = get_agent(name)
+                .unwrap()
+                .status_integration
+                .as_ref()
+                .unwrap();
+            let expected = home.join(integration.host_config_subpath);
+            assert_eq!(integration.host_config_path(home, &[]), expected, "{name}");
             assert_eq!(
-                sidecar.host_config_path(home, &["XDG_CONFIG_HOME=/elsewhere".to_string()]),
+                integration.host_config_path(home, &["XDG_CONFIG_HOME=/elsewhere".to_string()]),
                 expected,
                 "{name} must ignore env overrides it does not declare"
             );
@@ -2573,7 +2613,7 @@ mod tests {
         // the install site.
         let kiro = get_agent("kiro").unwrap();
         let sel = kiro
-            .sidecar_hooks
+            .status_integration
             .as_ref()
             .unwrap()
             .selected_agent_hooks
@@ -2587,12 +2627,12 @@ mod tests {
             (sel.resolve_config_file)(tmp.path(), "custom-agent"),
             tmp.path().join("custom-agent.json")
         );
-        // The other sidecar agents do not (their hooks apply globally).
+        // The other integrations do not (their hooks apply globally).
         for name in ["settl", "hermes"] {
             assert!(
                 get_agent(name)
                     .unwrap()
-                    .sidecar_hooks
+                    .status_integration
                     .as_ref()
                     .unwrap()
                     .selected_agent_hooks
@@ -2710,37 +2750,37 @@ mod tests {
     }
 
     #[test]
-    fn test_all_sidecar_hooks_declare_expected_format() {
+    fn test_all_status_integrations_declare_expected_format() {
         // Mirror of `test_all_hook_configs_declare_expected_format` for the
-        // sidecar path. The dispatch in `crate::hooks::has_aoe_marker` is
+        // integration path. The dispatch in `crate::hooks::has_aoe_marker` is
         // keyed off this field.
-        let expected: &[(&str, SidecarFormat)] = &[
-            ("opencode", SidecarFormat::OpencodePluginJs),
-            ("settl", SidecarFormat::SettlToml),
-            ("hermes", SidecarFormat::HermesYaml),
-            ("kiro", SidecarFormat::KiroJson),
-            ("kimi", SidecarFormat::KimiToml),
+        let expected: &[(&str, StatusIntegrationFormat)] = &[
+            ("opencode", StatusIntegrationFormat::OpencodePluginJs),
+            ("settl", StatusIntegrationFormat::SettlToml),
+            ("hermes", StatusIntegrationFormat::HermesYaml),
+            ("kiro", StatusIntegrationFormat::KiroJson),
+            ("kimi", StatusIntegrationFormat::KimiToml),
         ];
         for (name, fmt) in expected {
             let agent = get_agent(name).unwrap_or_else(|| panic!("missing agent {name}"));
-            let sidecar = agent
-                .sidecar_hooks
+            let integration = agent
+                .status_integration
                 .as_ref()
-                .unwrap_or_else(|| panic!("agent {name} must have sidecar_hooks"));
+                .unwrap_or_else(|| panic!("agent {name} must have status_integration"));
             assert_eq!(
-                sidecar.format, *fmt,
-                "agent {name} sidecar format must be {fmt:?}"
+                integration.format, *fmt,
+                "agent {name} integration format must be {fmt:?}"
             );
         }
         let declared: Vec<&str> = AGENTS
             .iter()
-            .filter(|a| a.sidecar_hooks.is_some())
+            .filter(|a| a.status_integration.is_some())
             .map(|a| a.name)
             .collect();
         let expected_names: Vec<&str> = expected.iter().map(|(n, _)| *n).collect();
         assert_eq!(
             declared, expected_names,
-            "sidecar_hooks agent set drifted; update test_all_sidecar_hooks_declare_expected_format"
+            "status_integration agent set drifted; update test_all_status_integrations_declare_expected_format"
         );
     }
 
@@ -2775,13 +2815,13 @@ mod tests {
 
     #[test]
     fn test_hook_config_and_sidecar_hooks_are_mutually_exclusive() {
-        // `SidecarHooks` doc states the two are mutually exclusive. Lock
+        // `AgentStatusIntegration` doc states the two are mutually exclusive. Lock
         // the invariant so a future agent does not silently get hooks
         // installed by both paths.
         for agent in AGENTS {
             assert!(
-                !(agent.hook_config.is_some() && agent.sidecar_hooks.is_some()),
-                "agent {} must not declare both hook_config and sidecar_hooks",
+                !(agent.hook_config.is_some() && agent.status_integration.is_some()),
+                "agent {} must not declare both hook_config and status_integration",
                 agent.name
             );
         }

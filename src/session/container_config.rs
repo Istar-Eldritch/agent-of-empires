@@ -1785,10 +1785,10 @@ pub(crate) fn build_container_config(
     let hooks_enabled = profile_session_config.agent_status_hooks;
     if let Some(agent) = active_agent {
         if hooks_enabled {
-            // Sidecar agents (hermes YAML, kiro per-agent JSON) use schemas the
+            // Status integrations (hermes YAML, kiro per-agent JSON, opencode plugin) use schemas the
             // generic hook_config path below cannot emit; they install through
-            // their SidecarHooks installer at the sandbox config subpath.
-            if agent.sidecar_hooks.is_some() || agent.hook_config.is_some() {
+            // their AgentStatusIntegration installer at the sandbox config subpath.
+            if agent.status_integration.is_some() || agent.hook_config.is_some() {
                 crate::session::validate_instance_id(instance_id).map_err(|e| {
                     anyhow::anyhow!(
                         "refusing to mount hook directory: AOE_INSTANCE_ID failed validation: {e}"
@@ -1814,8 +1814,8 @@ pub(crate) fn build_container_config(
                 }
             }
 
-            if let Some(sidecar) = &agent.sidecar_hooks {
-                let events = match crate::agents::resolved_sidecar_hook_events(
+            if let Some(integration) = &agent.status_integration {
+                let events = match crate::agents::resolved_status_integration_events(
                     agent,
                     &profile_config,
                 ) {
@@ -1827,15 +1827,15 @@ pub(crate) fn build_container_config(
                 };
                 if !events.is_empty() {
                     // Default target: the standalone hooks agent's sandbox config.
-                    // When the user selected their own agent via the sidecar's
+                    // When the user selected their own agent via the integration's
                     // selected-agent flag (e.g. Kiro `--agent NAME`), the container
                     // loads THAT agent's config (these CLIs have no global hooks), so
                     // install into its staged file instead. The selected agent's dir
                     // is copied into the sandbox via AGENT_CONFIG_MOUNTS, so the
                     // staged path is the sandbox config dir plus the selected name's
                     // file (mirrors the host path in
-                    // `Instance::install_sidecar_host_hooks`).
-                    let config_file = sidecar
+                    // `Instance::install_status_integration_host`).
+                    let config_file = integration
                         .selected_agent_hooks
                         .as_ref()
                         .zip(agent_selection.selected_agent)
@@ -1845,11 +1845,11 @@ pub(crate) fn build_container_config(
                             // `.kiro/sandbox/agents`) before this install runs, so
                             // the resolver can match by `name` there as on the host.
                             let agents_dir =
-                                home.join(Path::new(sidecar.sandbox_config_subpath).parent()?);
+                                home.join(Path::new(integration.sandbox_config_subpath).parent()?);
                             Some((sel.resolve_config_file)(&agents_dir, name))
                         })
-                        .unwrap_or_else(|| home.join(sidecar.sandbox_config_subpath));
-                    if let Err(e) = (sidecar.install)(
+                        .unwrap_or_else(|| home.join(integration.sandbox_config_subpath));
+                    if let Err(e) = (integration.install)(
                         &config_file,
                         crate::hooks::HookInstallTarget::Sandbox,
                         &events,
@@ -4270,16 +4270,16 @@ trust_level = "trusted"
         );
     }
 
-    // Regression guard for the trap in #958: a sidecar agent (settl TOML,
+    // Regression guard for the trap in #958: an integration agent (settl TOML,
     // hermes YAML, kiro per-agent JSON) that lands without wiring up the
     // sandbox install branch silently breaks status detection in containers.
-    // Driving every sandboxable sidecar agent through build_container_config
+    // Driving every sandboxable integration agent through build_container_config
     // and asserting its config lands at `sandbox_config_subpath` (plus a
     // mounted hook dir) means a future agent that forgets to set
-    // `sidecar_hooks` fails this test instead of shipping broken.
+    // `status_integration` fails this test instead of shipping broken.
     #[test]
     #[serial_test::serial]
-    fn test_build_container_config_installs_sidecar_hooks_files() {
+    fn test_build_container_config_installs_status_integration_files() {
         let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
@@ -4291,18 +4291,18 @@ trust_level = "trusted"
 
         let sidecar_agents: Vec<&crate::agents::AgentDef> = crate::agents::AGENTS
             .iter()
-            .filter(|a| a.sidecar_hooks.is_some() && !a.host_only)
+            .filter(|a| a.status_integration.is_some() && !a.host_only)
             .collect();
         assert!(
             sidecar_agents.iter().any(|a| a.name == "hermes")
                 && sidecar_agents.iter().any(|a| a.name == "kiro"),
-            "expected hermes and kiro to be sandboxable sidecar agents"
+            "expected hermes and kiro to be sandboxable integration agents"
         );
 
         for agent in sidecar_agents {
-            let sidecar = agent.sidecar_hooks.as_ref().unwrap();
+            let integration = agent.status_integration.as_ref().unwrap();
             assert!(
-                !sidecar.sandbox_config_subpath.is_empty(),
+                !integration.sandbox_config_subpath.is_empty(),
                 "{} is sandboxable so it needs a sandbox_config_subpath",
                 agent.name
             );
@@ -4329,7 +4329,7 @@ trust_level = "trusted"
             )
             .unwrap();
 
-            let sandbox_config = temp_home.path().join(sidecar.sandbox_config_subpath);
+            let sandbox_config = temp_home.path().join(integration.sandbox_config_subpath);
             assert!(
                 sandbox_config.exists(),
                 "{} sandbox hook config should be installed at {}",
@@ -4378,7 +4378,7 @@ trust_level = "trusted"
         git2::Repository::init(project_dir.path()).unwrap();
 
         let kiro = crate::agents::get_agent("kiro").unwrap();
-        let sidecar = kiro.sidecar_hooks.as_ref().unwrap();
+        let integration = kiro.status_integration.as_ref().unwrap();
         let sandbox_info = super::super::instance::SandboxInfo {
             enabled: true,
             container_id: None,
@@ -4415,7 +4415,7 @@ trust_level = "trusted"
             .contains("aoe-hooks"));
 
         // ...NOT the standalone aoe-hooks sandbox agent.
-        let standalone = temp_home.path().join(sidecar.sandbox_config_subpath);
+        let standalone = temp_home.path().join(integration.sandbox_config_subpath);
         assert!(
             !standalone.exists(),
             "standalone aoe-hooks sandbox config must not be written when an agent is selected"

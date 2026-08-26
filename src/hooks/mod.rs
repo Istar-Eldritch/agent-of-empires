@@ -1293,9 +1293,12 @@ pub fn uninstall_hooks(settings_path: &Path) -> Result<bool> {
 }
 
 fn default_sidecar_events(agent_name: &str) -> Vec<crate::agents::ResolvedHookEvent> {
-    let agent = crate::agents::get_agent(agent_name).expect("sidecar agent is registered");
-    crate::agents::resolved_sidecar_hook_events(agent, &crate::session::config::Config::default())
-        .expect("default sidecar hook events resolve")
+    let agent = crate::agents::get_agent(agent_name).expect("integration agent is registered");
+    crate::agents::resolved_status_integration_events(
+        agent,
+        &crate::session::config::Config::default(),
+    )
+    .expect("default integration events resolve")
 }
 
 /// Install AoE status hooks into a settl TOML config file (typically
@@ -1427,8 +1430,8 @@ pub fn uninstall_settl_hooks(config_path: &Path) -> Result<bool> {
 /// OAuth settings (login populates it), so this installer edits the
 /// document with `toml_edit` to preserve the surrounding tables, comments,
 /// and formatting rather than reserialising the whole file the way the
-/// settl installer does. That preservation is why `SidecarFormat::KimiToml`
-/// is distinct from `SidecarFormat::SettlToml`.
+/// settl installer does. That preservation is why `StatusIntegrationFormat::KimiToml`
+/// is distinct from `StatusIntegrationFormat::SettlToml`.
 ///
 /// Idempotent on disk: when the file already encodes the same AoE-managed
 /// hooks, it is not rewritten (same bytes).
@@ -2130,7 +2133,7 @@ pub fn uninstall_all_hooks() {
                 uninstall_hooks(&target.path)
             }
             HookTargetKind::CodexToml => uninstall_codex_hooks(&target.path),
-            HookTargetKind::Sidecar(sidecar) => (sidecar.uninstall)(&target.path),
+            HookTargetKind::Integration(integration) => (integration.uninstall)(&target.path),
         };
         match result {
             Ok(true) => println!("Removed AoE hooks from {}", target.path.display()),
@@ -2191,14 +2194,16 @@ mod tests {
         if agent.hook_config.is_some() {
             crate::agents::resolved_hook_events(agent, &config).unwrap()
         } else {
-            crate::agents::resolved_sidecar_hook_events(agent, &config).unwrap()
+            crate::agents::resolved_status_integration_events(agent, &config).unwrap()
         }
     }
 
-    fn sidecar_default_events(agent_name: &str) -> &'static [crate::agents::SidecarHookEvent] {
+    fn status_integration_default_events(
+        agent_name: &str,
+    ) -> &'static [crate::agents::StatusIntegrationEvent] {
         crate::agents::get_agent(agent_name)
             .unwrap()
-            .sidecar_hooks
+            .status_integration
             .as_ref()
             .unwrap()
             .events
@@ -2583,7 +2588,7 @@ mod tests {
             .unwrap()
             .as_mapping()
             .unwrap();
-        for event in sidecar_default_events("hermes") {
+        for event in status_integration_default_events("hermes") {
             assert!(
                 hooks
                     .get(serde_yaml::Value::String(event.name.into()))
@@ -2596,7 +2601,7 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&allowlist_target).unwrap()).unwrap();
         assert_eq!(
             allowlist["approvals"].as_array().unwrap().len(),
-            sidecar_default_events("hermes").len()
+            status_integration_default_events("hermes").len()
         );
 
         uninstall_hermes_hooks(&config_path).unwrap();
@@ -3720,7 +3725,7 @@ command = "echo user-hook"
 
     #[test]
     fn test_settl_hook_commands_write_correct_status() {
-        for event in sidecar_default_events("settl") {
+        for event in status_integration_default_events("settl") {
             let expected_status = event.status.as_str();
             let cmd = hook_command(expected_status, HookInstallTarget::Host);
             assert!(
@@ -3751,7 +3756,7 @@ command = "echo user-hook"
             .as_mapping()
             .unwrap();
 
-        for event in sidecar_default_events("hermes") {
+        for event in status_integration_default_events("hermes") {
             let entries = hooks
                 .get(serde_yaml::Value::String(event.name.into()))
                 .unwrap_or_else(|| panic!("event {} missing", event.name))
@@ -3780,7 +3785,10 @@ command = "echo user-hook"
         let raw = std::fs::read_to_string(&allowlist).unwrap();
         let parsed: Value = serde_json::from_str(&raw).unwrap();
         let approvals = parsed["approvals"].as_array().unwrap();
-        assert_eq!(approvals.len(), sidecar_default_events("hermes").len());
+        assert_eq!(
+            approvals.len(),
+            status_integration_default_events("hermes").len()
+        );
     }
 
     #[test]
@@ -3910,7 +3918,10 @@ hooks_auto_accept: false
         let raw = std::fs::read_to_string(&allowlist).unwrap();
         let parsed: Value = serde_json::from_str(&raw).unwrap();
         let approvals = parsed["approvals"].as_array().unwrap();
-        assert_eq!(approvals.len(), sidecar_default_events("hermes").len());
+        assert_eq!(
+            approvals.len(),
+            status_integration_default_events("hermes").len()
+        );
     }
 
     #[test]
@@ -3946,7 +3957,7 @@ hooks_auto_accept: false
 
     #[test]
     fn test_hermes_hook_commands_write_correct_status() {
-        for event in sidecar_default_events("hermes") {
+        for event in status_integration_default_events("hermes") {
             let expected_status = event.status.as_str();
             let cmd = hook_command(expected_status, HookInstallTarget::Host);
             assert!(
@@ -3962,7 +3973,7 @@ hooks_auto_accept: false
 
     #[test]
     fn test_hermes_approval_request_writes_waiting() {
-        let mapped: Vec<&str> = sidecar_default_events("hermes")
+        let mapped: Vec<&str> = status_integration_default_events("hermes")
             .iter()
             .filter(|event| event.name == "pre_approval_request")
             .map(|event| event.status.as_str())
@@ -3989,7 +4000,7 @@ hooks_auto_accept: false
         let config: Value = serde_json::from_str(&content).unwrap();
         let hooks = config["hooks"].as_object().unwrap();
 
-        for event in sidecar_default_events("kiro") {
+        for event in status_integration_default_events("kiro") {
             let entries = hooks
                 .get(event.name)
                 .unwrap_or_else(|| panic!("event {} missing", event.name))
@@ -4054,7 +4065,7 @@ hooks_auto_accept: false
 
         let content = std::fs::read_to_string(&config_path).unwrap();
         let config: Value = serde_json::from_str(&content).unwrap();
-        for event in sidecar_default_events("kiro") {
+        for event in status_integration_default_events("kiro") {
             let entries = config["hooks"][event.name].as_array().unwrap();
             assert_eq!(
                 entries.len(),
@@ -4200,8 +4211,8 @@ hooks_auto_accept: false
     fn test_install_into_selected_kiro_agent_creates_file() {
         // No pre-existing agent file: installing into the selected agent's path
         // creates it with AoE hooks, just like the dedicated aoe-hooks agent.
-        // Mirrors how `install_sidecar_host_hooks` resolves the path then calls
-        // the sidecar installer.
+        // Mirrors how `install_status_integration_host` resolves the path then calls
+        // the integration installer.
         let agents_dir = TempDir::new().unwrap();
         let path = resolve_kiro_agent_file(agents_dir.path(), "custom-agent");
         install_kiro_hooks(&path, HookInstallTarget::Host).unwrap();
@@ -4210,7 +4221,7 @@ hooks_auto_accept: false
         // The created file's name must match the selected agent, not the
         // standalone "aoe-hooks" default, so Kiro loads it for --agent custom-agent.
         assert_eq!(config["name"].as_str(), Some("custom-agent"));
-        for event in sidecar_default_events("kiro") {
+        for event in status_integration_default_events("kiro") {
             let entries = config["hooks"][event.name].as_array().unwrap();
             assert_eq!(
                 entries.len(),
@@ -5464,7 +5475,7 @@ max_context_size = 200000
         let hooks = parsed["hooks"].as_array().expect("hooks array installed");
         assert_eq!(
             hooks.len(),
-            crate::agents::KIMI_SIDECAR_EVENTS.len(),
+            crate::agents::KIMI_STATUS_EVENTS.len(),
             "one hook entry per default kimi status event"
         );
         assert!(hooks.iter().all(|h| {
@@ -5542,7 +5553,7 @@ max_context_size = 200000
         }));
         assert_eq!(
             hooks.len(),
-            crate::agents::KIMI_SIDECAR_EVENTS.len() + 1,
+            crate::agents::KIMI_STATUS_EVENTS.len() + 1,
             "AoE events plus the preserved user hook"
         );
         // Uninstall removes only the AoE hooks, leaving the user's entry.

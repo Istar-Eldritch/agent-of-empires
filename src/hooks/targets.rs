@@ -29,8 +29,8 @@ pub(crate) enum HookTargetKind {
     /// (`CODEX_HOME` aware).
     CodexJson,
     /// settl/hermes/kiro: a config format the JSON path cannot emit; install
-    /// goes through the agent's bundled `SidecarHooks` function pointers.
-    Sidecar(&'static crate::agents::SidecarHooks),
+    /// goes through the agent's bundled `AgentStatusIntegration` function pointers.
+    Integration(&'static crate::agents::AgentStatusIntegration),
 }
 
 /// One reachable on-disk location where AoE may have written status hooks.
@@ -102,25 +102,25 @@ pub(crate) fn iter_hook_targets_in(home: &Path, env_lists: &[Vec<String>]) -> Ve
                 });
             }
         }
-        if let Some(sidecar) = agent.sidecar_hooks.as_ref() {
-            let events = crate::agents::resolved_sidecar_hook_events(
+        if let Some(integration) = agent.status_integration.as_ref() {
+            let events = crate::agents::resolved_status_integration_events(
                 agent,
                 &crate::session::config::Config::default(),
             )
             .unwrap_or_default();
-            // Mirror the `hook_config` branch above: a sidecar whose config dir
+            // Mirror the `hook_config` branch above: an integration whose config dir
             // follows an env var (opencode / `XDG_CONFIG_HOME`) is reachable at
             // more than one path, and uninstall plus the hook-rewrite
             // migrations have to see every one of them.
             let mut paths: Vec<PathBuf> = Vec::new();
-            push_unique_target_path(&mut paths, sidecar.host_config_path(home, &[]));
+            push_unique_target_path(&mut paths, integration.host_config_path(home, &[]));
             for env in env_lists {
-                push_unique_target_path(&mut paths, sidecar.host_config_path(home, env));
+                push_unique_target_path(&mut paths, integration.host_config_path(home, env));
             }
             for path in paths {
                 out.push(HookTarget {
                     agent_name: agent.name,
-                    kind: HookTargetKind::Sidecar(sidecar),
+                    kind: HookTargetKind::Integration(integration),
                     path,
                     events: events.clone(),
                 });
@@ -168,7 +168,7 @@ pub(super) fn collect_env_lists_from_session() -> Vec<Vec<String>> {
 /// error: a file we cannot identify is a file we must not rewrite.
 ///
 /// Why this exists: the install functions (`install_hooks`,
-/// `install_codex_hooks_with_preserved_state`, sidecar installers) create
+/// `install_codex_hooks_with_preserved_state`, integration installers) create
 /// the file when absent. Calling them unconditionally on every reachable
 /// target would resurrect hooks for users who explicitly uninstalled. The
 /// migration must only touch files it already owns.
@@ -181,15 +181,23 @@ pub(crate) fn has_aoe_marker(target: &HookTarget) -> bool {
             json_settings_has_aoe_marker(&target.path)
         }
         HookTargetKind::CodexToml => codex_config_has_aoe_marker(&target.path),
-        HookTargetKind::Sidecar(sidecar) => match sidecar.format {
-            crate::agents::SidecarFormat::SettlToml => settl_config_has_aoe_marker(&target.path),
-            crate::agents::SidecarFormat::HermesYaml => hermes_config_has_aoe_marker(&target.path),
-            crate::agents::SidecarFormat::KiroJson => kiro_config_has_aoe_marker(&target.path),
+        HookTargetKind::Integration(integration) => match integration.format {
+            crate::agents::StatusIntegrationFormat::SettlToml => {
+                settl_config_has_aoe_marker(&target.path)
+            }
+            crate::agents::StatusIntegrationFormat::HermesYaml => {
+                hermes_config_has_aoe_marker(&target.path)
+            }
+            crate::agents::StatusIntegrationFormat::KiroJson => {
+                kiro_config_has_aoe_marker(&target.path)
+            }
             // Kimi's config.toml uses the same flat `[[hooks]]` array of
             // `{ event, command }` entries as settl, so the settl marker
             // walker identifies AoE-managed hooks in it unchanged.
-            crate::agents::SidecarFormat::KimiToml => settl_config_has_aoe_marker(&target.path),
-            crate::agents::SidecarFormat::OpencodePluginJs => {
+            crate::agents::StatusIntegrationFormat::KimiToml => {
+                settl_config_has_aoe_marker(&target.path)
+            }
+            crate::agents::StatusIntegrationFormat::OpencodePluginJs => {
                 super::opencode::opencode_plugin_has_aoe_marker(&target.path)
             }
         },

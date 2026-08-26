@@ -461,7 +461,8 @@ fn status_hook_env_prefix(
     instance_id: &str,
     agent: Option<&crate::agents::AgentDef>,
 ) -> String {
-    let has_hooks = agent.is_some_and(|a| a.hook_config.is_some() || a.sidecar_hooks.is_some());
+    let has_hooks =
+        agent.is_some_and(|a| a.hook_config.is_some() || a.status_integration.is_some());
 
     if has_hooks {
         format!(
@@ -4696,8 +4697,9 @@ impl Instance {
             return;
         }
         if let Some(agent) = agent {
-            if let Some(sidecar) = agent.sidecar_hooks.as_ref() {
-                let events = match crate::agents::resolved_sidecar_hook_events(agent, &config) {
+            if let Some(sidecar) = agent.status_integration.as_ref() {
+                let events = match crate::agents::resolved_status_integration_events(agent, &config)
+                {
                     Ok(events) => events,
                     Err(e) => {
                         tracing::warn!(target: "session.store", "Failed to resolve {} status hooks: {}", agent.name, e);
@@ -4710,7 +4712,12 @@ impl Instance {
                 // sandboxed, so the gate is a no-op for them.
                 if !self.is_sandboxed() {
                     if let Some(home) = dirs::home_dir() {
-                        self.install_sidecar_host_hooks(sidecar, &home, &config.session, &events);
+                        self.install_status_integration_host(
+                            sidecar,
+                            &home,
+                            &config.session,
+                            &events,
+                        );
                     }
                 }
             } else if let Some(hook_cfg) = agent.hook_config.as_ref() {
@@ -4741,15 +4748,15 @@ impl Instance {
     /// when the user actually selected one and the merge setting is on, install
     /// into that agent's own config file and stop. Otherwise install into the
     /// agent's standalone config and run any `post_install_host` follow-up.
-    fn install_sidecar_host_hooks(
+    fn install_status_integration_host(
         &self,
-        sidecar: &'static crate::agents::SidecarHooks,
+        integration: &'static crate::agents::AgentStatusIntegration,
         home: &Path,
         session_cfg: &super::config::SessionConfig,
         events: &[crate::agents::ResolvedHookEvent],
     ) {
         if session_cfg.merge_hooks_into_selected_agent {
-            if let Some(sel) = sidecar.selected_agent_hooks.as_ref() {
+            if let Some(sel) = integration.selected_agent_hooks.as_ref() {
                 if let Some(name) =
                     crate::agents::parse_selected_agent(&self.selected_agent_args(), sel.flag)
                 {
@@ -4760,12 +4767,16 @@ impl Instance {
                     // agent's config (e.g. `.kiro/agents`); the resolver picks the
                     // right file within it by `name`.
                     let agents_dir = home.join(
-                        Path::new(sidecar.host_config_subpath)
+                        Path::new(integration.host_config_subpath)
                             .parent()
                             .unwrap_or(Path::new(".")),
                     );
                     let path = (sel.resolve_config_file)(&agents_dir, &name);
-                    match (sidecar.install)(&path, crate::hooks::HookInstallTarget::Host, events) {
+                    match (integration.install)(
+                        &path,
+                        crate::hooks::HookInstallTarget::Host,
+                        events,
+                    ) {
                         Ok(()) => tracing::info!(target: "session.store",
                             "Installed AoE status hooks into {} agent '{}' at {}", self.tool, name, path.display()),
                         Err(e) => tracing::warn!(target: "session.store",
@@ -4776,12 +4787,12 @@ impl Instance {
             }
         }
 
-        let config_path = sidecar.host_config_path(home, &self.resolved_host_environment());
-        match (sidecar.install)(&config_path, crate::hooks::HookInstallTarget::Host, events) {
+        let config_path = integration.host_config_path(home, &self.resolved_host_environment());
+        match (integration.install)(&config_path, crate::hooks::HookInstallTarget::Host, events) {
             Ok(()) => {
                 tracing::info!(target: "session.store",
                     "Installed AoE status hooks for {} via standalone hooks agent", self.tool);
-                if let Some(post_install) = sidecar.post_install_host {
+                if let Some(post_install) = integration.post_install_host {
                     post_install();
                 }
             }
@@ -5548,7 +5559,7 @@ impl Instance {
             // as kiro carries kiro's sidecar via detect_as), and the sandbox's
             // own `resolve_active_agent`, which also falls back to detect_as.
             self.resolved_agent()
-                .and_then(|a| a.sidecar_hooks.as_ref())
+                .and_then(|a| a.status_integration.as_ref())
                 .and_then(|s| s.selected_agent_hooks.as_ref())
                 .and_then(|sel| {
                     crate::agents::parse_selected_agent(&self.selected_agent_args(), sel.flag)

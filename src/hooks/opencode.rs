@@ -27,7 +27,7 @@ use anyhow::Result;
 use super::{hook_command, resolve_config_dir_override, with_config_lock, HookInstallTarget};
 
 /// Host fallback for [`opencode_plugin_path_in`], and the declared
-/// `SidecarHooks::host_config_subpath` for opencode. Only used when
+/// `AgentStatusIntegration::host_config_subpath` for opencode. Only used when
 /// `XDG_CONFIG_HOME` is unset.
 pub const OPENCODE_PLUGIN_SUBPATH: &str = ".config/opencode/plugin/aoe-status.js";
 
@@ -262,7 +262,7 @@ mod tests {
 
     fn opencode_events() -> Vec<crate::agents::ResolvedHookEvent> {
         let agent = crate::agents::get_agent("opencode").unwrap();
-        crate::agents::resolved_sidecar_hook_events(
+        crate::agents::resolved_status_integration_events(
             agent,
             &crate::session::config::Config::default(),
         )
@@ -355,7 +355,7 @@ mod tests {
                 crate::agents::HookStatus::Idle,
             );
         let agent = crate::agents::get_agent("opencode").unwrap();
-        let events = crate::agents::resolved_sidecar_hook_events(agent, &config).unwrap();
+        let events = crate::agents::resolved_status_integration_events(agent, &config).unwrap();
         let rendered = render_opencode_plugin(HookInstallTarget::Host, &events).unwrap();
 
         // The overridden event moved from the waiting map into the idle group,

@@ -172,8 +172,8 @@ fn rewrite_one(target: &HookTarget) -> Result<()> {
                 HookInstallTarget::Host,
             )
         }
-        HookTargetKind::Sidecar(sidecar) => {
-            (sidecar.install)(&target.path, HookInstallTarget::Host, &target.events)
+        HookTargetKind::Integration(integration) => {
+            (integration.install)(&target.path, HookInstallTarget::Host, &target.events)
         }
     }
 }
