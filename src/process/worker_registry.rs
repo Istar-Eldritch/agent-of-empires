@@ -55,10 +55,12 @@ pub struct WorkerRecord {
     /// Binary build identity (`build_info::BUILD_VERSION`) of the
     /// `aoe __acp-runner` process that wrote this record, e.g.
     /// `"1.9.5+g7f31a9c42e01"`. Distinct from `runner_version`, which is
-    /// the on-disk SCHEMA version. The daemon compares this against its
-    /// own `BUILD_VERSION` to detect a worker left running on an older
-    /// binary after `aoe update` and respawn it (see #1754). Defaulted on
-    /// load for legacy records that pre-date this field; the empty string
+    /// the runner's protocol/topology generation (#2977): two runners on the
+    /// same generation can differ in build and vice versa, so the daemon
+    /// tracks them as independent staleness axes. The daemon compares this
+    /// against its own `BUILD_VERSION` to detect a worker left running on an
+    /// older binary after `aoe update` and respawn it (see #1754). Defaulted
+    /// on load for legacy records that pre-date this field; the empty string
     /// compares unequal to any current build, forcing a one-time respawn.
     #[serde(default)]
     pub build_version: String,
