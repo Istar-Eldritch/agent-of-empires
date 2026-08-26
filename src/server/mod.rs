@@ -5857,7 +5857,6 @@ async fn instance_lock_in(
 /// user, who is by construction present for it. Every `Stopped` reason maps to
 /// `Idle`, so a rate-limit park marks unread too; that is the same policy
 /// terminal sessions get, and a parked session does want attention.
-#[cfg(feature = "serve")]
 fn should_mark_acp_unread(inst: &Instance, old_status: Status, unread_enabled: bool) -> bool {
     unread_enabled
         && inst.is_structured()
@@ -5890,7 +5889,6 @@ fn should_mark_acp_unread(inst: &Instance, old_status: Status, unread_enabled: b
 /// A stale-profile write is not retried. The row is left read rather than
 /// half-marked, the turn's mark is simply lost, and the move is rare enough that
 /// a re-resolve loop is not worth the added failure surface here.
-#[cfg(feature = "serve")]
 async fn persist_and_mirror_unread(
     instances: &RwLock<Vec<Instance>>,
     instance_lock: &tokio::sync::Mutex<()>,
@@ -5960,7 +5958,6 @@ async fn persist_and_mirror_unread(
 ///   daemon that died mid-turn would otherwise trap the dot grey. Mid-run a
 ///   `Stopped` in memory is a deliberate stop, so `apply_status_intent`'s guard
 ///   should keep it.
-#[cfg(feature = "serve")]
 async fn recover_structured_unread_after_lag(
     instances: &RwLock<Vec<Instance>>,
     event_store: &crate::acp::event_store::EventStore,
@@ -8124,7 +8121,6 @@ mod tests {
     /// #3181: the automatic mark's predicate for a structured row, driven off
     /// the live ACP turn-end event. One table rather than a test per case, per
     /// the repo's compile-cost rule.
-    #[cfg(feature = "serve")]
     #[test]
     fn should_mark_acp_unread_only_on_a_structured_running_to_idle_turn_end() {
         // (name, structured, old_status, new_status, unread_enabled, already_unread, expected)
@@ -8229,7 +8225,6 @@ mod tests {
     /// Seed `profile`'s store with `rows`, so a persist closure has a matching
     /// id to mark. Mirrors the shape used by the `flush_passive_transition_*`
     /// tests above.
-    #[cfg(feature = "serve")]
     fn seed_profile_store(profile: &str, rows: Vec<Instance>) {
         crate::session::Storage::new_unwatched(profile)
             .expect("storage")
@@ -8240,7 +8235,6 @@ mod tests {
             .expect("seed write");
     }
 
-    #[cfg(feature = "serve")]
     fn load_profile_row(profile: &str, id: &str) -> Option<Instance> {
         crate::session::Storage::new_unwatched(profile)
             .expect("storage")
@@ -8258,7 +8252,6 @@ mod tests {
     /// nothing, so mirroring on `is_ok()` alone would mark memory off a
     /// successful no-op against a profile the row no longer lives in, and the
     /// next disk reload would silently drop the notification.
-    #[cfg(feature = "serve")]
     #[tokio::test]
     #[serial_test::serial]
     async fn persist_and_mirror_unread_mirrors_only_a_committed_mutation() {
@@ -8326,7 +8319,6 @@ mod tests {
     /// `flush_passive_transition_defers_unread_until_persist_ok` locks for the
     /// tmux poller. Separate test rather than a row in the one above because it
     /// needs the store deliberately broken.
-    #[cfg(feature = "serve")]
     #[tokio::test]
     #[serial_test::serial]
     async fn persist_and_mirror_unread_skips_the_mirror_on_a_failed_write() {
@@ -8376,7 +8368,6 @@ mod tests {
     /// lifecycle event, so the discriminator is the row rather than the event:
     /// only the structured row still sitting at `Running` represents a turn that
     /// ended unobserved.
-    #[cfg(feature = "serve")]
     #[tokio::test]
     #[serial_test::serial]
     async fn recover_structured_unread_after_lag_marks_only_a_missed_turn_end() {
@@ -8477,7 +8468,6 @@ mod tests {
     /// is dropped, or the mirror is reordered, because none of them run the
     /// listener. This one drives a real `Event::Stopped` frame through the
     /// broadcast and asserts both halves of the write.
-    #[cfg(feature = "serve")]
     #[tokio::test]
     #[serial_test::serial]
     async fn acp_event_listener_marks_a_finished_turn_unread_on_disk_and_in_memory() {

@@ -6,6 +6,6 @@
 # that is measuring an idiom, not a problem. 192 clears `Response` with
 # headroom while still flagging an error type that is genuinely large.
 #
-# This surfaced only once CI started linting the `serve` feature set; the
-# affected helpers live in src/server/api/ and were never in a clippy run.
+# The affected helpers live in src/server/api/, which went unlinted for a long
+# time because clippy ran at a feature set that compiled them out.
 large-error-threshold = 192
