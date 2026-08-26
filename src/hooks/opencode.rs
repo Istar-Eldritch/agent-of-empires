@@ -26,7 +26,7 @@ use anyhow::Result;
 
 use super::{hook_command, resolve_config_dir_override, with_config_lock, HookInstallTarget};
 
-/// Host fallback for [`opencode_plugin_path_in`], and the declared
+/// Host fallback for `opencode_plugin_path_in`, and the declared
 /// `AgentStatusIntegration::host_config_subpath` for opencode. Only used when
 /// `XDG_CONFIG_HOME` is unset.
 pub const OPENCODE_PLUGIN_SUBPATH: &str = ".config/opencode/plugin/aoe-status.js";
@@ -70,7 +70,7 @@ pub(crate) fn opencode_plugin_has_aoe_marker(path: &Path) -> bool {
 /// Write the AoE status plugin, replacing any prior AoE-generated copy.
 ///
 /// The whole file is AoE's, so this is a replace rather than a merge. Refuses
-/// to overwrite a file without [`AOE_PLUGIN_MARKER`]: that path belongs to
+/// to overwrite a file without `AOE_PLUGIN_MARKER`: that path belongs to
 /// someone else, and clobbering a user's plugin to report status would be a bad
 /// trade. Skips the write when the rendered bytes already match, so a
 /// re-launch does not churn the file's mtime.
@@ -107,7 +107,7 @@ pub fn install_opencode_plugin_with_events(
 /// Remove the AoE status plugin. Leaves a file that is not ours in place.
 ///
 /// Symlink handling mirrors the install side, which writes through a link
-/// because [`crate::session::atomic_write`] resolves the chain first. Deleting
+/// because `crate::session::atomic_write` resolves the chain first. Deleting
 /// only the link would strand AoE's generated content at the target; deleting
 /// only the target would leave a dangling link that opencode still globs, so it
 /// would log a plugin load failure on every launch. Both go.
