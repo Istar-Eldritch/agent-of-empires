@@ -186,14 +186,11 @@ cargo check                       # Type-check
 cargo test                        # Run tests
 cargo fmt                         # Format
 cargo clippy                      # Lint
-cargo build --release             # Release build (TUI only)
-
-# Web dashboard build (pulls in axum + the React frontend via build.rs)
-cargo build --release
+cargo build --release             # Release build (TUI + web dashboard)
 
 # Run from source
 cargo run                         # TUI
-cargo run -- serve  # Web dashboard on :8081 (debug namespace)
+cargo run -- serve                # Web dashboard on :8081 (debug namespace)
 
 # Logging at startup. AOE_LOG_LEVEL is the canonical knob.
 AOE_LOG_LEVEL=debug cargo run
