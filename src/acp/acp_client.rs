@@ -4471,8 +4471,14 @@ async fn connect_runner_control_v3(
                     Some(err) if !err.is_null() => ControlBody::ServerError {
                         call_id,
                         error: serde_json::from_value(err.clone()).unwrap_or_else(|_| {
+                            // A handler answered with an error envelope this
+                            // side cannot parse. That is an internal failure,
+                            // not a missing method, so it must not borrow
+                            // METHOD_NOT_FOUND: an agent that special-cases
+                            // -32601 would conclude the method is unsupported
+                            // and stop calling it.
                             control_protocol::JsonRpcError::new(
-                                control_protocol::METHOD_NOT_FOUND,
+                                control_protocol::INTERNAL_ERROR,
                                 "handler produced a malformed error",
                             )
                         }),

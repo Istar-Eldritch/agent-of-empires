@@ -58,10 +58,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// and typed prompt/cancel frames; the [`ControlBody::PromptCompleted`]
 /// shape changed, so v1 and v2 are wire-incompatible and the version gate
 /// is what keeps a mixed-version daemon/runner pair from misreading each
-/// other. v3 (#2977) adds the reverse and forward call lanes; a v3 runner
-/// no longer binds
-/// `<id>.sock` at all, so a pre-v3 daemon cannot drive it and the gate is
-/// load-bearing rather than merely defensive.
+/// other. v3 (#2977) adds the reverse and forward call lanes; a v3 runner no
+/// longer binds `<id>.sock` at all, so a pre-v3 daemon cannot drive it and
+/// the gate is load-bearing rather than merely defensive.
 pub const CONTROL_PROTOCOL_VERSION: u32 = 3;
 
 /// Hard cap on a single control frame. Phase A frames are tiny; reject
@@ -211,6 +210,11 @@ pub struct JsonRpcError {
 /// a method this daemon has no handler for, so the agent gets a real
 /// error instead of parking on a request nobody will ever answer.
 pub const METHOD_NOT_FOUND: i64 = -32601;
+
+/// JSON-RPC "internal error". Used when the daemon produced an answer this
+/// side could not make sense of, as opposed to [`METHOD_NOT_FOUND`], which
+/// specifically means no handler exists for the method.
+pub const INTERNAL_ERROR: i64 = -32603;
 
 /// Reserved-range code for "the daemon went away before answering". Shared
 /// by the runner's disconnect sweep and its deadline expiry so an agent
