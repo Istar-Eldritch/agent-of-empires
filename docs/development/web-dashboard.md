@@ -2,7 +2,7 @@
 
 Contributor notes for hacking on the web dashboard. End users do not need any of this; the dashboard ships in every release binary. See the [Web Dashboard guide](../guides/web-dashboard.md) for launching and using it.
 
-Build, run, and the `cargo xtask dev` inner loop (Vite + `aoe serve` with HMR, `--watch` auto-rebuild) are covered in [Development](../development.md). The dashboard needs the `serve` Cargo feature plus Node.js/npm; the build runs `npm install && npm run build` in `web/` and embeds the output in the binary, so there is nothing separate to deploy. A plain `cargo build` (no `serve`) needs no JS tooling.
+Build, run, and the `cargo xtask dev` inner loop (Vite + `aoe serve` with HMR, `--watch` auto-rebuild) are covered in [Development](../development.md). The dashboard is embedded in every binary, so every build needs Node.js/npm: the build runs `npm install && npm run build` in `web/` and embeds the output, and there is nothing separate to deploy.
 
 ## Manual frontend loop
 
@@ -25,6 +25,6 @@ VITE_PROXY=http://localhost:50106 npm run dev
 
 ## Architecture
 
-The `serve` feature embeds an axum server that serves the React bundle and provides: the REST API (`/api/sessions`, plus the orchestration endpoints in the [HTTP API Reference](../api.md)), a WebSocket PTY relay (`/sessions/:id/ws`), token auth (cookie / query param / WS protocol header) with rate limiting, token rotation, and device tracking, and security headers.
+The binary embeds an axum server that serves the React bundle and provides: the REST API (`/api/sessions`, plus the orchestration endpoints in the [HTTP API Reference](../api.md)), a WebSocket PTY relay (`/sessions/:id/ws`), token auth (cookie / query param / WS protocol header) with rate limiting, token rotation, and device tracking, and security headers.
 
 Each terminal connection spawns `tmux attach-session` inside a PTY and relays the raw byte stream bidirectionally over the WebSocket. That gives the browser an SSH-grade terminal, and is why sessions survive browser crashes and network drops.

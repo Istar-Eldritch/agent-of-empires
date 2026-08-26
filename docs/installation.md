@@ -35,9 +35,11 @@ cargo build --release
 The binary will be at `target/release/aoe`.
 
 Building from source requires Node.js and npm: every binary embeds the web
-dashboard, and the frontend is built automatically during compilation. If you
-package aoe and cannot run npm, set `AOE_WEB_DIST` to a directory holding a
-prebuilt dashboard and the build will copy that instead.
+dashboard, and the frontend is built automatically during compilation. The
+first build installs the frontend's npm dependencies, so it also needs access
+to the npm registry. If you package aoe and cannot reach npm, set
+`AOE_WEB_DIST` to a directory holding a prebuilt dashboard and the build will
+copy that instead of running npm at all.
 
 ## Verify Installation
 

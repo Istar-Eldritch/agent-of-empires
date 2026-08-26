@@ -27,7 +27,7 @@
 //! Run via:
 //!
 //! ```sh
-//! cargo test --test e2e -- fork_structured
+//! cargo test --features e2e-tests --test e2e -- fork_structured
 //! ```
 
 use std::path::PathBuf;

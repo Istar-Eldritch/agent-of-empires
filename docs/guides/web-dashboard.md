@@ -19,7 +19,7 @@ Mobile and touch behavior is documented inline on each page.
 
 The dashboard ships in all release binaries: [GitHub Releases](https://github.com/agent-of-empires/agent-of-empires/releases), the [quick install script](../installation.md#quick-install-recommended), and Homebrew (`brew install aoe`). Just run `aoe serve`.
 
-Building from source requires the `serve` Cargo feature (and Node.js to compile the embedded frontend); see [Web Dashboard Development](../development/web-dashboard.md).
+Building from source needs Node.js to compile the embedded frontend; see [Web Dashboard Development](../development/web-dashboard.md).
 
 ## Starting the server
 

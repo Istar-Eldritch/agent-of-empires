@@ -16607,11 +16607,6 @@ mod live_send_mode {
         );
     }
 
-    /// Acp-mode is a `serve` feature; the `structured_view` field on
-    /// Instance only exists when that feature is compiled in. Without
-    /// it, `is_structured()` is hard-coded to false and the gate is
-    /// a no-op, so there's nothing meaningful to verify in the default
-    /// build.
     #[test]
     #[serial]
     fn tab_does_not_start_live_send_for_acp_session() {

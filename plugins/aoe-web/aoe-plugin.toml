@@ -1,9 +1,9 @@
 # First-party web dashboard plugin marker (P8 of #268).
 #
-# The dashboard itself is Tier 2 trusted-native code compiled behind the
-# `serve` cargo feature; this manifest puts it under plugin management so it
-# can be disabled at runtime (`aoe plugin disable aoe.web`) independently of
-# the compile-time feature. `aoe serve` refuses to start while disabled.
+# The dashboard itself is Tier 2 trusted-native code compiled into every
+# binary; this manifest puts it under plugin management so it can be disabled
+# at runtime (`aoe plugin disable aoe.web`). While disabled, `aoe serve` is an
+# unrecognized subcommand.
 # Full extraction of the web crate is the last phase of the proving sequence.
 
 id = "aoe.web"

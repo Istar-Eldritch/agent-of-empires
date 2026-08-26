@@ -5,9 +5,6 @@
 //! `$APP_DIR/serve.{pid,url,log,mode}` files, and runs `aoe serve --stop`
 //! to tear down. The daemon survives across TUI quits, just like tmux
 //! sessions or the CLI-invoked daemon path.
-//!
-//! Only compiled with the `serve` feature, since the tunnel integration
-//! (and the qrcode crate it needs) lives there.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
