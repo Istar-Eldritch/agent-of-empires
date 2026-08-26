@@ -105,6 +105,12 @@ pub fn install_opencode_plugin_with_events(
 }
 
 /// Remove the AoE status plugin. Leaves a file that is not ours in place.
+///
+/// Symlink handling mirrors the install side, which writes through a link
+/// because [`crate::session::atomic_write`] resolves the chain first. Deleting
+/// only the link would strand AoE's generated content at the target; deleting
+/// only the target would leave a dangling link that opencode still globs, so it
+/// would log a plugin load failure on every launch. Both go.
 pub fn uninstall_opencode_plugin(path: &Path) -> Result<bool> {
     if !path.exists() {
         return Ok(false);
@@ -114,7 +120,17 @@ pub fn uninstall_opencode_plugin(path: &Path) -> Result<bool> {
         if !opencode_plugin_has_aoe_marker(path) {
             return Ok(false);
         }
-        std::fs::remove_file(path)?;
+        let target = crate::session::resolve_symlink_chain(path)?;
+        std::fs::remove_file(&target)?;
+        if target != *path {
+            // Best effort: the plugin content is already gone, and a failure
+            // here leaves a dangling link that is noisy but not harmful.
+            if let Err(e) = std::fs::remove_file(path) {
+                tracing::warn!(target: "hooks.uninstall",
+                    "Removed {} but could not remove the symlink at {}: {}",
+                    target.display(), path.display(), e);
+            }
+        }
         tracing::info!(target: "hooks.uninstall", "Removed AoE opencode plugin at {}", path.display());
         Ok(true)
     })
@@ -473,6 +489,42 @@ console.log(JSON.stringify(recorded))
         assert!(!path.exists());
         // Nothing left to remove the second time.
         assert!(!uninstall_opencode_plugin(&path).unwrap());
+    }
+
+    /// A file symlink at the plugin path: install writes through it (that is
+    /// `atomic_write`'s single write behavior, see #2784 / #3186), and uninstall
+    /// clears both ends. Leaving the target behind would strand generated
+    /// content in whatever the link points at; leaving the link behind would
+    /// give opencode a dangling plugin to fail on at every launch.
+    #[cfg(unix)]
+    #[test]
+    fn test_install_and_uninstall_through_a_symlinked_plugin_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("dotfiles").join("aoe-status.js");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let link = dir.path().join("plugin").join("aoe-status.js");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        install_opencode_plugin_with_events(&link, HookInstallTarget::Host, &opencode_events())
+            .unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "install must write through the link, not replace it"
+        );
+        assert!(std::fs::read_to_string(&target)
+            .unwrap()
+            .contains(AOE_PLUGIN_MARKER));
+
+        assert!(uninstall_opencode_plugin(&link).unwrap());
+        assert!(!target.exists(), "generated content must not be stranded");
+        assert!(
+            std::fs::symlink_metadata(&link).is_err(),
+            "a dangling link would make opencode log a plugin load failure on every launch"
+        );
     }
 
     #[test]
