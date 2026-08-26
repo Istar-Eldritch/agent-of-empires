@@ -159,11 +159,13 @@ fn runner_proxies_agent_requests_over_the_control_channel() {
         &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
     );
 
-    // Drive an agent-to-client request through cat. `session/set_mode` is a
-    // forward-lane call, so the runner writes it to the agent; cat echoes it
-    // back, and the echo is indistinguishable from the agent issuing that
-    // request itself. A string id proves the runner round-trips the id as
-    // the JSON value it arrived as rather than a rendering of it.
+    // Drive an agent-to-client request through cat. `fs/read_text_file` goes
+    // out on the forward lane, so the runner writes it to the agent; cat
+    // echoes it back, and that echo is indistinguishable from the agent
+    // issuing the request itself. One round trip therefore exercises both
+    // lanes. (Preserving a string-shaped agent id is covered by the
+    // `parse_request_value_id` table in `src/process/runner.rs`; the ids here
+    // are numeric.)
     write_frame(
         &mut ctl,
         &serde_json::json!({
