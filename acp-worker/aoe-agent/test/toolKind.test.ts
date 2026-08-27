@@ -10,7 +10,10 @@ test("maps the tool palette and the unregistered task tool", () => {
     // Regression for #1904: `task` used to fall through to "other", which
     // rendered a generic card instead of the think card.
     ["task", "think"],
+    // The model picks the casing, so every arm is matched case-insensitively.
     ["Task", "think"],
+    ["TASK", "think"],
+    ["bash", "execute"],
     // Anything the adapter does not know still falls through.
     ["WebFetch", "other"],
     ["", "other"],
