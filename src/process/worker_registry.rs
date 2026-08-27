@@ -42,11 +42,15 @@ pub use crate::process::worker::{is_pid_alive, validate_id as validate_session_i
 /// drive a v1 runner over the control channel and vice versa.
 ///
 /// This is deliberately NOT folded into [`is_record_live`]. A live worker of
-/// the wrong generation is still *live*, and calling it dead would push the
-/// reconciler into `FreshSpawn`, orphaning an in-flight turn. It pairs with
-/// [`is_build_current`] as a second staleness axis: the reconciler adopts a
-/// mismatched worker for the duration of its turn and replaces it at the next
-/// idle boundary.
+/// the wrong generation is still *live*, and calling it dead would drop its
+/// record while the PID inside is the only record of where the process is,
+/// stranding the runner and its agent subtree.
+///
+/// It pairs with [`is_build_current`] as a second staleness axis, but the two
+/// are not interchangeable. A build-stale worker still speaks this daemon's
+/// control protocol, so its in-flight turn can drain before it is replaced. A
+/// generation-stale one cannot be attached at all, so there is nothing to
+/// drain over and the reconciler replaces it immediately.
 pub const RUNNER_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -928,6 +932,80 @@ mod tests {
             assert!(record_path("term-dead").unwrap().exists());
             terminate("term-dead");
             assert!(!record_path("term-dead").unwrap().exists());
+        });
+    }
+
+    /// The upgrade path #2977 introduced, over a genuinely live process: a
+    /// `runner_version: 1` record left by a previous daemon.
+    ///
+    /// The chain that matters is classification then reaping. A live v1 runner
+    /// must read as LIVE (so nothing deletes its record while its PID is the
+    /// only copy of where the process is), as NOT runner-current (so the
+    /// reconciler replaces it), and `terminate` must actually signal it. Get
+    /// the first wrong and the record is dropped with the PID still in it,
+    /// which strands the runner and its whole agent subtree with no daemon
+    /// able to find them again.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn live_v1_record_is_live_but_stale_and_terminate_reaps_it() {
+        use std::os::unix::process::CommandExt as _;
+
+        with_temp_home(|| {
+            // Its own process group, so the killpg lands on it alone rather
+            // than on the test runner.
+            let mut victim = std::process::Command::new("sleep")
+                .arg("60")
+                .process_group(0)
+                .spawn()
+                .expect("spawn stand-in runner");
+
+            let dir = workers_dir().unwrap();
+            let sock = dir.join("v1sess.sock");
+            // A v1 runner bound the relay path itself, not the sibling.
+            std::fs::write(&sock, b"").unwrap();
+            let mut rec = WorkerRecord::new(
+                "v1sess".into(),
+                victim.id(),
+                sock.clone(),
+                "aoe-agent".into(),
+                "aoe-agent".into(),
+                PathBuf::from("/repo"),
+                None,
+                vec![],
+                vec![],
+                None,
+                None,
+            );
+            rec.runner_version = 1;
+            save(&rec).unwrap();
+
+            assert!(
+                is_record_live(&rec),
+                "a live v1 runner must not read as dead: its record holds the only copy of the pid"
+            );
+            assert!(
+                !is_runner_current(&rec),
+                "v1 is a generation behind, so the reconciler must replace it"
+            );
+
+            terminate("v1sess");
+
+            // Signalled, not merely forgotten.
+            let reaped = (0..40).any(|_| {
+                if matches!(victim.try_wait(), Ok(Some(_))) {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                false
+            });
+            let _ = victim.kill();
+            let _ = victim.wait();
+            assert!(
+                reaped,
+                "terminate must signal the live v1 runner, not orphan it"
+            );
+            assert!(!record_path("v1sess").unwrap().exists());
         });
     }
 

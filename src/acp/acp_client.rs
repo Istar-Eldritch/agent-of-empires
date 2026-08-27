@@ -2751,9 +2751,14 @@ impl AcpClient {
         // watchdogs stand down.
         //
         // A runner too old to speak v3 yields None. There is no byte relay to
-        // fall back to any more, so this is a hard failure for that runner
-        // rather than a downgrade; the reconciler's runner-version migration
-        // is what keeps a v1 worker on its legacy path until it drains.
+        // fall back to any more, so this is a hard failure for that runner:
+        // there is no legacy path left to serve it on. The reconciler is
+        // supposed to have replaced such a worker before we get here
+        // (`adopt_decision` sends a generation-stale worker straight to
+        // `RespawnStaleIdle` precisely because it cannot be attached), so
+        // reaching this is a race, not the migration's normal course. The
+        // caller terminates the worker rather than merely dropping its record,
+        // so losing that race leaks nothing.
         let guard = Arc::new(TerminalClaim::new());
         // Shared with the connection task so the control reader can hand idle
         // ownership back when it surfaces a waiterless completion (#3190).
@@ -16093,8 +16098,9 @@ done
 
     /// A runner that never binds the control socket yields no client and
     /// leaves the guard unclaimed. As of #2977 there is no relay to fall back
-    /// to, so the caller turns this into a typed spawn error; the reconciler's
-    /// runner-version migration is what keeps a live v1 worker usable.
+    /// to, so the caller turns this into a typed spawn error rather than a
+    /// downgrade; a live worker of an older generation is replaced by the
+    /// reconciler instead of being attached.
     #[tokio::test]
     async fn runner_control_absent_socket_leaves_guard_unclaimed() {
         let tmp = tempfile::tempdir().unwrap();

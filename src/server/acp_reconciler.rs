@@ -1100,6 +1100,14 @@ fn adopt_decision(
         AdoptDecision::FreshSpawn
     } else if build_current && runner_current {
         AdoptDecision::Attach
+    } else if !runner_current {
+        // Draining is impossible across a runner-generation gap: attaching to
+        // the worker is what lets a turn drain, and the control-version gate
+        // refuses a runner of the wrong generation outright, so there is no
+        // connection to stream over. Adopting would just route the session
+        // into the attach-failure path. Replace it now and let the turn die
+        // with it; the alternative is not a preserved turn, only a leaked one.
+        AdoptDecision::RespawnStaleIdle
     } else if in_flight_turn {
         AdoptDecision::AdoptStaleForDrain
     } else {
@@ -1453,21 +1461,31 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
                     }
                     return ResumeOutcome::Attached;
                 }
+                // `terminate`, not `delete`, on both failure paths. The
+                // record is the only place the runner's PID is written down,
+                // and `terminate` resolves it by re-reading the record, so
+                // deleting first leaves nothing to signal and strands the
+                // runner plus its whole agent subtree: no registry entry means
+                // every reaper that resolves a PID that way can no longer find
+                // it, and `aoe ps --acp` stops listing it. We reached this
+                // branch because the worker is live but unusable, which is
+                // exactly when that matters. Same argument as the FreshSpawn
+                // branch above and the allowlist refusal in `Supervisor`.
                 Ok(Err(e)) => {
                     tracing::warn!(
                         target: "acp.supervisor",
                         session = %id,
-                        "attach failed; falling back to fresh spawn: {e}"
+                        "attach failed; terminating the worker and falling back to fresh spawn: {e}"
                     );
-                    crate::process::worker_registry::delete(&id).ok();
+                    crate::process::worker_registry::terminate(&id);
                 }
                 Err(_) => {
                     tracing::warn!(
                         target: "acp.supervisor",
                         session = %id,
-                        "attach timed out after 3s; falling back to fresh spawn"
+                        "attach timed out after 3s; terminating the worker and falling back to fresh spawn"
                     );
-                    crate::process::worker_registry::delete(&id).ok();
+                    crate::process::worker_registry::terminate(&id);
                     return ResumeOutcome::RetryAfterAttachTimeout;
                 }
             }
@@ -2210,9 +2228,12 @@ mod tests {
     ///
     /// The load-bearing rows are the stale ones: a live worker of the wrong
     /// build OR the wrong runner generation must never be classified dead,
-    /// because `FreshSpawn` deletes the record and would orphan an in-flight
-    /// turn. Both axes get identical treatment, and a worker stale on BOTH
-    /// drains once rather than being reaped twice.
+    /// because that path would drop the record and lose the PID with it.
+    ///
+    /// The two axes are NOT treated identically. A build-stale worker still
+    /// speaks this daemon's control protocol, so its turn can drain before it
+    /// is replaced. A generation-stale one cannot be attached at all, so
+    /// draining is not on offer and it is replaced immediately.
     #[test]
     fn adopt_decision_truth_table() {
         use AdoptDecision::*;
@@ -2227,14 +2248,18 @@ mod tests {
             // Build-stale only (#1754).
             ((true, false, true, false), RespawnStaleIdle),
             ((true, false, true, true), AdoptStaleForDrain),
-            // Runner-generation-stale only (#2977): a v1 runner meeting a v2
-            // daemon. Same treatment as a build mismatch.
+            // Runner-generation-stale (#2977): replaced immediately whether
+            // or not a turn is in flight, because the control-version gate
+            // refuses that runner, so there is no connection for a turn to
+            // drain over. Adopting it would only route the session into the
+            // attach-failure path.
             ((true, true, false, false), RespawnStaleIdle),
-            ((true, true, false, true), AdoptStaleForDrain),
+            ((true, true, false, true), RespawnStaleIdle),
             // Stale on both axes at once, e.g. an `aoe update` that also
-            // crossed the runner generation. One drain, one respawn.
+            // crossed the runner generation. Generation wins: it is the axis
+            // that makes the worker unreachable rather than merely outdated.
             ((true, false, false, false), RespawnStaleIdle),
-            ((true, false, false, true), AdoptStaleForDrain),
+            ((true, false, false, true), RespawnStaleIdle),
         ];
         for ((live, build_current, runner_current, in_flight), expected) in cases {
             assert_eq!(
