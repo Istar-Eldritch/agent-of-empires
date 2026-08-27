@@ -764,7 +764,7 @@ struct JsonRpcPeek {
 
 /// Method that gets a semantic `cancelled` outcome on disconnect. Every
 /// other outstanding method is answered with a generic JSON-RPC error
-/// (see `cancel_outstanding_requests`), so no request parks; only this
+/// (see `cancel_server_calls`), so no request parks; only this
 /// one needs a typed result because its `cancelled` outcome is a normal,
 /// non-error control-flow signal the agent expects.
 const PERMISSION_METHOD: &str = "session/request_permission";
@@ -775,21 +775,20 @@ const PERMISSION_METHOD: &str = "session/request_permission";
 /// the agent to daemon path. Phase A of #1054.
 const PROMPT_METHOD: &str = "session/prompt";
 
-/// Seed for the runner's own agent-bound JSON-RPC ids (#2976 Phase B). The
-/// crate `ConnectionTo` on the daemon side allocates UUID-string ids for
-/// the `set_mode` / `set_config_option` / `delete_session` requests it
-/// still sends over the relay on the v2 path, so those never collide with
-/// the runner's integer ids by construction. This high seed is only defense
-/// in depth against a future crate change to integer ids.
+/// Seed for the runner's own agent-bound JSON-RPC ids. Since #2977 retired
+/// the relay, the runner allocates EVERY id on the agent's stdin (handshake,
+/// turn, and the forward-lane methods the daemon requests), so this is the
+/// only id space there and collisions are impossible by construction. The
+/// high seed is a leftover guard from when the daemon also put ids on that
+/// wire; harmless to keep, and it makes runner-issued ids obvious in a log.
 const RUNNER_REQUEST_ID_BASE: i64 = 1 << 48;
 
-/// Deadline for a single control-channel frame write. `emit_control`
-/// holds the `control` mutex across the write and runs on the sole
-/// stdout-relay task, so an unbounded write to a stalled control peer (a
-/// slow reader or a full socket buffer) would freeze the mutex and the
-/// whole session's relay. Capping it bounds that blast radius; a timeout
-/// is treated as a write failure so the existing drop/buffer cleanup
-/// runs. Phase A of #1054.
+/// Deadline for a single control-channel frame write. Since #2977 the write
+/// happens on a dedicated writer task rather than under the queue lock, so a
+/// stalled peer no longer freezes the session; the cap is what stops that
+/// writer parking forever on a peer that accepted the connection and then
+/// stopped reading. A timeout is treated as a write failure, so the frame is
+/// requeued for the next attach.
 const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Write a control frame with a bounded deadline. Returns `true` on a
@@ -809,13 +808,15 @@ async fn write_control_frame(
     )
 }
 
-/// Soft cap on `outstanding_requests`. Hit only if the daemon stops
-/// answering non-permission requests (which a healthy ACP daemon
-/// always does); a misbehaving daemon shouldn't be able to grow the
-/// map without bound across reconnects. When the cap trips we shed the
-/// non-permission entries first (permission cancellations are the
-/// semantically important ones to preserve for the disconnect sweep)
-/// and log once at warn so the leak is visible.
+/// Cap on reverse calls outstanding at once. Hit only if the daemon stops
+/// answering (a healthy one always does), so it exists to stop a wedged or
+/// misbehaving daemon growing `pending_server_calls` without bound across
+/// reconnects.
+///
+/// At the cap the runner REFUSES the new request with an error rather than
+/// evicting an existing entry. Evicting would drop the bookkeeping for a
+/// request the agent is already parked on, so nothing would ever answer it;
+/// refusing lets the agent's RPC layer resolve the id and move on.
 const MAX_OUTSTANDING_REQUESTS: usize = 1024;
 
 impl RunnerShared {
@@ -1053,13 +1054,14 @@ impl RunnerShared {
         agent_stdin: &Mutex<tokio::process::ChildStdin>,
         session_id: &str,
     ) {
-        let drained: Vec<PendingServerCall> = {
+        let drained: Vec<(u64, PendingServerCall)> = {
             let mut map = self.pending_server_calls.lock().await;
-            map.drain().map(|(_, v)| v).collect()
+            map.drain().collect()
         };
         if drained.is_empty() {
             return;
         }
+        let answered: HashSet<u64> = drained.iter().map(|(call_id, _)| *call_id).collect();
         info!(
             target: "acp.runner",
             session = %session_id,
@@ -1069,12 +1071,21 @@ impl RunnerShared {
         // Drop the queued `ServerCall` frames for the ids just answered, so a
         // reattaching daemon is not handed a request the agent already saw
         // resolved.
+        //
+        // Only those ids. Purging every queued `ServerCall` would race the
+        // stdout fanout, which runs on another task and can insert a fresh
+        // pending entry plus its frame between the drain above and this
+        // purge: that frame would be dropped while its pending entry
+        // survived, parking the agent on a request no daemon ever sees until
+        // the next disconnect sweeps it.
         {
             let mut ch = self.control.lock().await;
-            ch.queue
-                .retain(|f| !matches!(f, ControlBody::ServerCall { .. }));
+            ch.queue.retain(|f| match f {
+                ControlBody::ServerCall { call_id, .. } => !answered.contains(call_id),
+                _ => true,
+            });
         }
-        for pending in drained {
+        for (_, pending) in drained {
             let outcome = if pending.method == PERMISSION_METHOD {
                 // ACP `RequestPermissionResponse` with the `cancelled`
                 // outcome. The agent SDK unblocks its parked stdio loop on
@@ -1369,12 +1380,11 @@ impl RunnerShared {
     /// `session/new` (#2979). Without this, `ControlBody::Cancel` and any
     /// later cache replay would address the pre-reset conversation.
     ///
-    /// Keyed on the response actually carrying a session id rather than on a
-    /// tracked request id, which is what lets the relay-era
-    /// `relay_session_news` set go away: the runner now allocates every
-    /// agent-bound id itself, so there is no foreign id space to correlate
-    /// against. Only a successful response reaches here, so a failed reset
-    /// leaves the old session cached and live.
+    /// Keyed on the response actually carrying a session id, rather than on a
+    /// separately-tracked request id as the relay-era code had to do: the
+    /// runner now allocates every agent-bound id itself, so there is no
+    /// foreign id space to correlate against. Only a successful response
+    /// reaches here, so a failed reset leaves the old session cached and live.
     async fn refresh_session_from_reset(&self, result: &serde_json::Value) {
         let Some(sid) = result.get("sessionId").and_then(|v| v.as_str()) else {
             return;

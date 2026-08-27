@@ -206,14 +206,10 @@ pub struct JsonRpcError {
     pub data: Option<serde_json::Value>,
 }
 
-/// JSON-RPC "method not found". Answers a [`ControlBody::ServerCall`] for
-/// a method this daemon has no handler for, so the agent gets a real
-/// error instead of parking on a request nobody will ever answer.
-pub const METHOD_NOT_FOUND: i64 = -32601;
-
 /// JSON-RPC "internal error". Used when the daemon produced an answer this
-/// side could not make sense of, as opposed to [`METHOD_NOT_FOUND`], which
-/// specifically means no handler exists for the method.
+/// side could not make sense of. Distinct from JSON-RPC's -32601
+/// "method not found", which the crate's own dispatch answers for an
+/// unhandled method before the shim ever sees it.
 pub const INTERNAL_ERROR: i64 = -32603;
 
 /// Reserved-range code for "the daemon went away before answering". Shared
@@ -393,7 +389,7 @@ mod tests {
             },
             ControlBody::ServerError {
                 call_id: 1,
-                error: JsonRpcError::new(METHOD_NOT_FOUND, "no handler"),
+                error: JsonRpcError::new(INTERNAL_ERROR, "no handler"),
             },
             ControlBody::Notify {
                 method: "session/update".into(),

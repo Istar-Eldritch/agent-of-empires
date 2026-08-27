@@ -4062,9 +4062,11 @@ struct ShimCorrelation {
     /// synthetic id can never be mistaken for one the crate minted, which
     /// would silently cross the two lanes.
     next_synthetic: i64,
-    /// Allocator for forward `call_id`s.
-    next_forward: u64,
 }
+
+/// Process-wide seed for forward `call_id`s, so the space is monotonic
+/// across daemon connections rather than restarting at zero on each attach.
+static NEXT_FORWARD_CALL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl ShimCorrelation {
     fn synthetic_id(&mut self) -> i64 {
@@ -4073,8 +4075,7 @@ impl ShimCorrelation {
     }
 
     fn forward_id(&mut self) -> u64 {
-        self.next_forward += 1;
-        self.next_forward
+        NEXT_FORWARD_CALL_ID.fetch_add(1, AtomicOrdering::Relaxed)
     }
 }
 
@@ -4212,17 +4213,42 @@ async fn connect_runner_control_v3(
         let stream = loop {
             match tokio::net::UnixStream::connect(control_path).await {
                 Ok(stream) => break stream,
-                // Not bound yet (or bound but not yet listening). Retry until
-                // the outer timeout gives up.
-                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+                // Retry only what a not-yet-ready runner actually produces:
+                // the socket file missing, or bound but not yet listening.
+                // Anything else (a path too long for `sun_path`, no
+                // permission, a path that is not a socket) will not fix
+                // itself, so spinning to the deadline and then reporting
+                // "does not speak v3" would bury the real cause.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                    ) =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await
+                }
+                Err(e) => {
+                    warn!(
+                        target: "acp.protocol",
+                        session = %session_label,
+                        path = %control_path.display(),
+                        "control socket is unusable: {e}"
+                    );
+                    return None;
+                }
             }
         };
         let (mut read_half, mut write_half) = stream.into_split();
         match control_protocol::read_frame(&mut read_half).await {
+            // Check the session id too, not just the version. This channel now
+            // carries the whole event stream and every reverse call, so dialing
+            // the wrong runner would cross two sessions' traffic rather than
+            // merely miss a completion.
             Ok(Some(ControlBody::Hello {
                 control_protocol_version,
-                ..
-            })) if control_protocol_version == control_protocol::CONTROL_PROTOCOL_VERSION => {}
+                session_id,
+            })) if control_protocol_version == control_protocol::CONTROL_PROTOCOL_VERSION
+                && session_id == session_label => {}
             _ => return None,
         }
         control_protocol::write_frame(
@@ -4479,9 +4505,9 @@ async fn connect_runner_control_v3(
                             // A handler answered with an error envelope this
                             // side cannot parse. That is an internal failure,
                             // not a missing method, so it must not borrow
-                            // METHOD_NOT_FOUND: an agent that special-cases
-                            // -32601 would conclude the method is unsupported
-                            // and stop calling it.
+                            // -32601: an agent that special-cases that code
+                            // would conclude the method is unsupported and
+                            // stop calling it.
                             control_protocol::JsonRpcError::new(
                                 control_protocol::INTERNAL_ERROR,
                                 "handler produced a malformed error",
@@ -16011,6 +16037,19 @@ done
         let _ = fake.await;
     }
 
+    /// Clears a process-wide env var on drop, so a panicking test cannot leak
+    /// it into whatever runs next.
+    struct RestoreEnvOnDrop(&'static str);
+
+    impl Drop for RestoreEnvOnDrop {
+        fn drop(&mut self) {
+            // SAFETY: callers hold a default-key `#[serial]` lock.
+            unsafe {
+                std::env::remove_var(self.0);
+            }
+        }
+    }
+
     /// A runner whose `Hello` advertises an unknown control-protocol version
     /// is not trusted: no `Stopped` is emitted and the guard stays unclaimed
     /// so the legacy resume-idle watchdog still fires.
@@ -16103,10 +16142,22 @@ done
     /// downgrade; a live worker of an older generation is replaced by the
     /// reconciler instead of being attached.
     #[tokio::test]
+    #[serial_test::serial]
     async fn runner_control_absent_socket_leaves_guard_unclaimed() {
         let tmp = tempfile::tempdir().unwrap();
         // No control listener is bound at the sibling path.
         let main_socket = tmp.path().join("s.sock");
+
+        // A missing socket is legitimately retryable (the runner binds it
+        // shortly after spawn), so the dial waits out its deadline. Shrink the
+        // deadline rather than the retry, so the test does not spend the full
+        // production window proving a negative. `#[serial]` because this is a
+        // process-wide env var.
+        // SAFETY: serialized against other default-key serial tests.
+        unsafe {
+            std::env::set_var("AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS", "150");
+        }
+        let _restore = RestoreEnvOnDrop("AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS");
 
         let (event_tx, mut event_rx) = mpsc::channel::<Event>(8);
         let guard = Arc::new(TerminalClaim::new());
