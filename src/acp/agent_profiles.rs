@@ -612,8 +612,8 @@ mod tests {
             assert!(profile.supports_exit_plan_mode);
             assert!(profile.supports_wakeup_tools);
         }
-        // `aoe-agent` sits with the others despite bundling Claude as one of
-        // its providers: the adapter's own tool palette is Read/Write/Bash,
+        // `aoe-agent` sits with the non-Claude group despite bundling Claude
+        // as one of its providers: the adapter's tool palette is Read/Write/Bash,
         // with no ExitPlanMode and no ScheduleWakeup to synthesise from (#1904).
         for profile in [
             &CODEX,
