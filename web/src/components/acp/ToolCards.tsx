@@ -1103,7 +1103,21 @@ function FetchToolCard({ tool, result }: Props) {
 
 /* ── think ──────────────────────────────────────────────────────── */
 
-function ThinkToolCard({ tool }: Props) {
+function ThinkToolCard({ tool, result }: Props) {
+  // A think call's substance normally lives somewhere other than the card:
+  // in streamed child tool calls, or in a returned report. The quiet
+  // one-line card is right for that. A *failed* one inverts it, the error
+  // is all there is, and this card has nowhere to put it. Fall through to
+  // the generic card, which auto-expands on error and prints the text.
+  //
+  // aoe-agent makes this the common case rather than an edge: `task` is not
+  // in its palette, so the AI SDK answers every call with a NoSuchToolError
+  // naming the tools that do exist, which is the one message a user needs
+  // to see. A claude or opencode Task can fail too, and was equally silent
+  // before this branch. See #1904.
+  if (statusFor(result) === "err") {
+    return <GenericToolCard tool={tool} result={result} />;
+  }
   return (
     <div className="my-1 flex items-center gap-2 px-3 py-1 text-xs italic text-text-muted">
       <Sparkles className="h-3 w-3 text-text-dim" />
