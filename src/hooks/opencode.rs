@@ -204,6 +204,17 @@ function write(command) {{
 // flash the whole session Idle mid-turn.
 const active = new Set();
 
+// Events that end a session without an idle of its own. They report no status,
+// because a failed or deleted subagent does not mean the parent's turn is over,
+// but the session must stop counting toward the idle suppression above.
+// Current opencode idles on every terminal path (`halt` in
+// session/processor.ts sets idle, and both the abort and failure paths route
+// through it), so this is a backstop against that contract changing rather
+// than a fix for an observed hang: without it, one session that ever ends
+// without idling pins the pane Running for the life of the process, and the
+// pane detector cannot rescue it because the status file exists and wins.
+const TERMINAL = new Set(["session.error", "session.deleted"]);
+
 function sessionIdOf(event) {{
   return event && event.properties && event.properties.sessionID;
 }}
@@ -246,6 +257,11 @@ export const AoeStatus = async () => {{
   return {{
   event: async ({{ event }}) => {{
     try {{
+      if (TERMINAL.has(event.type)) {{
+        const id = sessionIdOf(event);
+        if (id) active.delete(id);
+        return;
+      }}
       await report(keysFor(event), sessionIdOf(event));
     }} catch {{
       // Status reporting must never break an opencode event handler.
@@ -417,13 +433,16 @@ mod tests {
     /// Drive the generated plugin under `node` with `Bun.spawn` stubbed, and
     /// assert the sequence of statuses it would have written.
     ///
-    /// The subagent rule is the subtle part: opencode runs the task tool as its
-    /// own session that emits its own idle, so a finished subagent must not
-    /// report the whole session Idle while the parent turn is still going. That
-    /// is a behavior of the emitted JS, which no Rust-side assertion on the
-    /// rendered text can reach.
+    /// Two halves of one rule, both behaviors of the emitted JS that no
+    /// Rust-side assertion on the rendered text can reach:
+    ///
+    /// 1. opencode runs the task tool as its own session that emits its own
+    ///    idle, so a finished subagent must not report the whole session Idle
+    ///    while the parent turn is still going.
+    /// 2. a subagent that ends on a terminal event instead of an idle must stop
+    ///    counting, or it pins the pane Running for the life of the process.
     #[test]
-    fn test_rendered_plugin_suppresses_subagent_idle() {
+    fn test_rendered_plugin_tracks_active_sessions_for_idle() {
         let Ok(node) = which::which("node") else {
             eprintln!("skipping: node not on PATH");
             return;
@@ -452,11 +471,19 @@ if (!plugin.event) throw new Error("no handlers registered with AOE_INSTANCE_ID 
 const status = (sessionID, type) =>
   plugin.event({ event: { type: "session.status", properties: { sessionID, status: { type } } } })
 
+// Phase 1: a subagent finishing must not idle the parent.
 await status("A", "busy")                                // parent turn starts
 await plugin["tool.execute.before"]({ sessionID: "B" })  // subagent starts working
 await status("B", "idle")                                // subagent done, parent is not
 await plugin.event({ event: { type: "permission.asked", properties: { sessionID: "A" } } })
 await status("A", "idle")                                // parent done
+
+// Phase 2: a subagent that dies on a terminal event must stop counting, so the
+// parent's own idle still lands. session.error reports no status of its own.
+await status("C", "busy")                                // parent turn starts
+await plugin["tool.execute.before"]({ sessionID: "D" })  // subagent starts working
+await plugin.event({ event: { type: "session.error", properties: { sessionID: "D" } } })
+await status("C", "idle")                                // parent done
 console.log(JSON.stringify(recorded))
 "#,
         )
@@ -474,7 +501,7 @@ console.log(JSON.stringify(recorded))
         );
         assert_eq!(
             String::from_utf8_lossy(&out.stdout).trim(),
-            r#"["running","running","waiting","idle"]"#,
+            r#"["running","running","waiting","idle","running","running","idle"]"#,
             "stderr:\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
