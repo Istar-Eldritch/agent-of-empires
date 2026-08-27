@@ -630,6 +630,16 @@ struct RunnerShared {
     /// through the control channel; replayed verbatim on every later
     /// attach so the agent is handshaken exactly once.
     handshake: Mutex<RunnerHandshake>,
+    /// Serializes the runner-owned handshake, so two `Initialize` (or
+    /// `EstablishSession`) frames arriving before the first completes cannot
+    /// both miss the cache and double-send to the agent. Reachable now that
+    /// the handshake runs off the control read loop.
+    ///
+    /// Deliberately a separate lock from `handshake`: the stdout fanout takes
+    /// that one (`refresh_session_from_reset`), so holding it across an agent
+    /// round trip would stall the fanout and with it the very response the
+    /// round trip is waiting for.
+    handshake_gate: Mutex<()>,
     /// Monotonic JSON-RPC id allocator for every request the runner issues
     /// to the agent. As of Phase C (#2977) that is all of them: the
     /// handshake, the turn, and the forward-lane methods the daemon asks for
@@ -822,6 +832,7 @@ impl RunnerShared {
             control: Mutex::new(ControlChannel::default()),
             control_wake: tokio::sync::Notify::new(),
             handshake: Mutex::new(RunnerHandshake::default()),
+            handshake_gate: Mutex::new(()),
             next_req_id: AtomicI64::new(RUNNER_REQUEST_ID_BASE),
             pending_client_responses: Mutex::new(HashMap::new()),
             pending_server_calls: Mutex::new(HashMap::new()),
@@ -1280,6 +1291,7 @@ impl RunnerShared {
         agent_stdin: &Mutex<tokio::process::ChildStdin>,
         request: serde_json::Value,
     ) -> Result<serde_json::Value, serde_json::Value> {
+        let _gate = self.handshake_gate.lock().await;
         if let Some(cached) = self.handshake.lock().await.initialized.clone() {
             return Ok(cached);
         }
@@ -1303,6 +1315,7 @@ impl RunnerShared {
         method: &str,
         request: serde_json::Value,
     ) -> Result<(String, serde_json::Value), serde_json::Value> {
+        let _gate = self.handshake_gate.lock().await;
         if let Some(cached) = self.handshake.lock().await.session.clone() {
             return Ok(cached);
         }
@@ -1698,10 +1711,14 @@ async fn run_control_writer(
 /// version gate doing its job: a v3 runner binds no relay socket, so there
 /// is no older transport for it to fall back to on this runner.
 ///
-/// The read loop never awaits a handler: `ServerResult` / `ServerError` only
-/// write to the agent, and the handshake frames are quick. Nothing here can
-/// park for the minutes a permission request takes, because the daemon does
-/// that waiting on its own side.
+/// The read loop never awaits an agent round trip. The frames it handles
+/// inline only ever WRITE to the agent (`ServerResult` / `ServerError`,
+/// `Prompt`, `Cancel`, `AgentCall`); their responses come back through the
+/// stdout fanout on another task. The two handshake frames do await the agent,
+/// so they are spawned rather than handled inline. Getting that wrong
+/// deadlocks the whole session, and unrecoverably: the accept loop awaits this
+/// function, so a parked read loop also blocks the next daemon from
+/// attaching.
 async fn handle_control_connection(
     stream: UnixStream,
     shared: Arc<RunnerShared>,
@@ -1756,31 +1773,51 @@ async fn handle_control_connection(
                     break;
                 }
             }
+            // Both handshake arms run OFF this loop. They are the only
+            // frames whose handler awaits a response from the agent, and
+            // awaiting inline deadlocks the session: an agent that issues a
+            // client request while answering `session/new` (legal ACP, and
+            // the reason this proxy layer exists) waits on the runner, while
+            // the runner's read loop is parked on the handshake response and
+            // can never read the `ServerResult` that would unblock it.
+            // Nothing needs to come back to this loop, since the answer goes
+            // out through `emit_control` either way. `handshake_gate` keeps
+            // two frames from double-sending to the agent.
             ControlBody::Initialize { request } => {
-                let frame = match shared.run_or_replay_initialize(&agent_stdin, request).await {
-                    Ok(result) => ControlBody::Initialized { result },
-                    Err(error) => {
-                        warn!(target: "acp.runner", session = %session_id, "initialize failed: {error}");
-                        ControlBody::HandshakeFailed { error }
-                    }
-                };
-                shared.emit_control(frame).await;
+                let shared = Arc::clone(&shared);
+                let agent_stdin = Arc::clone(&agent_stdin);
+                let session_id = session_id.clone();
+                tokio::spawn(async move {
+                    let frame = match shared.run_or_replay_initialize(&agent_stdin, request).await {
+                        Ok(result) => ControlBody::Initialized { result },
+                        Err(error) => {
+                            warn!(target: "acp.runner", session = %session_id, "initialize failed: {error}");
+                            ControlBody::HandshakeFailed { error }
+                        }
+                    };
+                    shared.emit_control(frame).await;
+                });
             }
             ControlBody::EstablishSession { method, request } => {
-                let frame = match shared
-                    .run_or_replay_session(&agent_stdin, &method, request)
-                    .await
-                {
-                    Ok((acp_session_id, result)) => ControlBody::SessionReady {
-                        acp_session_id,
-                        result,
-                    },
-                    Err(error) => {
-                        warn!(target: "acp.runner", session = %session_id, "{method} failed: {error}");
-                        ControlBody::HandshakeFailed { error }
-                    }
-                };
-                shared.emit_control(frame).await;
+                let shared = Arc::clone(&shared);
+                let agent_stdin = Arc::clone(&agent_stdin);
+                let session_id = session_id.clone();
+                tokio::spawn(async move {
+                    let frame = match shared
+                        .run_or_replay_session(&agent_stdin, &method, request)
+                        .await
+                    {
+                        Ok((acp_session_id, result)) => ControlBody::SessionReady {
+                            acp_session_id,
+                            result,
+                        },
+                        Err(error) => {
+                            warn!(target: "acp.runner", session = %session_id, "{method} failed: {error}");
+                            ControlBody::HandshakeFailed { error }
+                        }
+                    };
+                    shared.emit_control(frame).await;
+                });
             }
             ControlBody::Prompt { request } => {
                 if shared.agent_prompt(&agent_stdin, request).await.is_none() {

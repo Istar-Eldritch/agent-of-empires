@@ -246,6 +246,148 @@ fn write_frame(stream: &mut UnixStream, body: &serde_json::Value) {
     stream.flush().expect("flush frame");
 }
 
+/// Regression for the deadlock the Phase C lane merge introduced: an agent
+/// that issues a client request while it is answering `session/new`.
+///
+/// That is legal ACP and precisely what this proxy layer exists to support.
+/// Before the fix, the runner's control read loop awaited the handshake
+/// response inline, so the agent's `fs/read_text_file` reached the daemon as a
+/// `ServerCall` but the answering `ServerResult` could never be read: the
+/// agent waited on the runner and the runner waited on the agent. It was also
+/// unrecoverable, because the accept loop awaits the connection handler, so no
+/// later daemon could attach either.
+///
+/// Asserts the session completes, which it cannot do if the loop parks.
+#[test]
+fn agent_request_during_session_new_does_not_deadlock_the_runner() {
+    if cfg!(not(unix)) {
+        return;
+    }
+    let Some(python3) = find_python3() else {
+        eprintln!("skipping: python3 not found for fake ACP agent");
+        return;
+    };
+
+    let scratch = Scratch::new("dl");
+    let home = scratch.0.join("home");
+    let xdg = scratch.0.join("xdg");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&xdg).unwrap();
+
+    // Answers `initialize` immediately, but on `session/new` first issues its
+    // own `fs/read_text_file` at the client and waits for the answer before
+    // replying. An agent doing setup work through the client's fs capability
+    // behaves exactly like this.
+    let agent_py = scratch.0.join("deadlock_agent.py");
+    std::fs::write(
+        &agent_py,
+        r#"
+import sys, json
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+pending_session = None
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": msg["id"], "result": {"protocolVersion": 1}})
+    elif method == "session/new":
+        # Ask the client for a file BEFORE answering. This is the deadlock.
+        pending_session = msg["id"]
+        send({"jsonrpc": "2.0", "id": 9001, "method": "fs/read_text_file",
+              "params": {"path": "/tmp/setup"}})
+    elif method is None and msg.get("id") == 9001 and pending_session is not None:
+        # Our fs request was answered; now we can finish session/new.
+        send({"jsonrpc": "2.0", "id": pending_session,
+              "result": {"sessionId": "sess-dl"}})
+        pending_session = None
+"#,
+    )
+    .unwrap();
+
+    let session_id = "sdl00001";
+    let workers = app_dir(&home, &xdg).join("acp-workers");
+    let control = workers.join(format!("{session_id}.control.sock"));
+    let record = workers.join(format!("{session_id}.json"));
+
+    let _child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_aoe"))
+            .args([
+                "__acp-runner",
+                "--socket",
+                workers.join(format!("{session_id}.sock")).to_str().unwrap(),
+                "--session-id",
+                session_id,
+                "--agent-name",
+                "fake-agent",
+                "--cwd",
+                home.to_str().unwrap(),
+                "--",
+                python3.to_str().unwrap(),
+                agent_py.to_str().unwrap(),
+            ])
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("AOE_ACP_WATCHDOG_POLL_MS", "150")
+            .spawn()
+            .expect("spawn acp runner"),
+    );
+
+    wait_for(&record, "registry record");
+    wait_for(&control, "control socket");
+
+    let mut ctl = UnixStream::connect(&control).expect("connect control socket");
+    ctl.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    assert_eq!(read_frame(&mut ctl)["kind"], "hello");
+    write_frame(
+        &mut ctl,
+        &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
+    );
+    write_frame(
+        &mut ctl,
+        &serde_json::json!({"kind": "initialize", "request": {"protocolVersion": 1}}),
+    );
+    assert_eq!(read_typed_frame(&mut ctl)["kind"], "initialized");
+
+    write_frame(
+        &mut ctl,
+        &serde_json::json!({
+            "kind": "establish_session",
+            "method": "session/new",
+            "request": {"cwd": home.to_str().unwrap()},
+        }),
+    );
+
+    // The agent's mid-handshake request must reach us as a ServerCall. Pre-fix
+    // this arrived fine; it is the answer that could not be read.
+    let call = read_typed_frame(&mut ctl);
+    assert_eq!(call["kind"], "server_call", "got {call}");
+    assert_eq!(call["method"], "fs/read_text_file");
+    write_frame(
+        &mut ctl,
+        &serde_json::json!({
+            "kind": "server_result",
+            "call_id": call["call_id"],
+            "result": {"content": "setup data"},
+        }),
+    );
+
+    // Pre-fix this read times out: the runner never processed the
+    // server_result, so the agent never finished session/new.
+    let ready = read_typed_frame(&mut ctl);
+    assert_eq!(
+        ready["kind"], "session_ready",
+        "the handshake must complete once the agent's own request is answered: {ready}"
+    );
+    assert_eq!(ready["acp_session_id"], "sess-dl");
+}
+
 /// Resolve a python3 interpreter for the fake ACP agent, or None to skip.
 fn find_python3() -> Option<PathBuf> {
     for cand in [
