@@ -9870,9 +9870,10 @@ async fn handle_release_terminal(
     let result = match res.terminals.release(request.terminal_id.0.as_ref()).await {
         Ok(()) => Ok(ReleaseTerminalResponse::new()),
         // Releasing a terminal this session already released is success, not
-        // an error: #2977 replays a completed-but-undelivered result across a
-        // control reattach, so the agent can legitimately ask twice. Scoped
-        // to ids we know were released, so a genuinely bogus id still errors
+        // an error. An agent whose release was answered but whose daemon then
+        // disconnected (or which simply retries) can legitimately ask twice,
+        // and a delete that has already happened is not a failure. Scoped to
+        // ids we know were released, so a genuinely bogus id still errors
         // rather than being masked.
         Err(super::terminal_handler::TerminalError::UnknownTerminal(_))
             if res

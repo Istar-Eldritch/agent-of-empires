@@ -71,10 +71,9 @@ pub struct TerminalManager {
 struct TerminalManagerInner {
     outputs: std::collections::HashMap<TerminalId, TerminalOutput>,
     /// Ids this session has already released. Lets `terminal/release` be
-    /// idempotent for a replayed call (#2977 replays a completed-but-undelivered
-    /// result across a control reattach) without masking a genuinely unknown
-    /// id, which still errors. Bounded by the session's terminal count, which
-    /// is bounded by the agent's tool calls.
+    /// idempotent for a duplicate call (an agent retrying after a daemon
+    /// disconnect, say) without masking a genuinely unknown id, which still
+    /// errors. Holds ids only, and is bounded by the session's terminal count.
     released: std::collections::HashSet<TerminalId>,
 }
 

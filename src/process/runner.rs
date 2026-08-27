@@ -664,13 +664,6 @@ struct RunnerShared {
     /// `next_req_id`: one names an agent-bound JSON-RPC request, the other a
     /// control-channel call, and they are never matched against each other.
     next_call_id: AtomicU64,
-    /// Results for reverse-lane calls that a daemon answered but whose
-    /// answer the runner could not hand to the agent, or that completed
-    /// while no daemon was attached to hear about it. Keyed by `call_id` so
-    /// a reattaching daemon replaying the same call gets the memoized
-    /// answer instead of re-running the side effect. This is why a daemon
-    /// restart mid-`terminal/create` does not run the command twice.
-    server_call_results: Mutex<HashMap<u64, serde_json::Value>>,
     /// Forward-lane calls in flight: agent-bound JSON-RPC id -> the daemon's
     /// `call_id`, so the stdout fanout can turn the agent's response into an
     /// `AgentResult` / `AgentError` for the right waiter.
@@ -837,7 +830,6 @@ impl RunnerShared {
             pending_client_responses: Mutex::new(HashMap::new()),
             pending_server_calls: Mutex::new(HashMap::new()),
             next_call_id: AtomicU64::new(1),
-            server_call_results: Mutex::new(HashMap::new()),
             pending_agent_calls: Mutex::new(HashMap::new()),
         }
     }
@@ -1001,12 +993,13 @@ impl RunnerShared {
         self.write_agent_line(agent_stdin, &response).await
     }
 
-    /// Answer a reverse-lane call whose `call_id` the daemon just resolved.
+    /// Answer a reverse-lane call whose `call_id` the daemon just resolved,
+    /// writing the JSON-RPC response to the agent under its own id.
     ///
-    /// Memoizes the answer under `call_id` when the agent write fails, so a
-    /// reattaching daemon replaying the same call is served from the memo
-    /// rather than re-running the side effect. That memo is what makes a
-    /// daemon restart during `terminal/create` run the command once.
+    /// If the agent write fails the answer is dropped: the agent is gone, so
+    /// there is nobody left to receive it. Nothing is memoized for a later
+    /// daemon, because a `call_id` is minted per agent request and a retry
+    /// arrives as a new one, so a memo could never be matched to it.
     async fn resolve_server_call(
         &self,
         agent_stdin: &Mutex<tokio::process::ChildStdin>,
@@ -1026,19 +1019,10 @@ impl RunnerShared {
             );
             return;
         };
-        if let Ok(result) = &outcome {
-            self.server_call_results
-                .lock()
-                .await
-                .insert(call_id, result.clone());
-        }
-        if self
+        if !self
             .answer_agent(agent_stdin, &pending.agent_id, outcome)
             .await
         {
-            // Delivered, so the memo has served its purpose.
-            self.server_call_results.lock().await.remove(&call_id);
-        } else {
             warn!(
                 target: "acp.runner",
                 session = %session_id,
@@ -1057,9 +1041,10 @@ impl RunnerShared {
     /// `session/request_permission` or `elicitation/create` is a UI card, and
     /// re-presenting one whose daemon is gone races the daemon's own
     /// attach-time orphan sweep and can leave a duplicate card or an agent
-    /// parked on a card that was swept. Notifications and already-computed
-    /// results DO replay, which is what the queue and `server_call_results`
-    /// are for. So `session/request_permission` gets the semantic `cancelled`
+    /// parked on a card that was swept. Buffered notifications DO replay, via
+    /// the outbound queue, but an outstanding CALL does not: the agent is told
+    /// the daemon went away and may reissue it as a fresh call.
+    /// So `session/request_permission` gets the semantic `cancelled`
     /// outcome it has always got, and every other method a method-agnostic
     /// JSON-RPC error its RPC layer can resolve by id without anyone
     /// guessing a typed result shape.
