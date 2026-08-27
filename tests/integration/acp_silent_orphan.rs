@@ -105,7 +105,7 @@ async fn silent_orphan_fires_on_cost_then_silence() {
 
     let preseed = "silent-orphan-positive";
     let (socket_path, _tmp) =
-        spawn_runner_with_shim(&[("SHIM_PRESEED_SESSION_ID", preseed.to_string())]).await;
+        spawn_runner_with_shim(preseed, &[("SHIM_PRESEED_SESSION_ID", preseed.to_string())]).await;
 
     let client = AcpClient::attach(
         socket_path,
@@ -167,7 +167,7 @@ async fn silent_orphan_suppressed_during_normal_turn() {
 
     let preseed = "silent-orphan-negative";
     let (socket_path, _tmp) =
-        spawn_runner_with_shim(&[("SHIM_PRESEED_SESSION_ID", preseed.to_string())]).await;
+        spawn_runner_with_shim(preseed, &[("SHIM_PRESEED_SESSION_ID", preseed.to_string())]).await;
 
     let client = AcpClient::attach(
         socket_path,
@@ -230,7 +230,7 @@ async fn silent_orphan_disabled_by_zero_grace() {
 
     let preseed = "silent-orphan-disabled";
     let (socket_path, _tmp) =
-        spawn_runner_with_shim(&[("SHIM_PRESEED_SESSION_ID", preseed.to_string())]).await;
+        spawn_runner_with_shim(preseed, &[("SHIM_PRESEED_SESSION_ID", preseed.to_string())]).await;
 
     let client = AcpClient::attach(
         socket_path,
@@ -289,7 +289,7 @@ async fn silent_orphan_suppressed_during_async_agent_wait() {
 
     let preseed = "silent-orphan-async-agent";
     let (socket_path, _tmp) =
-        spawn_runner_with_shim(&[("SHIM_PRESEED_SESSION_ID", preseed.to_string())]).await;
+        spawn_runner_with_shim(preseed, &[("SHIM_PRESEED_SESSION_ID", preseed.to_string())]).await;
 
     let client = AcpClient::attach(
         socket_path,
@@ -349,7 +349,7 @@ async fn silent_orphan_suppressed_during_background_bash() {
 
     let preseed = "silent-orphan-background-bash";
     let (socket_path, _tmp) =
-        spawn_runner_with_shim(&[("SHIM_PRESEED_SESSION_ID", preseed.to_string())]).await;
+        spawn_runner_with_shim(preseed, &[("SHIM_PRESEED_SESSION_ID", preseed.to_string())]).await;
 
     let client = AcpClient::attach(
         socket_path,
@@ -403,7 +403,7 @@ async fn silent_orphan_suppressed_during_scheduled_wakeup() {
 
     let preseed = "silent-orphan-wakeup";
     let (socket_path, _tmp) =
-        spawn_runner_with_shim(&[("SHIM_PRESEED_SESSION_ID", preseed.to_string())]).await;
+        spawn_runner_with_shim(preseed, &[("SHIM_PRESEED_SESSION_ID", preseed.to_string())]).await;
 
     let client = AcpClient::attach(
         socket_path,

@@ -61,7 +61,10 @@ async fn attach_in_flight_synthesizes_reattach_idle_stopped() {
     // instead of the 10s production default.
     std::env::set_var("AOE_RESUME_IDLE_GRACE_MS", "500");
 
-    let (socket_path, _runner) = spawn_runner_with_shim(&[]).await;
+    // The runner must announce the same session id the daemon attaches
+    // with; the control handshake verifies it.
+    const SESSION: &str = "midturn-true";
+    let (socket_path, _runner) = spawn_runner_with_shim(SESSION, &[]).await;
 
     let mut client = AcpClient::attach(
         socket_path,
@@ -98,7 +101,10 @@ async fn attach_idle_session_does_not_synthesize_stopped() {
 
     std::env::set_var("AOE_RESUME_IDLE_GRACE_MS", "500");
 
-    let (socket_path, _runner) = spawn_runner_with_shim(&[]).await;
+    // The runner must announce the same session id the daemon attaches
+    // with; the control handshake verifies it.
+    const SESSION: &str = "midturn-false";
+    let (socket_path, _runner) = spawn_runner_with_shim(SESSION, &[]).await;
 
     let mut client = AcpClient::attach(
         socket_path,
@@ -145,10 +151,16 @@ async fn attach_in_flight_disarms_after_first_inbound_notification() {
     std::env::set_var("AOE_RESUME_IDLE_GRACE_MS", "800");
 
     let session_id = "test-acp-session-id";
-    let (socket_path, _runner) = spawn_runner_with_shim(&[
-        ("SHIM_PRESEED_SESSION_ID", session_id.to_string()),
-        ("SHIM_EMIT_UNSOLICITED_NOTIF", "200".to_string()),
-    ])
+    // The runner must announce the same session id the daemon attaches
+    // with; the control handshake verifies it.
+    const SESSION: &str = "midturn-disarm";
+    let (socket_path, _runner) = spawn_runner_with_shim(
+        SESSION,
+        &[
+            ("SHIM_PRESEED_SESSION_ID", session_id.to_string()),
+            ("SHIM_EMIT_UNSOLICITED_NOTIF", "200".to_string()),
+        ],
+    )
     .await;
 
     let mut client = AcpClient::attach(
@@ -193,8 +205,11 @@ async fn socket_transport_round_trips_prompt_via_attach() {
     }
 
     let preseed = "preseed-roundtrip-session";
+    // The runner must announce the same session id the daemon attaches
+    // with; the control handshake verifies it.
+    const SESSION: &str = "roundtrip";
     let (socket_path, _runner) =
-        spawn_runner_with_shim(&[("SHIM_PRESEED_SESSION_ID", preseed.to_string())]).await;
+        spawn_runner_with_shim(SESSION, &[("SHIM_PRESEED_SESSION_ID", preseed.to_string())]).await;
 
     let mut client = AcpClient::attach(
         socket_path,

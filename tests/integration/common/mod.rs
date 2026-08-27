@@ -117,7 +117,10 @@ pub fn set_temp_home(path: &Path) {
 /// Returns the `--socket` path (still the derivation base for the control
 /// sibling, which is what `AcpClient::attach` dials) and guards that keep the
 /// temp dir and the runner process alive for the test's duration.
-pub async fn spawn_runner_with_shim(env: &[(&str, String)]) -> (PathBuf, RunnerGuard) {
+pub async fn spawn_runner_with_shim(
+    session_id: &str,
+    env: &[(&str, String)],
+) -> (PathBuf, RunnerGuard) {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     let xdg = temp.path().join("xdg");
@@ -128,7 +131,10 @@ pub async fn spawn_runner_with_shim(env: &[(&str, String)]) -> (PathBuf, RunnerG
     // rather than deriving the app-dir layout (which varies by platform and
     // by whether XDG_CONFIG_HOME is set). The runner still writes its
     // registry record under the temp HOME; nothing here reads it.
-    let session_id = "midturn1";
+    //
+    // `session_id` must match what the caller passes to `AcpClient::attach`:
+    // the daemon verifies the id the runner announces in its `Hello`, so a
+    // fixture that spawned under a fixed id would be rejected.
     let socket_path = temp.path().join(format!("{session_id}.sock"));
     let control = temp.path().join(format!("{session_id}.control.sock"));
 
