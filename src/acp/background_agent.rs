@@ -370,8 +370,10 @@ async fn run_tailer(
 
     let mut offset: u64 = 0;
     let mut line_buf = String::new();
-    let mut snap = Snapshot::default();
-    snap.format = format;
+    let mut snap = Snapshot {
+        format,
+        ..Default::default()
+    };
     let mut last_progress = Utc::now() - chrono::Duration::seconds(10);
     let mut last_growth = Utc::now();
     let mut stalled_emitted = false;
@@ -519,6 +521,7 @@ async fn run_tailer(
 }
 
 /// One child run parsed from the async runner's `status.json`.
+#[derive(Clone)]
 struct PiStep {
     run_id: String,
     parent_workflow_run_id: Option<String>,
@@ -772,7 +775,7 @@ async fn emit_pi_child_event(
             })
             .await
             .map_err(|_| ())?;
-        let _ = event_tx
+        event_tx
             .send(Event::BackgroundAgentProgress {
                 agent_id: step.run_id.clone(),
                 status: pi_child_active(step, now_ms),
@@ -793,7 +796,7 @@ async fn emit_pi_child_event(
     if step.status != "running" {
         track.done = true;
         track.status = step.status.clone();
-        let _ = event_tx
+        event_tx
             .send(completed(
                 step.run_id.clone(),
                 pi_step_status(&step.status),
@@ -807,7 +810,7 @@ async fn emit_pi_child_event(
     }
     if sig != track.sig {
         track.sig = sig;
-        let _ = event_tx
+        event_tx
             .send(Event::BackgroundAgentProgress {
                 agent_id: step.run_id.clone(),
                 status: pi_child_active(step, now_ms),
@@ -839,7 +842,7 @@ async fn flush_pi_children(
         if let Some(track) = children.get_mut(&id) {
             track.done = true;
         }
-        let _ = event_tx
+        event_tx
             .send(completed(
                 id,
                 pi_step_status(&status),
@@ -1181,17 +1184,30 @@ fn format_warning(snap: &Snapshot) -> Option<String> {
 /// (`ok: None`) means the sub-agent was mid-action, never done.
 fn infer_idle_outcome(snap: &Snapshot) -> (BackgroundAgentStatus, Option<String>, Option<String>) {
     let dangling_tool = !snap.unresolved_tools.is_empty();
+    // Claude transcripts end via stop_reason; pi runs end via the runner's
+    // terminal record. Name the missing signal honestly per format.
+    let (inferred, silent) = if snap.format == TranscriptFormat::PiEvents {
+        (
+            "runner stopped reporting; no terminal record; completion inferred from last output",
+            "runner stopped reporting; stopped tracking",
+        )
+    } else {
+        (
+            "no explicit end_turn marker; completion inferred from final text",
+            "no transcript activity; stopped tracking",
+        )
+    };
     if snap.last_was_text && snap.last_text.is_some() && !dangling_tool {
         (
             BackgroundAgentStatus::Completed,
             snap.last_text.clone(),
-            Some("no explicit end_turn marker; completion inferred from final text".into()),
+            Some(inferred.into()),
         )
     } else {
         (
             BackgroundAgentStatus::Stalled,
             snap.result.clone(),
-            Some("no transcript activity; stopped tracking".into()),
+            Some(silent.into()),
         )
     }
 }
