@@ -257,11 +257,14 @@ const PI: AgentProfile = {
     todos: false,
     skills: false,
     wakeup: false,
-    subagents: false,
+    // pi-subagents emits child tool calls as ACP tool_call events linked via
+    // _meta.pi.parentToolUseId (emitted by pi-acp from the extension's
+    // streamed childToolEvents frames).
+    subagents: true,
     legacyModeFallback: false,
     heartbeatKeepalives: false,
   },
-  parentMetaNamespaces: [],
+  parentMetaNamespaces: ["pi"],
   mcpPrefixes: ["mcp__"],
   aliases: {},
   specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
