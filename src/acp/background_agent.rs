@@ -29,7 +29,7 @@
 //!   SDK format. Malformed lines are counted and skipped; a format we
 //!   cannot read at all degrades to a visible warning, never a panic.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -231,7 +231,15 @@ pub fn spawn_tailer(
             agent_id: agent_id.clone(),
         };
         let format = TranscriptFormat::from_opt_str(output_format.as_deref());
-        run_tailer(agent_id, output_file, format, source, event_tx).await;
+        run_tailer(
+            agent_id,
+            tool_call_id,
+            output_file,
+            format,
+            source,
+            event_tx,
+        )
+        .await;
     });
 }
 
@@ -291,6 +299,7 @@ struct Snapshot {
 
 async fn run_tailer(
     agent_id: String,
+    tool_call_id: String,
     output_file: String,
     format: TranscriptFormat,
     source: TranscriptSource,
@@ -327,13 +336,51 @@ async fn run_tailer(
     let mut last_growth = Utc::now();
     let mut stalled_emitted = false;
 
+    // pi-format only: per-child fan-out state. Workflow runs surface one
+    // panel row per child step; single-child runs fold into the umbrella.
+    let mut pi_children: HashMap<String, PiChildTrack> = HashMap::new();
     loop {
         let mut grew =
             read_new_lines(&source, &output_file, &mut offset, &mut line_buf, &mut snap).await;
-        if format == TranscriptFormat::PiEvents {
-            grew |= sync_pi_status(&source, &output_file, &mut snap).await;
-        }
         let now = Utc::now();
+        if format == TranscriptFormat::PiEvents {
+            if let Some(status) = read_pi_status(&source, &output_file).await {
+                let own: Vec<&PiStep> = status
+                    .steps
+                    .iter()
+                    .filter(|s| s.parent_workflow_run_id.as_deref() == Some(agent_id.as_str()))
+                    .collect();
+                if fold_umbrella_pi(&status, &own, &mut snap) {
+                    grew = true;
+                }
+                if !own.is_empty() {
+                    let now_ms = now.timestamp_millis();
+                    for step in &own {
+                        match emit_pi_child_event(
+                            &mut pi_children,
+                            step,
+                            &tool_call_id,
+                            now_ms,
+                            &event_tx,
+                        )
+                        .await
+                        {
+                            Ok(true) => grew = true,
+                            Ok(false) => {}
+                            // Session event channel closed; stop tracking.
+                            Err(()) => return,
+                        }
+                    }
+                    if snap.done
+                        && flush_pi_children(&mut pi_children, &event_tx)
+                            .await
+                            .is_err()
+                    {
+                        return; // session gone
+                    }
+                }
+            }
+        }
         if grew {
             last_growth = now;
             stalled_emitted = false;
@@ -418,106 +465,339 @@ async fn run_tailer(
     }
 }
 
-/// pi-format only: poll the run's `status.json` (sibling of the
-/// transcript's events.jsonl) and fold the async runner's canonical live
-/// state into the snapshot. Workflow steps become the tool entries (label,
-/// agent, per-step status), the top-level `state` decides terminality, and
-/// a fresh `lastUpdate` counts as activity, so the long quiet stretches
-/// between sparse `subagent.workflow.*` transcript records do not read as
-/// stalled. Returns true when the folded state changed materially.
-async fn sync_pi_status(source: &TranscriptSource, output_file: &str, snap: &mut Snapshot) -> bool {
-    let Some(dir) = std::path::Path::new(output_file).parent() else {
-        return false;
-    };
+/// One child run parsed from the async runner's `status.json`.
+struct PiStep {
+    run_id: String,
+    parent_workflow_run_id: Option<String>,
+    agent: String,
+    label: String,
+    status: String,
+    model: Option<String>,
+    tool_count: Option<u32>,
+    /// `tool args` of the most recent recorded tool call, for the
+    /// activity line.
+    last_tool: Option<String>,
+    /// Most recent output line, for the activity line and result preview.
+    last_text: Option<String>,
+    /// The child's task prompt, as recorded by the runner.
+    session_name: String,
+    last_activity_ms: Option<i64>,
+}
+
+/// Parsed `status.json`: the async runner's canonical live state for a run.
+struct PiStatus {
+    /// "running" | "complete" | "failed" | "stopped".
+    state: String,
+    last_update_ms: Option<i64>,
+    steps: Vec<PiStep>,
+}
+
+/// pi-format only: read the run's `status.json` (sibling of the
+/// transcript's events.jsonl). The runner rewrites this small snapshot in
+/// place as children start, make tool calls, and finish, so polling it
+/// gives per-child liveness and detail that the sparse
+/// `subagent.workflow.*` transcript records never carry. Returns None
+/// when the file is missing or unreadable (the poll loop keeps waiting).
+async fn read_pi_status(source: &TranscriptSource, output_file: &str) -> Option<PiStatus> {
+    let dir = std::path::Path::new(output_file).parent()?;
     let status_path = dir.join("status.json").to_string_lossy().into_owned();
-    // Whole-file read from offset 0; status.json is a small snapshot the
-    // runner rewrites in place, not an append-only log.
+    // Whole-file read from offset 0; status.json is a snapshot, not a log.
     let bytes = source.read_from(&status_path, 0).await;
     if bytes.is_empty() {
-        return false;
+        return None;
     }
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        return false;
-    };
-    let state = v.get("state").and_then(|s| s.as_str()).unwrap_or("");
-    let steps = v.get("steps").and_then(|s| s.as_array());
-
-    let mut sig = String::with_capacity(32);
-    sig.push_str(state);
-    let mut tools: Vec<ToolEntry> = Vec::new();
-    let mut last_tool = None;
-    let mut last_text = None;
-    if let Some(steps) = steps {
-        for step in steps.iter().take(MAX_TOOLS) {
-            let status = step.get("status").and_then(|s| s.as_str()).unwrap_or("");
-            sig.push('|');
-            sig.push_str(status);
-            let agent = step
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let state = v
+        .get("state")
+        .and_then(|s| s.as_str())
+        .unwrap_or("running")
+        .to_string();
+    let last_update_ms = v.get("lastUpdate").and_then(|m| m.as_i64());
+    let mut steps = Vec::new();
+    if let Some(records) = v.get("steps").and_then(|s| s.as_array()) {
+        for record in records {
+            let agent = record
                 .get("agent")
                 .and_then(|a| a.as_str())
-                .unwrap_or("agent");
-            let label = step
+                .unwrap_or("agent")
+                .to_string();
+            let label = record
                 .get("label")
                 .and_then(|l| l.as_str())
                 .filter(|l| !l.is_empty())
-                .unwrap_or(agent);
-            let title = step
+                .unwrap_or(&agent)
+                .to_string();
+            // recentTools entries are { tool, args, endMs }, most recent
+            // last; recentOutput is a list of output lines.
+            let last_tool = record
+                .get("recentTools")
+                .and_then(|t| t.as_array())
+                .and_then(|t| t.last())
+                .map(|t| {
+                    let tool = t.get("tool").and_then(|x| x.as_str()).unwrap_or("tool");
+                    let args = t.get("args").and_then(|x| x.as_str()).unwrap_or("");
+                    preview(&format!("{tool} {args}"))
+                })
+                .filter(|t| !t.is_empty());
+            let last_text = record
                 .get("recentOutput")
                 .and_then(|o| o.as_array())
-                .and_then(|o| o.first())
+                .and_then(|o| o.last())
                 .and_then(|o| o.as_str())
                 .filter(|o| !o.is_empty())
                 .map(preview);
-            if status == "running" && last_tool.is_none() {
-                last_tool = Some(agent.to_string());
-                last_text = title.clone();
-            }
-            let ok = match status {
-                "complete" => Some(true),
-                "failed" => Some(false),
-                _ => None,
-            };
-            tools.push(ToolEntry {
-                id: step
+            steps.push(PiStep {
+                run_id: record
                     .get("runId")
                     .and_then(|r| r.as_str())
-                    .unwrap_or(label)
+                    .unwrap_or_default()
                     .to_string(),
-                name: label.to_string(),
-                title,
-                ok,
+                parent_workflow_run_id: record
+                    .get("parentWorkflowRunId")
+                    .and_then(|r| r.as_str())
+                    .map(str::to_string),
+                agent,
+                label,
+                status: record
+                    .get("status")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("running")
+                    .to_string(),
+                model: record
+                    .get("model")
+                    .and_then(|m| m.as_str())
+                    .map(str::to_string),
+                tool_count: record
+                    .get("toolCount")
+                    .and_then(|c| c.as_u64())
+                    .map(|c| c as u32),
+                last_tool,
+                last_text,
+                session_name: record
+                    .get("sessionName")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                last_activity_ms: record.get("lastActivityAt").and_then(|m| m.as_i64()),
             });
         }
     }
-    if !tools.is_empty() {
-        snap.tool_count = tools.len() as u32;
-        snap.tools = tools;
-    }
-    if last_tool.is_some() {
-        snap.last_tool = last_tool;
-        snap.last_was_text = true;
-    }
-    if last_text.is_some() {
-        snap.last_text = last_text;
-    }
+    Some(PiStatus {
+        state,
+        last_update_ms,
+        steps,
+    })
+}
 
-    match state {
+/// pi-format only: fold a parsed status.json into the umbrella row's
+/// snapshot. Runs whose steps belong to this run's workflow fan out to
+/// their own panel rows (the umbrella keeps just the child count);
+/// single-child runs fold the one step's live detail (real tool count,
+/// recent tools) into the umbrella row itself. Returns true when the
+/// folded state changed materially.
+fn fold_umbrella_pi(status: &PiStatus, own: &[&PiStep], snap: &mut Snapshot) -> bool {
+    let mut sig = String::with_capacity(32);
+    sig.push_str(&status.state);
+    if own.is_empty() {
+        // Single-child run (or workflow before children spawn): the first
+        // step's live detail belongs to this row. recentTools only holds
+        // the runner's recent-window snapshot, so entries carry no ok
+        // state; the total count comes from the authoritative toolCount.
+        if let Some(step) = status.steps.first() {
+            sig.push_str(&format!("|{}|{:?}", step.status, step.tool_count));
+            if let Some(count) = step.tool_count {
+                snap.tool_count = count;
+            }
+            if let Some(tool) = &step.last_tool {
+                snap.last_tool = Some(tool.clone());
+                snap.last_was_text = false;
+            }
+            if let Some(text) = &step.last_text {
+                snap.last_text = Some(text.clone());
+                snap.last_was_text = true;
+            }
+        }
+    } else {
+        sig.push_str(&format!(
+            "|{}|{}",
+            own.len(),
+            own.first().map_or("", |s| s.status.as_str())
+        ));
+        snap.tool_count = own.len() as u32;
+        snap.tools.clear();
+    }
+    match status.state.as_str() {
         "running" => {}
         // Terminal states from the runner's own bookkeeping; the tailer's
         // transcript-based completion may fire first, but this catches
         // workflow runs whose events.jsonl ends with sparse records.
         "complete" | "failed" | "stopped" => {
             snap.done = true;
-            snap.pi_terminal_status = Some(state.to_string());
+            snap.pi_terminal_status = Some(status.state.clone());
         }
         _ => {}
     }
-
     let changed = snap.pi_sig.as_deref() != Some(sig.as_str());
     if changed {
         snap.pi_sig = Some(sig);
     }
     changed
+}
+
+/// Per-child fan-out state for one tailer. Keys are child run ids from
+/// status.json steps; the umbrella's `BackgroundAgentLaunched` rows stay
+/// as the workflow aggregate, and each child gets its own row carrying
+/// its own model, tool count, and terminal status.
+struct PiChildTrack {
+    sig: String,
+    status: String,
+    done: bool,
+}
+
+/// Map a status.json terminal step status to a panel status.
+fn pi_step_status(status: &str) -> BackgroundAgentStatus {
+    match status {
+        "failed" => BackgroundAgentStatus::Failed,
+        // The child was stopped or its session ended before finishing.
+        "stopped" => BackgroundAgentStatus::Detached,
+        _ => BackgroundAgentStatus::Completed,
+    }
+}
+
+fn pi_child_tool(step: &PiStep) -> crate::acp::state::BackgroundAgentTool {
+    crate::acp::state::BackgroundAgentTool {
+        name: step.label.clone(),
+        title: step.last_tool.clone(),
+        ok: match step.status.as_str() {
+            "complete" => Some(true),
+            "failed" => Some(false),
+            _ => None,
+        },
+    }
+}
+
+fn pi_child_active(step: &PiStep, now_ms: i64) -> BackgroundAgentStatus {
+    match step.last_activity_ms {
+        Some(ms) if now_ms.saturating_sub(ms) >= STALL_AFTER.as_millis() as i64 => {
+            BackgroundAgentStatus::Stalled
+        }
+        _ => BackgroundAgentStatus::Running,
+    }
+}
+
+/// Emit the launch/progress/completion events for one workflow child step.
+/// Returns true when the step state changed materially (counts as poll
+/// activity), Err when the session event channel closed.
+async fn emit_pi_child_event(
+    children: &mut HashMap<String, PiChildTrack>,
+    step: &PiStep,
+    tool_call_id: &str,
+    now_ms: i64,
+    event_tx: &Sender<Event>,
+) -> Result<bool, ()> {
+    let sig = format!("{}|{:?}", step.status, step.tool_count);
+    if !children.contains_key(&step.run_id) {
+        children.insert(
+            step.run_id.clone(),
+            PiChildTrack {
+                sig: sig.clone(),
+                status: step.status.clone(),
+                done: step.status != "running",
+            },
+        );
+        let description = format!("{} ({})", step.label, step.agent);
+        event_tx
+            .send(Event::BackgroundAgentLaunched {
+                agent_id: step.run_id.clone(),
+                tool_call_id: tool_call_id.to_string(),
+                description,
+                prompt: step.session_name.chars().take(2000).collect(),
+                model: step.model.clone().unwrap_or_default(),
+                output_file: String::new(),
+                output_format: None,
+                started_at: Utc::now(),
+            })
+            .await
+            .map_err(|_| ())?;
+        let _ = event_tx
+            .send(Event::BackgroundAgentProgress {
+                agent_id: step.run_id.clone(),
+                status: pi_child_active(step, now_ms),
+                tool_count: step.tool_count.unwrap_or(0),
+                tools: vec![pi_child_tool(step)],
+                last_tool: step.last_tool.clone(),
+                last_text: step.last_text.clone(),
+                at: Utc::now(),
+            })
+            .await
+            .map_err(|_| ())?;
+        return Ok(true);
+    }
+    let track = children.get_mut(&step.run_id).expect("just checked");
+    if track.done {
+        return Ok(false);
+    }
+    if step.status != "running" {
+        track.done = true;
+        track.status = step.status.clone();
+        let _ = event_tx
+            .send(completed(
+                step.run_id.clone(),
+                pi_step_status(&step.status),
+                vec![pi_child_tool(step)],
+                step.last_text.clone(),
+                None,
+            ))
+            .await
+            .map_err(|_| ())?;
+        return Ok(true);
+    }
+    if sig != track.sig {
+        track.sig = sig;
+        let _ = event_tx
+            .send(Event::BackgroundAgentProgress {
+                agent_id: step.run_id.clone(),
+                status: pi_child_active(step, now_ms),
+                tool_count: step.tool_count.unwrap_or(0),
+                tools: vec![pi_child_tool(step)],
+                last_tool: step.last_tool.clone(),
+                last_text: step.last_text.clone(),
+                at: Utc::now(),
+            })
+            .await
+            .map_err(|_| ())?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Flush children that never reported a terminal status when the workflow
+/// itself finished (the runner may race the last step's record).
+async fn flush_pi_children(
+    children: &mut HashMap<String, PiChildTrack>,
+    event_tx: &Sender<Event>,
+) -> Result<(), ()> {
+    let pending: Vec<(String, String)> = children
+        .iter()
+        .filter(|(_, t)| !t.done)
+        .map(|(id, t)| (id.clone(), t.status.clone()))
+        .collect();
+    for (id, status) in pending {
+        if let Some(track) = children.get_mut(&id) {
+            track.done = true;
+        }
+        let _ = event_tx
+            .send(completed(
+                id,
+                pi_step_status(&status),
+                Vec::new(),
+                None,
+                None,
+            ))
+            .await
+            .map_err(|_| ())?;
+    }
+    Ok(())
 }
 
 /// Read any bytes appended since `offset`, splitting on newlines and
@@ -996,58 +1276,197 @@ mod tests {
     /// `subagent.run.completed` is the definitive terminal marker written
     /// by the async runner; its `status` distinguishes success from
     /// failure so a failed run does not report Completed.
-    /// The async runner's `status.json` is the canonical live state for
-    /// workflow runs: steps become the tool entries, per-step status maps
-    /// to ok, and the top-level state decides terminality. A fresh
-    /// status.json with unchanged content must report no change so the
-    /// poll loop does not spam progress.
+    /// The async runner's `status.json` is the canonical live state.
+    /// Single-child runs fold the one step's live detail (real tool count,
+    /// recent tool) into the umbrella row; workflow children are excluded
+    /// from the umbrella because they fan out to their own rows. A fresh
+    /// read with unchanged content must not signal change.
     #[tokio::test]
-    async fn sync_pi_status_folds_steps_and_terminal_state() {
+    async fn read_pi_status_and_umbrella_fold() {
         let dir = tempfile::tempdir().unwrap();
         let run_dir = dir.path().join("run-1");
         tokio::fs::create_dir_all(&run_dir).await.unwrap();
         let transcript = run_dir.join("events.jsonl");
         tokio::fs::write(&transcript, "{}\n").await.unwrap();
         let source = TranscriptSource::Host;
+        let output_file = transcript.to_string_lossy().to_string();
 
-        let status = r#"{"runId":"run-1","mode":"workflow","state":"running","lastUpdate":1000,
-            "steps":[
-                {"agent":"delegate","label":"syntax","status":"complete","runId":"s1","recentOutput":["mapped the syntax"]},
-                {"agent":"delegate","label":"semantics","status":"running","runId":"s2","recentOutput":["reading checker"]},
-                {"agent":"delegate","label":"stdlib","status":"failed","runId":"s3"}
-            ]}"#;
+        let status = r#"{"runId":"run-1","mode":"single","state":"running","lastUpdate":1000,
+            "steps":[{"agent":"worker","status":"running","runId":"","toolCount":41,
+                      "recentTools":[{"tool":"read","args":"src/parser.rs"}],
+                      "recentOutput":["mapping the language surface"]}]}"#;
         tokio::fs::write(run_dir.join("status.json"), status)
             .await
             .unwrap();
 
+        let parsed = read_pi_status(&source, &output_file).await.unwrap();
+        assert_eq!(parsed.state, "running");
         let mut snap = Snapshot::default();
         snap.format = TranscriptFormat::PiEvents;
-        assert!(sync_pi_status(&source, &transcript.to_string_lossy(), &mut snap).await);
-        assert!(!snap.done, "running state must not complete");
-        assert_eq!(snap.tool_count, 3);
-        let tools = snapshot_tools(&snap);
-        assert_eq!(tools[0].name, "syntax");
-        assert_eq!(tools[0].ok, Some(true));
-        assert_eq!(tools[0].title.as_deref(), Some("mapped the syntax"));
-        assert_eq!(tools[1].ok, None);
-        assert_eq!(tools[2].ok, Some(false));
-        // The first running step drives the activity line.
-        assert_eq!(snap.last_tool.as_deref(), Some("delegate"));
-        assert_eq!(snap.last_text.as_deref(), Some("reading checker"));
+        let own: Vec<&PiStep> = parsed
+            .steps
+            .iter()
+            .filter(|s| s.parent_workflow_run_id.as_deref() == Some("run-1"))
+            .collect();
+        assert!(own.is_empty(), "single-mode steps must not fan out");
+        assert!(fold_umbrella_pi(&parsed, &own, &mut snap));
+        assert!(!snap.done);
+        assert_eq!(snap.tool_count, 41);
+        assert_eq!(snap.last_tool.as_deref(), Some("read src/parser.rs"));
+        assert_eq!(
+            snap.last_text.as_deref(),
+            Some("mapping the language surface")
+        );
 
         // Unchanged state → no change signal (no progress spam).
-        assert!(!sync_pi_status(&source, &transcript.to_string_lossy(), &mut snap).await);
+        let parsed = read_pi_status(&source, &output_file).await.unwrap();
+        let own: Vec<&PiStep> = parsed
+            .steps
+            .iter()
+            .filter(|s| s.parent_workflow_run_id.as_deref() == Some("run-1"))
+            .collect();
+        assert!(!fold_umbrella_pi(&parsed, &own, &mut snap));
 
-        // Terminal state flips the snapshot to done with a mappable status.
-        tokio::fs::write(
-            run_dir.join("status.json"),
-            r#"{"runId":"run-1","mode":"workflow","state":"failed","lastUpdate":2000,"steps":[]}"#,
-        )
-        .await
-        .unwrap();
-        assert!(sync_pi_status(&source, &transcript.to_string_lossy(), &mut snap).await);
+        // Workflow children are excluded from the umbrella fold; the
+        // umbrella counts them but keeps no tool entries.
+        let status = r#"{"runId":"run-2","mode":"workflow","state":"running","lastUpdate":2000,
+            "steps":[
+                {"agent":"delegate","label":"syntax","status":"complete","runId":"s1","parentWorkflowRunId":"run-2","model":"m1"},
+                {"agent":"delegate","label":"semantics","status":"running","runId":"s2","parentWorkflowRunId":"run-2","model":"m2"}
+            ]}"#;
+        tokio::fs::write(run_dir.join("status.json"), status)
+            .await
+            .unwrap();
+        let parsed = read_pi_status(&source, &output_file).await.unwrap();
+        assert_eq!(parsed.steps.len(), 2);
+        let own: Vec<&PiStep> = parsed
+            .steps
+            .iter()
+            .filter(|s| s.parent_workflow_run_id.as_deref() == Some("run-1"))
+            .collect();
+        assert!(own.is_empty(), "another workflow's children must not match");
+        let own: Vec<&PiStep> = parsed
+            .steps
+            .iter()
+            .filter(|s| s.parent_workflow_run_id.as_deref() == Some("run-2"))
+            .collect();
+        assert_eq!(own.len(), 2);
+        let mut snap = Snapshot::default();
+        snap.format = TranscriptFormat::PiEvents;
+        assert!(fold_umbrella_pi(&parsed, &own, &mut snap));
+        assert_eq!(snap.tool_count, 2);
+        assert!(snapshot_tools(&snap).is_empty(), "children own their rows");
+
+        // Terminal workflow state flips the snapshot to done, mappable.
+        let status =
+            r#"{"runId":"run-2","mode":"workflow","state":"failed","lastUpdate":3000,"steps":[]}"#;
+        tokio::fs::write(run_dir.join("status.json"), status)
+            .await
+            .unwrap();
+        let parsed = read_pi_status(&source, &output_file).await.unwrap();
+        let own: Vec<&PiStep> = parsed
+            .steps
+            .iter()
+            .filter(|s| s.parent_workflow_run_id.as_deref() == Some("run-2"))
+            .collect();
+        assert!(fold_umbrella_pi(&parsed, &own, &mut snap));
         assert!(snap.done);
         assert_eq!(snap.pi_terminal_status.as_deref(), Some("failed"));
+    }
+
+    /// Workflow children fan out to their own panel rows: a Launched with
+    /// the child's own run id, model, and prompt, then Progress ticks, and
+    /// a terminal step status maps to a terminal panel status.
+    #[tokio::test]
+    async fn pi_children_fan_out_to_own_rows() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let mut children: HashMap<String, PiChildTrack> = HashMap::new();
+        let step = PiStep {
+            run_id: "s1".into(),
+            parent_workflow_run_id: Some("run-2".into()),
+            agent: "delegate".into(),
+            label: "syntax".into(),
+            status: "running".into(),
+            model: Some("syn-large-text".into()),
+            tool_count: Some(7),
+            last_tool: Some("read src/parser.rs".into()),
+            last_text: Some("reading parser".into()),
+            session_name: "Map the syntax".into(),
+            last_activity_ms: Some(1000),
+        };
+        let now_ms = 1500;
+
+        // First sighting: Launched + initial Progress.
+        assert!(
+            emit_pi_child_event(&mut children, &step, "tc1", now_ms, &tx)
+                .await
+                .unwrap()
+        );
+        let Event::BackgroundAgentLaunched {
+            agent_id,
+            tool_call_id,
+            description,
+            model,
+            prompt,
+            ..
+        } = rx.recv().await.unwrap()
+        else {
+            panic!("expected Launched");
+        };
+        assert_eq!(agent_id, "s1");
+        assert_eq!(tool_call_id, "tc1");
+        assert_eq!(description, "syntax (delegate)");
+        assert_eq!(model, "syn-large-text");
+        assert_eq!(prompt, "Map the syntax");
+        let Event::BackgroundAgentProgress {
+            tool_count, tools, ..
+        } = rx.recv().await.unwrap()
+        else {
+            panic!("expected Progress");
+        };
+        assert_eq!(tool_count, 7);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "syntax");
+        assert_eq!(tools[0].ok, None);
+
+        // Unchanged → no events.
+        assert!(
+            !emit_pi_child_event(&mut children, &step, "tc1", now_ms, &tx)
+                .await
+                .unwrap()
+        );
+
+        // Tool count tick → Progress with the child's own entry.
+        let mut step2 = step.clone();
+        step2.tool_count = Some(9);
+        assert!(
+            emit_pi_child_event(&mut children, &step2, "tc1", now_ms, &tx)
+                .await
+                .unwrap()
+        );
+        let Event::BackgroundAgentProgress { tool_count, .. } = rx.recv().await.unwrap() else {
+            panic!("expected Progress");
+        };
+        assert_eq!(tool_count, 9);
+
+        // Terminal failure → Completed with Failed.
+        step2.status = "failed".into();
+        assert!(
+            emit_pi_child_event(&mut children, &step2, "tc1", now_ms, &tx)
+                .await
+                .unwrap()
+        );
+        let Event::BackgroundAgentCompleted { status, .. } = rx.recv().await.unwrap() else {
+            panic!("expected Completed");
+        };
+        assert_eq!(status, BackgroundAgentStatus::Failed);
+
+        // Done children stay quiet.
+        assert!(
+            !emit_pi_child_event(&mut children, &step2, "tc1", now_ms, &tx)
+                .await
+                .unwrap()
+        );
     }
 
     #[test]
