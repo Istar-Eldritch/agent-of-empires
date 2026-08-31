@@ -918,8 +918,9 @@ export interface AcpState {
 }
 
 /** Lifecycle status of an async background sub-agent. Mirrors the Rust
- *  `BackgroundAgentStatus`. `completed` is the only clean-finish state. */
-export type BackgroundAgentStatus = "running" | "stalled" | "completed" | "detached" | "error";
+ *  `BackgroundAgentStatus`. `completed` is the only clean-finish state;
+ *  `failed` is a terminal failure reported by adapters that know it (pi). */
+export type BackgroundAgentStatus = "running" | "stalled" | "completed" | "failed" | "detached" | "error";
 
 /** One tool call a background sub-agent made, for the per-agent tool list.
  *  Mirrors the Rust `BackgroundAgentTool`. */

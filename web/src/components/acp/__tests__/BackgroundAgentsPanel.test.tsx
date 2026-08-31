@@ -130,6 +130,13 @@ describe("BackgroundAgentsPanel", () => {
     expect(queryByRole("button", { name: /stop/i })).toBeNull();
   });
 
+  it("renders a failed agent with an error label and no Stop button", () => {
+    agentsMock.mockReturnValue([agent({ status: "failed", endedAt: new Date().toISOString() })]);
+    const { getByText, queryByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    expect(getByText("failed")).toBeTruthy();
+    expect(queryByRole("button", { name: /stop/i })).toBeNull();
+  });
+
   it("opens a details modal showing the full prompt, result, and tools", () => {
     agentsMock.mockReturnValue([
       agent({
