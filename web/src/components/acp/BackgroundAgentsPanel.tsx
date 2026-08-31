@@ -134,7 +134,7 @@ function AgentRow({ agent }: { agent: BackgroundAgent }) {
       {open && (
         <div className="space-y-2 border-t border-surface-800 bg-surface-900/30 px-3 py-2 pl-9 text-[11px]">
           {agent.warning && <Field label="warning" value={agent.warning} tone="warn" />}
-          <Field label="model" value={agent.model || "unknown"} mono />
+          <Field label="model" value={agent.model || "—"} mono />
           {agent.tools.length > 0 && <ToolList tools={agent.tools} />}
           <Field label="prompt" value={agent.prompt || "(none)"} clamp />
           {agent.result && <Field label="result" value={agent.result} clamp />}
@@ -183,7 +183,7 @@ function AgentDetailModal({ agent, onClose }: { agent: BackgroundAgent; onClose:
         </div>
         <div className="space-y-3 overflow-y-auto px-4 py-3 text-[12px]">
           {agent.warning && <Field label="warning" value={agent.warning} tone="warn" />}
-          <Field label="model" value={agent.model || "unknown"} mono />
+          <Field label="model" value={agent.model || "—"} mono />
           {agent.tools.length > 0 && <ToolList tools={agent.tools} />}
           <Field label="prompt" value={agent.prompt || "(none)"} />
           {agent.result && <Field label="result" value={agent.result} />}

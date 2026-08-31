@@ -278,9 +278,15 @@ struct Snapshot {
     unresolved_tools: HashSet<String>,
     /// Declared transcript format; selects the line parser.
     format: TranscriptFormat,
-    /// pi-format only: terminal status from `subagent.run.completed`
-    /// ("complete" vs "failed"), so a failed run does not report Completed.
+    /// pi-format only: terminal status from `subagent.run.completed` /
+    /// `subagent.workflow.completed` / status.json ("complete" vs "failed"
+    /// vs "stopped"), so a failed run does not report Completed.
     pi_terminal_status: Option<String>,
+    /// pi-format only: signature of the last status.json state folded in
+    /// (state + per-step statuses). Lets the poll loop emit progress when
+    /// the runner's canonical state changes even with no new transcript
+    /// lines. Never sent on the wire.
+    pi_sig: Option<String>,
 }
 
 async fn run_tailer(
@@ -322,8 +328,11 @@ async fn run_tailer(
     let mut stalled_emitted = false;
 
     loop {
-        let grew =
+        let mut grew =
             read_new_lines(&source, &output_file, &mut offset, &mut line_buf, &mut snap).await;
+        if format == TranscriptFormat::PiEvents {
+            grew |= sync_pi_status(&source, &output_file, &mut snap).await;
+        }
         let now = Utc::now();
         if grew {
             last_growth = now;
@@ -337,10 +346,12 @@ async fn run_tailer(
             // via end_turn, which always means success here. The idle
             // timeout below can also infer completion; see
             // infer_idle_outcome.
-            let status = if snap.pi_terminal_status.as_deref() == Some("failed") {
-                BackgroundAgentStatus::Failed
-            } else {
-                BackgroundAgentStatus::Completed
+            let status = match snap.pi_terminal_status.as_deref() {
+                Some("failed") => BackgroundAgentStatus::Failed,
+                // The run was stopped or its parent session went away
+                // before finishing; not a success, not a failure.
+                Some("stopped") => BackgroundAgentStatus::Detached,
+                _ => BackgroundAgentStatus::Completed,
             };
             let warning = format_warning(&snap);
             let _ = event_tx
@@ -405,6 +416,108 @@ async fn run_tailer(
             _ = event_tx.closed() => return,
         }
     }
+}
+
+/// pi-format only: poll the run's `status.json` (sibling of the
+/// transcript's events.jsonl) and fold the async runner's canonical live
+/// state into the snapshot. Workflow steps become the tool entries (label,
+/// agent, per-step status), the top-level `state` decides terminality, and
+/// a fresh `lastUpdate` counts as activity, so the long quiet stretches
+/// between sparse `subagent.workflow.*` transcript records do not read as
+/// stalled. Returns true when the folded state changed materially.
+async fn sync_pi_status(source: &TranscriptSource, output_file: &str, snap: &mut Snapshot) -> bool {
+    let Some(dir) = std::path::Path::new(output_file).parent() else {
+        return false;
+    };
+    let status_path = dir.join("status.json").to_string_lossy().into_owned();
+    // Whole-file read from offset 0; status.json is a small snapshot the
+    // runner rewrites in place, not an append-only log.
+    let bytes = source.read_from(&status_path, 0).await;
+    if bytes.is_empty() {
+        return false;
+    }
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    let state = v.get("state").and_then(|s| s.as_str()).unwrap_or("");
+    let steps = v.get("steps").and_then(|s| s.as_array());
+
+    let mut sig = String::with_capacity(32);
+    sig.push_str(state);
+    let mut tools: Vec<ToolEntry> = Vec::new();
+    let mut last_tool = None;
+    let mut last_text = None;
+    if let Some(steps) = steps {
+        for step in steps.iter().take(MAX_TOOLS) {
+            let status = step.get("status").and_then(|s| s.as_str()).unwrap_or("");
+            sig.push('|');
+            sig.push_str(status);
+            let agent = step
+                .get("agent")
+                .and_then(|a| a.as_str())
+                .unwrap_or("agent");
+            let label = step
+                .get("label")
+                .and_then(|l| l.as_str())
+                .filter(|l| !l.is_empty())
+                .unwrap_or(agent);
+            let title = step
+                .get("recentOutput")
+                .and_then(|o| o.as_array())
+                .and_then(|o| o.first())
+                .and_then(|o| o.as_str())
+                .filter(|o| !o.is_empty())
+                .map(preview);
+            if status == "running" && last_tool.is_none() {
+                last_tool = Some(agent.to_string());
+                last_text = title.clone();
+            }
+            let ok = match status {
+                "complete" => Some(true),
+                "failed" => Some(false),
+                _ => None,
+            };
+            tools.push(ToolEntry {
+                id: step
+                    .get("runId")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or(label)
+                    .to_string(),
+                name: label.to_string(),
+                title,
+                ok,
+            });
+        }
+    }
+    if !tools.is_empty() {
+        snap.tool_count = tools.len() as u32;
+        snap.tools = tools;
+    }
+    if last_tool.is_some() {
+        snap.last_tool = last_tool;
+        snap.last_was_text = true;
+    }
+    if last_text.is_some() {
+        snap.last_text = last_text;
+    }
+
+    match state {
+        "running" => {}
+        // Terminal states from the runner's own bookkeeping; the tailer's
+        // transcript-based completion may fire first, but this catches
+        // workflow runs whose events.jsonl ends with sparse records.
+        "complete" | "failed" | "stopped" => {
+            snap.done = true;
+            snap.pi_terminal_status = Some(state.to_string());
+        }
+        _ => {}
+    }
+
+    let changed = snap.pi_sig.as_deref() != Some(sig.as_str());
+    if changed {
+        snap.pi_sig = Some(sig);
+    }
+    changed
 }
 
 /// Read any bytes appended since `offset`, splitting on newlines and
@@ -602,6 +715,16 @@ fn fold_pi_line(v: &serde_json::Value, snap: &mut Snapshot) {
             }
         }
         // Definitive lifecycle markers written by the async runner.
+        // Workflows end with `subagent.workflow.completed` (state:
+        // complete/failed/stopped); plain runs with `subagent.run.completed`
+        // (status: complete/failed).
+        "subagent.workflow.completed" => {
+            snap.parsed_any = true;
+            snap.done = true;
+            if let Some(state) = v.get("state").and_then(|s| s.as_str()) {
+                snap.pi_terminal_status = Some(state.to_string());
+            }
+        }
         "subagent.run.completed" => {
             snap.parsed_any = true;
             snap.done = true;
@@ -873,6 +996,60 @@ mod tests {
     /// `subagent.run.completed` is the definitive terminal marker written
     /// by the async runner; its `status` distinguishes success from
     /// failure so a failed run does not report Completed.
+    /// The async runner's `status.json` is the canonical live state for
+    /// workflow runs: steps become the tool entries, per-step status maps
+    /// to ok, and the top-level state decides terminality. A fresh
+    /// status.json with unchanged content must report no change so the
+    /// poll loop does not spam progress.
+    #[tokio::test]
+    async fn sync_pi_status_folds_steps_and_terminal_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path().join("run-1");
+        tokio::fs::create_dir_all(&run_dir).await.unwrap();
+        let transcript = run_dir.join("events.jsonl");
+        tokio::fs::write(&transcript, "{}\n").await.unwrap();
+        let source = TranscriptSource::Host;
+
+        let status = r#"{"runId":"run-1","mode":"workflow","state":"running","lastUpdate":1000,
+            "steps":[
+                {"agent":"delegate","label":"syntax","status":"complete","runId":"s1","recentOutput":["mapped the syntax"]},
+                {"agent":"delegate","label":"semantics","status":"running","runId":"s2","recentOutput":["reading checker"]},
+                {"agent":"delegate","label":"stdlib","status":"failed","runId":"s3"}
+            ]}"#;
+        tokio::fs::write(run_dir.join("status.json"), status)
+            .await
+            .unwrap();
+
+        let mut snap = Snapshot::default();
+        snap.format = TranscriptFormat::PiEvents;
+        assert!(sync_pi_status(&source, &transcript.to_string_lossy(), &mut snap).await);
+        assert!(!snap.done, "running state must not complete");
+        assert_eq!(snap.tool_count, 3);
+        let tools = snapshot_tools(&snap);
+        assert_eq!(tools[0].name, "syntax");
+        assert_eq!(tools[0].ok, Some(true));
+        assert_eq!(tools[0].title.as_deref(), Some("mapped the syntax"));
+        assert_eq!(tools[1].ok, None);
+        assert_eq!(tools[2].ok, Some(false));
+        // The first running step drives the activity line.
+        assert_eq!(snap.last_tool.as_deref(), Some("delegate"));
+        assert_eq!(snap.last_text.as_deref(), Some("reading checker"));
+
+        // Unchanged state → no change signal (no progress spam).
+        assert!(!sync_pi_status(&source, &transcript.to_string_lossy(), &mut snap).await);
+
+        // Terminal state flips the snapshot to done with a mappable status.
+        tokio::fs::write(
+            run_dir.join("status.json"),
+            r#"{"runId":"run-1","mode":"workflow","state":"failed","lastUpdate":2000,"steps":[]}"#,
+        )
+        .await
+        .unwrap();
+        assert!(sync_pi_status(&source, &transcript.to_string_lossy(), &mut snap).await);
+        assert!(snap.done);
+        assert_eq!(snap.pi_terminal_status.as_deref(), Some("failed"));
+    }
+
     #[test]
     fn fold_pi_events_run_completed_marks_done_with_status() {
         let cases = [("complete", "complete"), ("failed", "failed")];
