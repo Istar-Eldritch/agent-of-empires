@@ -896,6 +896,10 @@ pub enum Event {
         /// `protocol::strip_transcript_path`.
         #[serde(default)]
         output_file: String,
+        /// Transcript format hint for the tailer (Claude default;
+        /// "pi-events" selects the pi-subagents async run parser).
+        #[serde(default, skip_serializing)]
+        output_format: Option<String>,
         started_at: DateTime<Utc>,
     },
     /// Throttled snapshot of a running background sub-agent's transcript
@@ -1549,6 +1553,7 @@ impl AcpState {
                 prompt,
                 model,
                 output_file: _,
+                output_format: _,
                 started_at,
             } => {
                 let record = BackgroundAgentRecord {
@@ -1812,6 +1817,7 @@ mod tests {
             prompt: "do the thing".into(),
             model: "claude-opus-4-8".into(),
             output_file: "/tmp/a1.output".into(),
+            output_format: None,
             started_at: Utc::now(),
         })
         .unwrap();
