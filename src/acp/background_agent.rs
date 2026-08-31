@@ -172,9 +172,31 @@ impl Drop for ActiveGuard {
 /// closes. `output_file` is the launch payload's transcript path.
 /// `active` is the connection's in-flight background-agent set: the id is
 /// inserted here and removed when the tailer task exits (see `ActiveGuard`).
+/// Transcript on-disk format. Claude Code's async-Task transcripts and
+/// pi-subagents' async run `events.jsonl` carry the same information in
+/// different record shapes, so the tailer folds lines through the parser
+/// matching the launch's declared format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TranscriptFormat {
+    #[default]
+    Claude,
+    /// pi-subagents async run `events.jsonl` (pi session event stream).
+    PiEvents,
+}
+
+impl TranscriptFormat {
+    fn from_opt_str(value: Option<&str>) -> Self {
+        match value {
+            Some("pi-events") => Self::PiEvents,
+            _ => Self::Claude,
+        }
+    }
+}
+
 pub fn spawn_tailer(
     agent_id: String,
     output_file: String,
+    output_format: Option<String>,
     source: TranscriptSource,
     event_tx: Sender<Event>,
     active: Arc<Mutex<HashSet<String>>>,
@@ -208,7 +230,8 @@ pub fn spawn_tailer(
             active,
             agent_id: agent_id.clone(),
         };
-        run_tailer(agent_id, output_file, source, event_tx).await;
+        let format = TranscriptFormat::from_opt_str(output_format.as_deref());
+        run_tailer(agent_id, output_file, format, source, event_tx).await;
     });
 }
 
@@ -253,11 +276,17 @@ struct Snapshot {
     /// payload; completion state must stay accurate past that cap, so it
     /// cannot be derived from the truncated list. Never sent on the wire.
     unresolved_tools: HashSet<String>,
+    /// Declared transcript format; selects the line parser.
+    format: TranscriptFormat,
+    /// pi-format only: terminal status from `subagent.run.completed`
+    /// ("complete" vs "failed"), so a failed run does not report Completed.
+    pi_terminal_status: Option<String>,
 }
 
 async fn run_tailer(
     agent_id: String,
     output_file: String,
+    format: TranscriptFormat,
     source: TranscriptSource,
     event_tx: Sender<Event>,
 ) {
@@ -287,6 +316,7 @@ async fn run_tailer(
     let mut offset: u64 = 0;
     let mut line_buf = String::new();
     let mut snap = Snapshot::default();
+    snap.format = format;
     let mut last_progress = Utc::now() - chrono::Duration::seconds(10);
     let mut last_growth = Utc::now();
     let mut stalled_emitted = false;
@@ -301,13 +331,22 @@ async fn run_tailer(
         }
 
         if snap.done {
-            // The explicit end_turn completion path. The idle timeout
-            // below can also infer completion; see infer_idle_outcome.
+            // The explicit completion path. For pi-format transcripts the
+            // runner's `subagent.run.completed` record carries the true
+            // status ("complete" vs "failed"); Claude transcripts only end
+            // via end_turn, which always means success here. The idle
+            // timeout below can also infer completion; see
+            // infer_idle_outcome.
+            let status = if snap.pi_terminal_status.as_deref() == Some("failed") {
+                BackgroundAgentStatus::Failed
+            } else {
+                BackgroundAgentStatus::Completed
+            };
             let warning = format_warning(&snap);
             let _ = event_tx
                 .send(completed(
                     agent_id,
-                    BackgroundAgentStatus::Completed,
+                    status,
                     snapshot_tools(&snap),
                     snap.result.clone(),
                     warning,
@@ -405,6 +444,10 @@ fn fold_line(line: &str, snap: &mut Snapshot) {
         snap.parse_errors += 1;
         return;
     };
+    if snap.format == TranscriptFormat::PiEvents {
+        fold_pi_line(&v, snap);
+        return;
+    }
     let kind = v.get("type").and_then(|t| t.as_str());
     let Some(msg) = v.get("message") else {
         return;
@@ -446,6 +489,126 @@ fn fold_line(line: &str, snap: &mut Snapshot) {
             }
         }
         // attachment / system bookkeeping lines: ignore.
+        _ => {}
+    }
+}
+
+/// Fold one pi-subagents async-run `events.jsonl` record into the snapshot.
+/// Same information as the Claude parser, different record shapes:
+/// `tool_execution_start/end` carry the tool call lifecycle (with
+/// `toolCallId`/`toolName` at the top level), `message_end` carries full
+/// messages, and `subagent.run.completed` is the definitive terminal marker.
+fn fold_pi_line(v: &serde_json::Value, snap: &mut Snapshot) {
+    let kind = v.get("type").and_then(|t| t.as_str());
+    let Some(kind) = kind else { return };
+    match kind {
+        "tool_execution_start" => {
+            snap.parsed_any = true;
+            snap.tool_count += 1;
+            let name = v
+                .get("toolName")
+                .and_then(|n| n.as_str())
+                .unwrap_or("tool")
+                .to_string();
+            snap.last_tool = Some(name.clone());
+            snap.last_was_text = false;
+            let id = v
+                .get("toolCallId")
+                .and_then(|i| i.as_str())
+                .unwrap_or_default()
+                .to_string();
+            snap.unresolved_tools.insert(id.clone());
+            if snap.tools.len() >= MAX_TOOLS {
+                return;
+            }
+            let title = v
+                .get("args")
+                .and_then(|a| a.as_object())
+                .map(|obj| {
+                    for key in [
+                        "command",
+                        "file_path",
+                        "path",
+                        "pattern",
+                        "url",
+                        "query",
+                        "description",
+                    ] {
+                        if let Some(val) = obj.get(key).and_then(|v| v.as_str()) {
+                            if !val.is_empty() {
+                                return Some(preview(val));
+                            }
+                        }
+                    }
+                    None
+                })
+                .unwrap_or(None);
+            snap.tools.push(ToolEntry {
+                id,
+                name,
+                title,
+                ok: None,
+            });
+        }
+        "tool_execution_end" => {
+            let id = v
+                .get("toolCallId")
+                .and_then(|i| i.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let is_error = v.get("isError").and_then(|e| e.as_bool()).unwrap_or(false);
+            snap.unresolved_tools.remove(&id);
+            if let Some(entry) = snap.tools.iter_mut().find(|t| t.id == id) {
+                entry.ok = Some(!is_error);
+            }
+        }
+        "message_end" => {
+            let Some(message) = v.get("message") else {
+                return;
+            };
+            let role = message.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            if role != "assistant" {
+                return;
+            }
+            let end_turn = message.get("stopReason").and_then(|s| s.as_str()) == Some("end_turn");
+            let mut saw_text = false;
+            if let Some(blocks) = message.get("content").and_then(|c| c.as_array()) {
+                for block in blocks {
+                    match block.get("type").and_then(|t| t.as_str()) {
+                        Some("text") => {
+                            if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                let text = preview(text);
+                                if !text.is_empty() {
+                                    saw_text = true;
+                                    snap.last_text = Some(text.clone());
+                                    if end_turn {
+                                        snap.result = Some(text);
+                                    }
+                                }
+                            }
+                        }
+                        Some("toolCall") | Some("tool_use") => {
+                            snap.last_was_text = false;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if saw_text {
+                snap.last_was_text = true;
+            }
+            if end_turn {
+                snap.done = true;
+            }
+        }
+        // Definitive lifecycle markers written by the async runner.
+        "subagent.run.completed" => {
+            snap.parsed_any = true;
+            snap.done = true;
+            if let Some(status) = v.get("status").and_then(|s| s.as_str()) {
+                snap.pi_terminal_status = Some(status.to_string());
+            }
+        }
         _ => {}
     }
 }
@@ -661,6 +824,70 @@ mod tests {
         assert_eq!(snap.last_tool.as_deref(), Some("Bash"));
         assert_eq!(snap.last_text.as_deref(), Some("working on it"));
         assert!(!snap.done);
+    }
+
+    /// pi-subagents async runs announce their launch with the claudeCode
+    /// envelope and `outputFormat: "pi-events"`; the tailer must fold the
+    /// run's `events.jsonl` records (different shapes from Claude
+    /// transcripts) into the same snapshot state.
+    #[test]
+    fn fold_pi_events_tracks_tools_and_terminal_status() {
+        let mut snap = Snapshot::default();
+        snap.format = TranscriptFormat::PiEvents;
+        fold_line(
+            r#"{"type":"tool_execution_start","toolCallId":"t1","toolName":"read","args":{"path":"AGENTS.md"},"observedAt":1000}"#,
+            &mut snap,
+        );
+        fold_line(
+            r#"{"type":"tool_execution_start","toolCallId":"t2","toolName":"bash","args":{"command":"ls -la"},"observedAt":1001}"#,
+            &mut snap,
+        );
+        fold_line(
+            r#"{"type":"tool_execution_end","toolCallId":"t1","toolName":"read","isError":false,"observedAt":1002}"#,
+            &mut snap,
+        );
+        fold_line(
+            r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"working on it"}],"stopReason":"toolUse"}}"#,
+            &mut snap,
+        );
+        assert_eq!(snap.tool_count, 2);
+        assert_eq!(snap.last_tool.as_deref(), Some("bash"));
+        assert_eq!(snap.last_text.as_deref(), Some("working on it"));
+        assert!(!snap.done);
+        let tools = snapshot_tools(&snap);
+        assert_eq!(tools[0].name, "read");
+        assert_eq!(tools[0].title.as_deref(), Some("AGENTS.md"));
+        assert_eq!(tools[0].ok, Some(true));
+        assert_eq!(tools[1].title.as_deref(), Some("ls -la"));
+        assert_eq!(tools[1].ok, None);
+
+        // End_turn final text completes with the result.
+        fold_line(
+            r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"final report"}],"stopReason":"end_turn"}}"#,
+            &mut snap,
+        );
+        assert!(snap.done);
+        assert_eq!(snap.result.as_deref(), Some("final report"));
+    }
+
+    /// `subagent.run.completed` is the definitive terminal marker written
+    /// by the async runner; its `status` distinguishes success from
+    /// failure so a failed run does not report Completed.
+    #[test]
+    fn fold_pi_events_run_completed_marks_done_with_status() {
+        let cases = [("complete", "complete"), ("failed", "failed")];
+        for (record_status, expected) in cases {
+            let mut snap = Snapshot::default();
+            snap.format = TranscriptFormat::PiEvents;
+            fold_line(
+                &format!(
+                    r#"{{"type":"subagent.run.completed","runId":"r1","status":"{record_status}","durationMs":1000}}"#
+                ),
+                &mut snap,
+            );
+            assert!(snap.done);
+            assert_eq!(snap.pi_terminal_status.as_deref(), Some(expected));
+        }
     }
 
     #[test]

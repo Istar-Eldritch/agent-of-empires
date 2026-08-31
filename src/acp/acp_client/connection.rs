@@ -619,6 +619,7 @@ pub(super) async fn run_connection_task<W, R>(
                         if let Event::BackgroundAgentLaunched {
                             agent_id,
                             output_file,
+                            output_format,
                             ..
                         } = &event
                         {
@@ -626,6 +627,7 @@ pub(super) async fn run_connection_task<W, R>(
                                 crate::acp::background_agent::spawn_tailer(
                                     agent_id.clone(),
                                     output_file.clone(),
+                                    output_format.clone(),
                                     bg_transcript_source.clone(),
                                     event_tx.clone(),
                                     between_prompt_bg_agents.clone(),

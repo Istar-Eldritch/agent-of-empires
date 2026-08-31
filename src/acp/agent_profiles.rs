@@ -231,10 +231,13 @@ pub const VIBE: AgentProfile = AgentProfile {
     yolo_mode_id: None,
 };
 
-/// Pi coding agent via `pi-acp`. Defaults until verified.
+/// Pi coding agent via `pi-acp`. Subagent child tool calls arrive as ACP
+/// tool_call events synthesized by pi-acp from pi-subagents' streamed
+/// childToolEvents frames, each carrying `_meta.pi.parentToolUseId` pointing
+/// at the parent subagent tool call (see pi-acp translate/subagent.ts).
 pub const PI: AgentProfile = AgentProfile {
     key: "pi",
-    parent_meta_namespaces: &[],
+    parent_meta_namespaces: &["pi"],
     clear_aliases: &[],
     clear_requires_driven_reset: false,
     supports_exit_plan_mode: false,
@@ -596,8 +599,10 @@ mod tests {
         // These adapters' tool-call parent linkage is undocumented; pin the
         // conservative empty namespace so a future edit cannot silently
         // start claiming hierarchy (prime-agent's _meta envelope is
-        // session-info only today).
-        for profile in [&VIBE, &PI, &OMP, &KIMI, &PRIME_AGENT] {
+        // session-info only today). PI now carries `pi` linkage emitted by
+        // pi-acp from pi-subagents child frames, so it is intentionally
+        // excluded here.
+        for profile in [&VIBE, &OMP, &KIMI, &PRIME_AGENT] {
             assert!(
                 profile.parent_meta_namespaces.is_empty(),
                 "{}: parent linkage must stay off until observed",
