@@ -886,7 +886,7 @@ impl AcpClient {
             .send(ClientCmd::ResumeBackgroundTailing(
                 launches
                     .into_iter()
-                    .map(|l| (l.agent_id, l.output_file))
+                    .map(|l| (l.agent_id, l.tool_call_id, l.output_file, l.output_format))
                     .collect(),
             ))
             .await

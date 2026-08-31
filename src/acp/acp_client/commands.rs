@@ -53,11 +53,12 @@ pub(super) enum ClientCmd {
         deadline: tokio::time::Instant,
         respond_to: oneshot::Sender<ResetSessionOutcome>,
     },
-    /// Spawn a tailer for each `(agent_id, output_file)` pair: sub-agents
-    /// launched by a previous daemon that survived the restart. Issued by
-    /// `Supervisor::attach` once, right after the connection is up, so
-    /// tracking resumes instead of the panel showing them as detached.
-    ResumeBackgroundTailing(Vec<(String, String)>),
+    /// Spawn a tailer for each `(agent_id, tool_call_id, output_file,
+    /// output_format)` tuple: sub-agents launched by a previous daemon that
+    /// survived the restart. Issued by `Supervisor::attach` once, right
+    /// after the connection is up, so tracking resumes instead of the panel
+    /// showing them as detached.
+    ResumeBackgroundTailing(Vec<(String, String, String, Option<String>)>),
     #[cfg(test)]
     FlushForTest(oneshot::Sender<()>),
     Shutdown,

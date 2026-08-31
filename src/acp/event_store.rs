@@ -154,7 +154,9 @@ pub struct RateLimitPark {
 #[derive(Debug, Clone)]
 pub struct UnresolvedBackgroundAgentLaunch {
     pub agent_id: String,
+    pub tool_call_id: String,
     pub output_file: String,
+    pub output_format: Option<String>,
 }
 
 /// SQLite-backed structured view event log. One row per (session_id, seq).
@@ -1665,7 +1667,9 @@ impl EventStore {
         };
         let mut stmt = match conn.prepare(
             "SELECT json_extract(event_json, '$.BackgroundAgentLaunched.agent_id'),
-                    json_extract(event_json, '$.BackgroundAgentLaunched.output_file')
+                    json_extract(event_json, '$.BackgroundAgentLaunched.tool_call_id'),
+                    json_extract(event_json, '$.BackgroundAgentLaunched.output_file'),
+                    json_extract(event_json, '$.BackgroundAgentLaunched.output_format')
              FROM acp_events
              WHERE session_id = ?1
                AND discriminant = 'BackgroundAgentLaunched'
@@ -1688,7 +1692,9 @@ impl EventStore {
         let rows = match stmt.query_map(params![session_id], |row| {
             Ok(UnresolvedBackgroundAgentLaunch {
                 agent_id: row.get(0)?,
-                output_file: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                tool_call_id: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                output_file: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                output_format: row.get(3)?,
             })
         }) {
             Ok(r) => r,

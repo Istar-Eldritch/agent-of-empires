@@ -135,18 +135,21 @@ pub(super) fn resolved_acp_config(
     }
 }
 
-/// Spawn a tailer for each `(agent_id, output_file)` pair a resume sweep
-/// found unresolved on attach. Shared by both command-loop arms.
+/// Spawn a tailer for each `(agent_id, tool_call_id, output_file,
+/// output_format)` tuple a resume sweep found unresolved on attach. Shared
+/// by both command-loop arms.
 fn handle_resume_background_tailing_cmd(
-    launches: Vec<(String, String)>,
+    launches: Vec<(String, String, String, Option<String>)>,
     bg_transcript_source: &crate::acp::background_agent::TranscriptSource,
     event_tx: &tokio::sync::mpsc::Sender<crate::acp::state::Event>,
     between_prompt_bg_agents: &std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 ) {
-    for (agent_id, output_file) in launches {
+    for (agent_id, tool_call_id, output_file, output_format) in launches {
         crate::acp::background_agent::spawn_tailer(
             agent_id,
+            tool_call_id,
             output_file,
+            output_format,
             bg_transcript_source.clone(),
             event_tx.clone(),
             between_prompt_bg_agents.clone(),
@@ -686,6 +689,7 @@ pub(super) async fn run_connection_task<W, R>(
                     // src/acp/background_agent.rs.
                     if let Event::BackgroundAgentLaunched {
                         agent_id,
+                        tool_call_id,
                         output_file,
                         output_format,
                         ..
@@ -694,6 +698,7 @@ pub(super) async fn run_connection_task<W, R>(
                         if !suppressing && !output_file.is_empty() {
                             crate::acp::background_agent::spawn_tailer(
                                 agent_id.clone(),
+                                tool_call_id.clone(),
                                 output_file.clone(),
                                 output_format.clone(),
                                 bg_transcript_source.clone(),

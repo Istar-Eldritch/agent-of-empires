@@ -903,7 +903,9 @@ pub enum Event {
         output_file: String,
         /// Transcript format hint for the tailer (Claude default;
         /// "pi-events" selects the pi-subagents async run parser).
-        #[serde(default, skip_serializing)]
+        /// Persisted alongside `output_file` so a resumed tailer picks the
+        /// right parser instead of always falling back to Claude.
+        #[serde(default)]
         output_format: Option<String>,
         started_at: DateTime<Utc>,
     },
