@@ -258,7 +258,7 @@ function StatusDot({ status }: { status: BackgroundAgentStatus }) {
       ? "bg-status-waiting animate-pulse"
       : status === "completed"
         ? "bg-status-running"
-        : status === "error"
+        : status === "error" || status === "failed"
           ? "bg-status-error"
           : "bg-text-dim/60"; // stalled / detached
   return <span className={`h-2 w-2 shrink-0 rounded-full ${cls}`} />;
@@ -273,8 +273,16 @@ function StatusLabel({ status, toolCount }: { status: BackgroundAgentStatus; too
     );
   }
   const label =
-    status === "completed" ? "done" : status === "stalled" ? "stalled" : status === "detached" ? "detached" : "error";
-  const tone = status === "error" ? "text-status-error" : "text-text-dim";
+    status === "completed"
+      ? "done"
+      : status === "stalled"
+        ? "stalled"
+        : status === "detached"
+          ? "detached"
+          : status === "failed"
+            ? "failed"
+            : "error";
+  const tone = status === "error" || status === "failed" ? "text-status-error" : "text-text-dim";
   return <span className={`shrink-0 text-[11px] ${tone}`}>{label}</span>;
 }
 

@@ -390,6 +390,11 @@ pub enum BackgroundAgentStatus {
     /// Saw the terminal `end_turn` assistant message, or inferred done from
     /// a final text block at the idle timeout. The work is done.
     Completed,
+    /// The run reached a terminal state reporting failure (pi async runs
+    /// mark this via `subagent.run.completed` status "failed"). Claude
+    /// transcripts have no failure signal; they report Completed or
+    /// Stalled/Error.
+    Failed,
     /// The parent session ended before the agent finished; we stopped
     /// tracking it. Not a success, not a failure.
     Detached,
@@ -1607,6 +1612,7 @@ impl AcpState {
                         && !matches!(
                             a.status,
                             BackgroundAgentStatus::Completed
+                                | BackgroundAgentStatus::Failed
                                 | BackgroundAgentStatus::Detached
                                 | BackgroundAgentStatus::Error
                         )
