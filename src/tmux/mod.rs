@@ -1631,8 +1631,8 @@ fn pane_dead_from_cache(name: &str) -> Option<bool> {
 }
 
 /// Repopulate [`PANE_META_CACHE`]. The timestamp is stamped even when the
-/// query fails, so a tmux outage costs one fork per poller cycle
-/// ([`CACHE_TTL`] / 2) instead of one per row per frame.
+/// query fails, so a tmux outage costs one fork per [`spawn_snapshot_poller`]
+/// cycle ([`CACHE_TTL`] / 2) instead of one per row per frame.
 fn publish_pane_meta_cache(
     refresh_id: u64,
     data: Option<std::sync::Arc<HashMap<String, PaneMetadata>>>,
