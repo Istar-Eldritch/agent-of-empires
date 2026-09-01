@@ -1477,80 +1477,6 @@ impl Session {
         let _ = crate::tmux::run_tmux_command_with_timeout(&mut command);
     }
 
-    /// Resize the session's first window so its pane's visible content area
-    /// becomes `cols` x `rows`. Best-effort: a missing session or a tmux ENOENT
-    /// is swallowed so a transient failure never blocks a render.
-    ///
-    /// Every caller (the web live view, the mobile live view, the TUI's passive
-    /// preview sync) works in pane/content geometry, not tmux window geometry:
-    /// they render the pane, not the tmux status bar. tmux `resize-window` sizes
-    /// the *window*, and vertical chrome (the status bar) shrinks the pane below
-    /// it, so a naive `resize-window -y rows` yields a `rows - chrome` pane and
-    /// the live owner loop then re-asserts forever against a target it can never
-    /// reach (#2766). We measure the chrome live and add it back, so the pane
-    /// lands at exactly `rows`. Cols need no adjustment: a single pane spans the
-    /// full window width, and the status bar is horizontal.
-    ///
-    /// Also used to keep a detached agent's pane sized to the visible preview
-    /// area: a full-screen agent is sized to whatever terminal it was last
-    /// attached from, so without this it renders taller than the preview window
-    /// and the bottom-anchored capture clips the top rows (worse when the info
-    /// header steals rows). Mirrors what live-send does through its worker.
-    ///
-    /// NOTE: tmux's `resize-window -x -y` silently flips the window-size option
-    /// to `manual`, so any later `attach-session` must call
-    /// [`reset_size_to_latest_client`](Self::reset_size_to_latest_client) first
-    /// or the window stays pinned at these preview dimensions.
-    pub fn resize_window(&self, cols: u16, rows: u16) -> bool {
-        let deadline = crate::tmux::TmuxCommandDeadline::new();
-        self.resize_window_with_deadline(cols, rows, &deadline)
-    }
-
-    pub(crate) fn resize_window_with_deadline(
-        &self,
-        cols: u16,
-        rows: u16,
-        deadline: &crate::tmux::TmuxCommandDeadline,
-    ) -> bool {
-        if cols == 0 || rows == 0 || !self.exists_with_deadline(deadline) {
-            return false;
-        }
-        self.resize_window_after_exists_with_deadline(cols, rows, deadline)
-    }
-
-    pub(crate) fn resize_window_after_exists_with_deadline(
-        &self,
-        cols: u16,
-        rows: u16,
-        deadline: &crate::tmux::TmuxCommandDeadline,
-    ) -> bool {
-        if cols == 0 || rows == 0 {
-            return false;
-        }
-        // Query the same window/pane the capture streams (:^.0), so the
-        // measured chrome matches the pane whose height the owner loop checks.
-        let pane_target = format!("{}:^.0", self.name);
-        let window_rows = self
-            .pane_chrome_rows_with_deadline(&pane_target, deadline)
-            .map(|chrome| rows.saturating_add(chrome))
-            .unwrap_or(rows);
-        let window_target = format!("{}:^", self.name);
-        let mut command = crate::tmux::tmux_command();
-        command.args([
-            "resize-window",
-            "-t",
-            &window_target,
-            "-x",
-            &cols.to_string(),
-            "-y",
-            &window_rows.to_string(),
-        ]);
-        deadline
-            .run(&mut command)
-            .map(|output| output.status.success())
-            .unwrap_or(false)
-    }
-
     /// Read the live vertical chrome (status-bar rows) for pane_target from
     /// tmux. None when the geometry cannot be read; callers then size the
     /// window with no chrome adjustment (the pre-#2766 behavior).
@@ -1585,7 +1511,8 @@ impl Session {
     /// attach, the mobile capture viewer, and the TUI's preview sync), each
     /// living in a different process. The lock lives in tmux user options so
     /// every process sees the same owner and only the owner calls
-    /// [`resize_window`](Self::resize_window); non-owners render best-effort.
+    /// [`resize_window_if_owner`](Self::resize_window_if_owner); non-owners
+    /// render best-effort.
     ///
     /// Steals the lock when the current holder's heartbeat is older than
     /// `ttl`, so a crashed or disconnected owner self-heals. A queue-local

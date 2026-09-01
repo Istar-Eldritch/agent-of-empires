@@ -749,8 +749,8 @@ pub(super) fn sample_debounce_wait_ms(
         .max(1)
 }
 /// Capture cadence when the worker is just keeping the home-list preview warm
-/// (no live-send). Matches the old render-driven `PREVIEW_REFRESH_MS` throttle
-/// so moving the fork off the render thread doesn't raise the idle fork rate.
+/// (no live-send). Matches the render-driven throttle it replaces, so moving
+/// the fork off the render thread doesn't raise the idle fork rate.
 const LIVE_CAPTURE_INTERVAL_IDLE_MS: u64 = 250;
 /// Maximum interval between authoritative snapshots while a live VT grid is
 /// otherwise supplying preview frames. This preserves upstream's bounded
@@ -914,8 +914,8 @@ fn frame_needs_publish(
 /// fresh content without ever forking on the render thread, and a switch
 /// swaps the target in place instead of spawning a new thread. The capture
 /// cadence adapts (`set_live`): tight while live-send is attached,
-/// `PREVIEW_REFRESH_MS`-matched otherwise so the background preview costs
-/// no more idle forks than the old render-driven throttle did.
+/// `LIVE_CAPTURE_INTERVAL_IDLE_MS` otherwise so the background preview costs
+/// no more idle forks than the render-driven throttle it replaces did.
 pub(in crate::tui) struct LiveCaptureWorker {
     /// Lines the render loop wants captured (height + scrollback + buffer).
     /// `0` means "not set yet"; the worker skips capturing until the first

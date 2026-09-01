@@ -1631,8 +1631,8 @@ fn pane_dead_from_cache(name: &str) -> Option<bool> {
 }
 
 /// Repopulate [`PANE_META_CACHE`]. The timestamp is stamped even when the
-/// query fails, so a tmux outage costs one fork per [`CACHE_TTL`] instead of
-/// one per row per frame.
+/// query fails, so a tmux outage costs one fork per poller cycle
+/// ([`CACHE_TTL`] / 2) instead of one per row per frame.
 fn publish_pane_meta_cache(
     refresh_id: u64,
     data: Option<std::sync::Arc<HashMap<String, PaneMetadata>>>,
@@ -3140,10 +3140,10 @@ mod tests {
     fn a_failed_pane_snapshot_is_an_answer_so_rows_do_not_re_fork() {
         // `refresh_pane_meta_cache` stamps `time` even when `batch_pane_metadata`
         // fails, and `pane_dead_from_cache` gates on `time` alone. That pairing is
-        // what bounds a tmux outage to one fork per CACHE_TTL instead of one per
-        // row per frame: if a fresh-but-empty snapshot resolved to `None`, every
-        // Tool row would drive another doomed refresh, which is the per-row fork
-        // this whole change removes.
+        // what bounds a tmux outage to one fork per poller cycle (CACHE_TTL / 2)
+        // instead of one per row per frame: if a fresh-but-empty snapshot
+        // resolved to `None`, every Tool row would drive another doomed refresh,
+        // which is the per-row fork this whole change removes.
         let guard = PaneMetaCacheGuard::capture();
         guard.force_failed_refresh();
 
