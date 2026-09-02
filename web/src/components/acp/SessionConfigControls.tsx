@@ -129,47 +129,49 @@ function ModelDropdown({ option, pending, onSelect }: SubProps) {
       {open && (
         <div
           id={menuId}
-          className="absolute bottom-full left-0 z-30 mb-1 w-64 overflow-hidden rounded-md border border-surface-700 bg-surface-850 shadow-xl"
+          className="absolute bottom-full left-0 z-30 mb-1 flex w-64 max-h-72 flex-col overflow-hidden rounded-md border border-surface-700 bg-surface-850 shadow-xl"
           role="menu"
         >
           <div className="border-b border-surface-800 px-3 py-1.5 text-[10px] uppercase tracking-wider text-text-dim">
             {option.name}
           </div>
-          {option.options.map((opt) => {
-            const isCurrent = opt.value === option.current_value;
-            const isPending = pending === opt.value;
-            return (
-              <button
-                key={opt.value}
-                type="button"
-                role="menuitem"
-                disabled={isPending}
-                onClick={() => {
-                  if (isPending || isCurrent) {
+          <div className="overflow-y-auto">
+            {option.options.map((opt) => {
+              const isCurrent = opt.value === option.current_value;
+              const isPending = pending === opt.value;
+              return (
+                <button
+                  key={opt.value}
+                  type="button"
+                  role="menuitem"
+                  disabled={isPending}
+                  onClick={() => {
+                    if (isPending || isCurrent) {
+                      setOpen(false);
+                      return;
+                    }
                     setOpen(false);
-                    return;
-                  }
-                  setOpen(false);
-                  void onSelect(opt.value);
-                }}
-                data-testid={`config-option-${option.id}-value-${opt.value}`}
-                className={[
-                  "flex w-full items-start gap-2 px-3 py-1.5 text-left text-[12px]",
-                  isCurrent
-                    ? "bg-surface-800 text-text-primary"
-                    : "text-text-secondary hover:bg-surface-800 hover:text-text-primary",
-                  isPending ? "cursor-not-allowed opacity-50" : "",
-                ].join(" ")}
-              >
-                <span className="flex-1">
-                  <span className="block font-medium">{opt.name}</span>
-                  {opt.description && <span className="block text-[11px] text-text-dim">{opt.description}</span>}
-                </span>
-                {isCurrent && !isPending && <span className="text-[10px] uppercase text-brand-500">Active</span>}
-                {isPending && <span className="text-[10px] uppercase text-text-dim">…</span>}
-              </button>
-            );
-          })}
+                    void onSelect(opt.value);
+                  }}
+                  data-testid={`config-option-${option.id}-value-${opt.value}`}
+                  className={[
+                    "flex w-full items-start gap-2 px-3 py-1.5 text-left text-[12px]",
+                    isCurrent
+                      ? "bg-surface-800 text-text-primary"
+                      : "text-text-secondary hover:bg-surface-800 hover:text-text-primary",
+                    isPending ? "cursor-not-allowed opacity-50" : "",
+                  ].join(" ")}
+                >
+                  <span className="flex-1">
+                    <span className="block font-medium">{opt.name}</span>
+                    {opt.description && <span className="block text-[11px] text-text-dim">{opt.description}</span>}
+                  </span>
+                  {isCurrent && !isPending && <span className="text-[10px] uppercase text-brand-500">Active</span>}
+                  {isPending && <span className="text-[10px] uppercase text-text-dim">…</span>}
+                </button>
+              );
+            })}
+          </div>
         </div>
       )}
     </div>
