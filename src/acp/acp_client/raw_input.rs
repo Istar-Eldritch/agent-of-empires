@@ -8,8 +8,9 @@ use tracing::{debug, info, warn};
 /// raw_input. Reads `delaySeconds` (number, falls back to numeric
 /// string) and the optional `reason`; computes the absolute wake
 /// timestamp from `Utc::now()`. Returns `None` if `delaySeconds` is
-/// missing or non-finite, better to skip the event than publish a
-/// wakeup at epoch zero. See #1091.
+/// missing, non-finite, or so large the wake time is unrepresentable,
+/// better to skip the event than publish a wakeup at epoch zero or
+/// panic on overflow. See #1091.
 pub(super) fn wakeup_event_from_raw(raw_input: &serde_json::Value) -> Option<Event> {
     let Some(delay_value) = raw_input.get("delaySeconds") else {
         debug!(
@@ -38,7 +39,15 @@ pub(super) fn wakeup_event_from_raw(raw_input: &serde_json::Value) -> Option<Eve
         return None;
     }
     let delay_ms = (delay_secs * 1000.0).clamp(0.0, i64::MAX as f64) as i64;
-    let at = chrono::Utc::now() + chrono::Duration::milliseconds(delay_ms);
+    let Some(at) = chrono::Utc::now().checked_add_signed(chrono::Duration::milliseconds(delay_ms))
+    else {
+        warn!(
+            target: "acp.protocol.wakeup",
+            delay_secs,
+            "ScheduleWakeup `delaySeconds` overflows the representable wake time; refusing to emit"
+        );
+        return None;
+    };
     let reason = raw_input
         .get("reason")
         .and_then(|v| v.as_str())
@@ -116,6 +125,45 @@ pub(super) fn background_agent_launched_from_value(v: &serde_json::Value) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wakeup_from_raw_rejects_unusable_delays() {
+        let cases = [
+            ("missing", serde_json::json!({})),
+            ("non-numeric", serde_json::json!({ "delaySeconds": "soon" })),
+            ("negative", serde_json::json!({ "delaySeconds": -1.0 })),
+            // JSON has no infinity literal, so it arrives as a numeric string.
+            ("non-finite", serde_json::json!({ "delaySeconds": "inf" })),
+            // Finite, but past the range chrono can add to `now`.
+            ("overflowing", serde_json::json!({ "delaySeconds": 1e18 })),
+        ];
+        for (label, raw) in cases {
+            assert!(
+                wakeup_event_from_raw(&raw).is_none(),
+                "{label} delaySeconds must not emit WakeupScheduled"
+            );
+        }
+    }
+
+    #[test]
+    fn wakeup_from_raw_schedules_valid_delay() {
+        let before = chrono::Utc::now();
+        let raw = serde_json::json!({ "delaySeconds": 600, "reason": "watching CI" });
+        match wakeup_event_from_raw(&raw) {
+            Some(Event::WakeupScheduled { at, reason }) => {
+                assert_eq!(reason.as_deref(), Some("watching CI"));
+                assert!((at - before).num_seconds() >= 600);
+                assert!((at - before).num_seconds() < 660);
+            }
+            other => panic!("expected WakeupScheduled, got {other:?}"),
+        }
+        // A numeric string is accepted the same way.
+        let raw = serde_json::json!({ "delaySeconds": "600" });
+        assert!(matches!(
+            wakeup_event_from_raw(&raw),
+            Some(Event::WakeupScheduled { .. })
+        ));
+    }
 
     #[test]
     fn background_agent_launched_parsed_from_agent_meta() {
