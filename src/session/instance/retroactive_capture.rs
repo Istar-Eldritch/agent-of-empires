@@ -8,15 +8,13 @@ impl Instance {
     /// while running another tool, and inactive peers that still own records
     /// in a shared host store.
     pub(super) fn retroactive_capture_exclusion_set(&self) -> HashSet<String> {
-        // Raw tool and resolved agent both: the parked-conversation lookup is
-        // keyed on the raw `tool` the swap path wrote, while which store this
-        // session shares, and so which peers can steal from it, follows the
-        // built-in it resolves to.
+        // Peers, parked conversations and store sharing all follow the
+        // built-in this session resolves to, never its own name: an alias and
+        // its base agent write one store.
         let capture_agent = self.capture_agent_name().unwrap_or(&self.tool);
         crate::session::capture::compose_exclusion_with_persisted_peers(
             &self.id,
             &self.project_path,
-            &self.tool,
             capture_agent,
             capture_agent == "claude"
                 || (matches!(capture_agent, "codex" | "kimi") && !self.is_sandboxed()),
@@ -285,7 +283,10 @@ impl Instance {
     /// count as one, matching the directory match in `filter_agent_sessions`.
     pub(super) fn contended_capture_key(&self) -> (String, String) {
         (
-            self.tool.clone(),
+            // Resolved: an alias and its built-in scan one store, so keying
+            // this raw leaves a mixed pair unmarked and lets the first
+            // self-heal claim the other pane's conversation.
+            self.capture_agent_name().unwrap_or(&self.tool).to_string(),
             crate::session::capture::canonicalize_or_raw(&self.project_path)
                 .to_string_lossy()
                 .into_owned(),

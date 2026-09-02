@@ -444,12 +444,19 @@ list_fresh() {{
   DIR="$1/projects/{dir_name}"
   [ -d "$DIR" ] || return 1
   missed=1
+  # Split the listing on newlines alone. The dir now comes from whatever a
+  # container process declares, so it can hold a space, and the default IFS
+  # would shred the path into arguments no `[ -f ]` matches.
+  OIFS=$IFS
+  IFS='
+'
   for f in $(ls -tL "$DIR"/*.jsonl 2>/dev/null); do
     [ -f "$f" ] || continue
     [ -n "$(find -L "$f" -mmin -5 2>/dev/null)" ] || continue
     basename "$f" .jsonl
     missed=0
   done
+  IFS=$OIFS
   return $missed
 }}
 FALLBACK="${{CLAUDE_CONFIG_DIR:-$HOME/.claude}}"
@@ -729,7 +736,7 @@ fn compose_exclusion_in(
 }
 
 /// Extend [`compose_exclusion`] with conversations same-project peers parked
-/// for `current_tool` during an engine swap. When
+/// for `current_capture_agent` during an engine swap. When
 /// `include_inactive_same_tool` is true, also include the sids of stopped,
 /// archived, or pane-less peers whose own built-in agent resolves to
 /// `current_capture_agent`, so a wrapper and the agent it wraps count as one
@@ -757,7 +764,6 @@ fn compose_exclusion_in(
 pub(crate) fn compose_exclusion_with_persisted_peers(
     current_instance_id: &str,
     current_project_path: &str,
-    current_tool: &str,
     current_capture_agent: &str,
     include_inactive_same_tool: bool,
     profile: &str,
@@ -796,13 +802,22 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
         // intends to resume it on a swap back. It is excluded regardless of the
         // peer's current tool or liveness: its pane is running another engine,
         // so the live tmux ownership scan cannot discover this id.
-        if let Some(parked) = inst
-            .prior_tool_session_ids
-            .get(current_tool)
-            .and_then(|p| p.agent_session_id.as_deref())
-            .filter(|s| !s.is_empty())
-        {
-            set.insert(parked.to_string());
+        //
+        // `swap_tool` keys this map on the raw outgoing tool, so an exact
+        // lookup makes a conversation parked under `claude-personal` invisible
+        // to `claude` and to every other alias of it, and the MRU scan then
+        // adopts what the peer means to resume. Match on the built-in each key
+        // resolves to instead, which only ever widens the set (#3638).
+        for (parked_tool, parked) in &inst.prior_tool_session_ids {
+            let parked_agent =
+                crate::session::instance::resolved_agent_for(&inst.source_profile, parked_tool, "")
+                    .map_or(parked_tool.as_str(), |a| a.name);
+            if parked_agent != current_capture_agent {
+                continue;
+            }
+            if let Some(sid) = parked.agent_session_id.as_deref().filter(|s| !s.is_empty()) {
+                set.insert(sid.to_string());
+            }
         }
         // Matched on the built-in each side resolves to, not on the raw
         // tool: a wrapper and the agent it wraps share one store, so a raw
@@ -2814,7 +2829,12 @@ pub(crate) fn kimi_store_is_shared(
             if inst.id == current_instance_id || inst.is_sandboxed() {
                 continue;
             }
-            let owns_kimi = inst.tool == "kimi"
+            // Matched on the built-in the peer resolves to, like the peer
+            // filter in `compose_exclusion_with_persisted_peers`: a wrapper
+            // captures into the same store, so reading `tool` raw reports a
+            // sole owner and licenses the MRU retarget this guard exists to
+            // refuse (#3516).
+            let owns_kimi = inst.capture_agent_name().unwrap_or(inst.tool.as_str()) == "kimi"
                 || inst
                     .prior_tool_session_ids
                     .get("kimi")
@@ -3778,12 +3798,18 @@ mod tests {
     fn container_snippet_prefers_a_running_process_config_dir() {
         let project_path = "/tmp/aoe-wrapper-scan";
         let injected = tempfile::tempdir().unwrap();
-        let wrapper = tempfile::tempdir().unwrap();
+        let wrapper_root = tempfile::tempdir().unwrap();
+        // A space in the declared dir is the realistic shape ("Claude
+        // Personal"), and the listing has to survive word splitting to find
+        // anything under it.
+        let wrapper = wrapper_root.path().join("Claude Personal");
         let wrapper_sid = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
         let injected_sid = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
-        for (home, sid) in [(&injected, injected_sid), (&wrapper, wrapper_sid)] {
+        for (home, sid) in [
+            (injected.path().to_path_buf(), injected_sid),
+            (wrapper.clone(), wrapper_sid),
+        ] {
             let dir = home
-                .path()
                 .join("projects")
                 .join(encode_claude_project_path(project_path));
             std::fs::create_dir_all(&dir).unwrap();
@@ -3807,14 +3833,14 @@ mod tests {
         // A live process declaring its own outranks it.
         let mut pane = std::process::Command::new("sleep")
             .arg("30")
-            .env("CLAUDE_CONFIG_DIR", wrapper.path())
+            .env("CLAUDE_CONFIG_DIR", &wrapper)
             .spawn()
             .expect("spawn stand-in for the wrapped agent");
         // `spawn` returning does not guarantee the child has reached `execve`,
         // and until it does its `environ` is still this process's. Wait for the
         // value the scan is meant to find rather than race it.
         let environ = format!("/proc/{}/environ", pane.id());
-        let declared = format!("CLAUDE_CONFIG_DIR={}", wrapper.path().display());
+        let declared = format!("CLAUDE_CONFIG_DIR={}", wrapper.display());
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while !std::fs::read(&environ)
             .map(|raw| {

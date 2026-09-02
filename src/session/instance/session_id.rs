@@ -106,7 +106,13 @@ impl Instance {
             // Keyed on the built-in binary rather than the resolved agent: a
             // wrapper is free to redirect `CLAUDE_CONFIG_DIR` itself, which
             // reads here as "no transcript" and would downgrade a live
-            // conversation to a `--session-id` Claude rejects (#3399).
+            // conversation to a `--session-id` Claude rejects (#3399). A
+            // declared `agent_config_dir` cannot widen this, since the probe
+            // resolves the tree from the env var alone, and the env var can be
+            // AoE's own rather than the one the wrapper exports. The cost is
+            // that a wrapper session stopped before its first prompt attempts
+            // one doomed `--resume`, reports Error, and starts fresh on the
+            // next launch; losing a live conversation is the worse trade.
             if self.tool == "claude"
                 && !self.is_sandboxed()
                 && crate::session::capture::claude_host_transcript_confirmed_absent(
@@ -156,6 +162,11 @@ impl Instance {
     /// session through the injected seam (opt-in, returns `None` when disabled
     /// or on failure, deferring to the SQLite poller); every other agent
     /// starts without a pinned id and is captured post-launch.
+    ///
+    /// Resolved through `agent_detect_as`, so a wrapper mints what its
+    /// built-in would. The pi arm is unreachable for one even so: its pin
+    /// needs a binary AoE probed on its own PATH, which no wrapper is (see
+    /// `pi_session_id_pinnable`), and the seam returns `None` for it.
     fn fresh_launch_session_id(
         &self,
         mint_fresh_id: &dyn Fn(&str) -> Option<String>,
@@ -639,6 +650,24 @@ impl Instance {
         is_existing && !takes_pinning_arm
     }
 
+    /// Whether a `ResumeStrategy::Subcommand` (or `ForkStrategy::CodexFork`)
+    /// token can be spliced into this launch command.
+    ///
+    /// [`splice_subcommand_or_append`] puts the token after the first
+    /// whitespace-delimited word, which is the binary only for a line AoE
+    /// built itself or an override that opens with the agent's own binary. A
+    /// wrapper such as `ssh -t host codex` would take `resume <sid>` on `ssh`
+    /// and restart the wrong command, so an unparseable override emits no
+    /// resume at all (#3638).
+    fn subcommand_splice_is_safe(&self, agent: &crate::agents::AgentDef) -> bool {
+        if !self.has_command_override() {
+            return true;
+        }
+        self.command.split_whitespace().next().is_some_and(|first| {
+            first == agent.binary || first.ends_with(&format!("/{}", agent.binary))
+        })
+    }
+
     pub(super) fn apply_session_flags(&mut self, cmd: &mut String, context: &str) -> bool {
         // Owned: the rest of this fn takes `&mut self`, and the unresolved
         // fallback borrows `self.tool`.
@@ -656,7 +685,17 @@ impl Instance {
                         crate::agents::get_agent(resume_tool).map(|a| &a.fork_strategy),
                         Some(crate::agents::ForkStrategy::CodexFork)
                     );
-                    splice_subcommand_or_append(cmd, &fork_part, is_subcommand);
+                    let splice_ok = !is_subcommand
+                        || crate::agents::get_agent(resume_tool)
+                            .is_some_and(|a| self.subcommand_splice_is_safe(a));
+                    if splice_ok {
+                        splice_subcommand_or_append(cmd, &fork_part, is_subcommand);
+                    } else {
+                        tracing::info!(target: "session.store",
+                            tool = %self.tool,
+                            "fork subcommand needs the binary's position and this command override does not expose it; launching without it"
+                        );
+                    }
                 }
             }
             // A fork is a fresh session, not an in-place resume.
@@ -685,6 +724,22 @@ impl Instance {
         // to gate emission too.
         if matches!(resume_tool, "copilot" | "kimi" | "prime-agent") && self.is_sandboxed() {
             session_id = None;
+        }
+        // Same fail-closed rule for a subcommand-shaped resume whose splice
+        // point this command hides: a mangled launch line is worse than a
+        // fresh conversation.
+        if let Some(agent) = crate::agents::get_agent(resume_tool) {
+            if matches!(
+                agent.resume_strategy,
+                crate::agents::ResumeStrategy::Subcommand(_)
+            ) && !self.subcommand_splice_is_safe(agent)
+            {
+                tracing::info!(target: "session.store",
+                    tool = %self.tool,
+                    "resume subcommand needs the binary's position and this command override does not expose it; starting fresh"
+                );
+                session_id = None;
+            }
         }
         // A transcript the pane published outranks its id: `--session <path>`
         // resolves the conversation wherever it was started, while
@@ -1482,6 +1537,42 @@ mod tests {
         assert!(!inst.opencode_launch_mirrorable_by_ambient_serve());
     }
 
+    /// A subcommand-shaped resume has to land immediately after the binary,
+    /// and the splice finds that spot by taking the first word. A wrapper
+    /// command puts something else there, so the flags are dropped rather
+    /// than spliced onto the wrong program (#3638).
+    #[test]
+    fn codex_wrapper_command_never_takes_a_spliced_subcommand() {
+        const PROFILE: &str = "codex-wrapper-splice-test";
+        let _registry = install_aliases(PROFILE, &[("codex-remote", "codex")]);
+        let sid = "11111111-2222-3333-4444-555555555555";
+
+        // The documented custom-agent shape: a multi-token launcher.
+        let mut wrapped = Instance::new("wrapper", "/tmp/codex-splice");
+        wrapped.source_profile = PROFILE.to_string();
+        wrapped.tool = "codex-remote".to_string();
+        wrapped.command = "ssh -t lenovo codex".to_string();
+        wrapped.agent_session_id = Some(sid.to_string());
+        wrapped.resume_intent = ResumeIntent::Use(sid.to_string());
+        let mut cmd = wrapped.command.clone();
+        assert!(!wrapped.apply_session_flags(&mut cmd, "test"));
+        assert_eq!(
+            cmd, "ssh -t lenovo codex",
+            "the resume token must not be spliced onto the launcher"
+        );
+
+        // An override that does open with the binary keeps its resume.
+        let mut direct = Instance::new("direct", "/tmp/codex-splice");
+        direct.source_profile = PROFILE.to_string();
+        direct.tool = "codex-remote".to_string();
+        direct.command = "codex --model o3".to_string();
+        direct.agent_session_id = Some(sid.to_string());
+        direct.resume_intent = ResumeIntent::Use(sid.to_string());
+        let mut direct_cmd = direct.command.clone();
+        assert!(direct.apply_session_flags(&mut direct_cmd, "test"));
+        assert_eq!(direct_cmd, format!("codex resume {sid} --model o3"));
+    }
+
     /// A custom agent that wraps a supported one has no `AgentDef` of its
     /// own, so every capture and resume path used to miss on `tool` raw: no
     /// id was pinned at launch and no resume flag was emitted, and each
@@ -2275,6 +2366,45 @@ mod tests {
             );
         }
 
+        /// `swap_tool` parks a conversation under the raw outgoing tool, so
+        /// an exact-key lookup hides a wrapper's parked Claude thread from a
+        /// plain `claude` session sharing the cwd, and the MRU scan adopts
+        /// what the peer means to resume on a swap back (#3638).
+        #[test]
+        #[serial]
+        fn parked_conversations_are_matched_across_aliases() {
+            const PROFILE: &str = "verify-parked-alias";
+            let _registry = install_aliases(PROFILE, &[("claude-personal", "claude")]);
+            let temp = tempdir().unwrap();
+            let _guard = claude_home_guard(&temp);
+
+            let project_path = "/tmp/aoe-test-parked-alias";
+            let parked_sid = "88888888-8888-4888-8888-888888888888";
+
+            // A wrapper session that has since swapped engines: its Claude
+            // conversation now lives under the `claude-personal` key.
+            let mut peer = Instance::new("swapped-wrapper", project_path);
+            peer.source_profile = PROFILE.to_string();
+            peer.tool = "claude-personal".to_string();
+            peer.command = "claude-personal".to_string();
+            peer.agent_session_id = Some(parked_sid.to_string());
+            peer.status = Status::Running;
+            peer.swap_tool("codex");
+            assert_eq!(peer.tool, "codex");
+            super::seed_disk_for_sidecar_test(PROFILE, &peer);
+
+            let mut plain = Instance::new("plain-claude", project_path);
+            plain.source_profile = PROFILE.to_string();
+            plain.tool = "claude".to_string();
+
+            assert!(
+                plain
+                    .retroactive_capture_exclusion_set()
+                    .contains(parked_sid),
+                "a conversation parked under an alias must be off limits to its base agent"
+            );
+        }
+
         // Companion to the above for the engine swap: the peer is not a
         // Claude session any more (it swapped to pi), so it no longer
         // passes the `tool` filter in
@@ -2327,7 +2457,6 @@ mod tests {
             let pi_exclusion = crate::session::capture::compose_exclusion_with_persisted_peers(
                 "other-pi-instance",
                 project_path,
-                "pi",
                 "pi",
                 false,
                 profile,
