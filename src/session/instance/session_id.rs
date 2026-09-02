@@ -2240,6 +2240,41 @@ mod tests {
             assert_eq!(inst.agent_session_id.as_deref(), Some(mine));
         }
 
+        /// A wrapper and the built-in it wraps write into one transcript
+        /// dir, so an inactive plain-`claude` peer must be excluded from a
+        /// `claude-personal` session's mtime scan. Resolving the poller for
+        /// wrappers (#3638) is what makes that scan reachable at all, and a
+        /// raw `tool` compare would leave this direction unguarded.
+        #[test]
+        #[serial]
+        fn exclusion_set_spans_a_wrapper_and_the_agent_it_wraps() {
+            const PROFILE: &str = "verify-wrapper-peer";
+            let _registry = install_aliases(PROFILE, &[("claude-personal", "claude")]);
+            let temp = tempdir().unwrap();
+            let _guard = claude_home_guard(&temp);
+
+            let project_path = "/tmp/aoe-test-wrapper-peer";
+            let peer_sid = "77777777-7777-4777-8777-777777777777";
+            let mut peer = Instance::new("stopped-claude-peer", project_path);
+            peer.source_profile = PROFILE.to_string();
+            peer.tool = "claude".to_string();
+            peer.agent_session_id = Some(peer_sid.to_string());
+            peer.status = Status::Stopped;
+            super::seed_disk_for_sidecar_test(PROFILE, &peer);
+
+            let mut wrapper = Instance::new("wrapper-instance", project_path);
+            wrapper.source_profile = PROFILE.to_string();
+            wrapper.tool = "claude-personal".to_string();
+            wrapper.command = "claude-personal".to_string();
+
+            assert!(
+                wrapper
+                    .retroactive_capture_exclusion_set()
+                    .contains(peer_sid),
+                "a stopped claude peer's conversation must be off limits to the wrapper"
+            );
+        }
+
         // Companion to the above for the engine swap: the peer is not a
         // Claude session any more (it swapped to pi), so it no longer
         // passes the `tool` filter in
@@ -2292,6 +2327,7 @@ mod tests {
             let pi_exclusion = crate::session::capture::compose_exclusion_with_persisted_peers(
                 "other-pi-instance",
                 project_path,
+                "pi",
                 "pi",
                 false,
                 profile,

@@ -31,9 +31,11 @@ const WRAPPER: &str = "claude-personal";
 /// put on the launch line.
 fn install_wrapper_shim(h: &mut TuiTestHarness) {
     let bin = h.install_path_command(WRAPPER);
+    // The `launch:` prefix keeps an argv-less launch on its own recorded line,
+    // so a launch that pinned nothing fails on the missing flag rather than
+    // reading as no launch at all.
     let script = r#"#!/bin/sh
-printf '%s ' "$@" >> "$HOME/wrapper-launches"
-printf '\n' >> "$HOME/wrapper-launches"
+printf 'launch: %s\n' "$*" >> "$HOME/wrapper-launches"
 exec sleep 600
 "#;
     let path = bin.join(WRAPPER);

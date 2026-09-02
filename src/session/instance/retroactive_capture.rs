@@ -8,15 +8,16 @@ impl Instance {
     /// while running another tool, and inactive peers that still own records
     /// in a shared host store.
     pub(super) fn retroactive_capture_exclusion_set(&self) -> HashSet<String> {
-        // The tool argument stays raw: peers are matched on their own stored
-        // `tool`, and resolving only this side would stop two sessions of the
-        // same wrapper from seeing each other. Which stores need the
-        // inactive-peer sweep is agent behavior, so that resolves.
+        // Raw tool and resolved agent both: the parked-conversation lookup is
+        // keyed on the raw `tool` the swap path wrote, while which store this
+        // session shares, and so which peers can steal from it, follows the
+        // built-in it resolves to.
         let capture_agent = self.capture_agent_name().unwrap_or(&self.tool);
         crate::session::capture::compose_exclusion_with_persisted_peers(
             &self.id,
             &self.project_path,
             &self.tool,
+            capture_agent,
             capture_agent == "claude"
                 || (matches!(capture_agent, "codex" | "kimi") && !self.is_sandboxed()),
             &self.effective_profile(),

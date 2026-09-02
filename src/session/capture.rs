@@ -432,7 +432,8 @@ pub(crate) fn claude_poll_fn(
 /// themselves and AoE never sees its container path. So each distinct
 /// `CLAUDE_CONFIG_DIR` a live process declares is tried first, the first
 /// directory holding fresh transcripts winning, and the injected value is the
-/// fallback.
+/// fallback. The `/proc` walk costs a pipeline per process, which is bounded
+/// by a session container holding one agent and its children.
 fn claude_container_list_snippet(dir_name: &str) -> String {
     format!(
         r#"
@@ -730,8 +731,10 @@ fn compose_exclusion_in(
 /// Extend [`compose_exclusion`] with conversations same-project peers parked
 /// for `current_tool` during an engine swap. When
 /// `include_inactive_same_tool` is true, also include the sids of stopped,
-/// archived, or pane-less peers using `current_tool`. Persisted peers are read
-/// from `sessions.json` via `Storage` for the caller's effective profile.
+/// archived, or pane-less peers whose own built-in agent resolves to
+/// `current_capture_agent`, so a wrapper and the agent it wraps count as one
+/// store. Persisted peers are read from `sessions.json` via `Storage` for the
+/// caller's effective profile.
 ///
 /// Used by `Instance::try_retroactive_capture` and snapshotted when its poller
 /// starts. Parked conversations are no longer published in the peer's tmux
@@ -755,6 +758,7 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
     current_instance_id: &str,
     current_project_path: &str,
     current_tool: &str,
+    current_capture_agent: &str,
     include_inactive_same_tool: bool,
     profile: &str,
     retroactive_capture_excludes: &HashSet<String>,
@@ -800,7 +804,13 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
         {
             set.insert(parked.to_string());
         }
-        if !include_inactive_same_tool || inst.tool != current_tool {
+        // Matched on the built-in each side resolves to, not on the raw
+        // tool: a wrapper and the agent it wraps share one store, so a raw
+        // compare leaves an inactive base-agent peer's conversation open to
+        // the wrapper's mtime scan (#3638). The parked lookup above stays
+        // keyed on the raw tool, which is how the swap path writes it.
+        let peer_capture_agent = inst.capture_agent_name().unwrap_or(inst.tool.as_str());
+        if !include_inactive_same_tool || peer_capture_agent != current_capture_agent {
             continue;
         }
         let should_exclude = matches!(inst.status, crate::session::Status::Stopped)
@@ -3800,6 +3810,25 @@ mod tests {
             .env("CLAUDE_CONFIG_DIR", wrapper.path())
             .spawn()
             .expect("spawn stand-in for the wrapped agent");
+        // `spawn` returning does not guarantee the child has reached `execve`,
+        // and until it does its `environ` is still this process's. Wait for the
+        // value the scan is meant to find rather than race it.
+        let environ = format!("/proc/{}/environ", pane.id());
+        let declared = format!("CLAUDE_CONFIG_DIR={}", wrapper.path().display());
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !std::fs::read(&environ)
+            .map(|raw| {
+                raw.split(|b| *b == 0)
+                    .any(|entry| entry == declared.as_bytes())
+            })
+            .unwrap_or(false)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stand-in never published its own CLAUDE_CONFIG_DIR"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let out = std::process::Command::new("sh")
             .arg("-c")
             .arg(&snippet)

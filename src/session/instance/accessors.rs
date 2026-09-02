@@ -191,7 +191,7 @@ impl Instance {
     /// this session. Both paths fail closed on an unknown tool, so keying them
     /// off `tool` raw leaves a custom wrapper with no poller, no pre-minted id
     /// and no resume flag, silently and forever (#3638).
-    pub(super) fn capture_agent_name(&self) -> Option<&'static str> {
+    pub(crate) fn capture_agent_name(&self) -> Option<&'static str> {
         self.resolved_agent().map(|a| a.name)
     }
 
