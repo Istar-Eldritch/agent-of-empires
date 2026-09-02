@@ -18,7 +18,8 @@ impl Instance {
         // acquire_session_id_with: it keeps the config read and the binary
         // probe off every other launch, and keeps the inner fn a pure,
         // testable seam.
-        let preassign = self.tool == "opencode" && self.opencode_preassign_enabled();
+        let preassign =
+            self.capture_agent_name() == Some("opencode") && self.opencode_preassign_enabled();
         let pin_pi = self.pi_session_id_pinnable();
         self.acquire_session_id_with(&|path| {
             if pin_pi {
@@ -102,6 +103,10 @@ impl Instance {
             // the conversation under the same id (see
             // `resume_flag_arm_is_existing`). Host-only: a sandboxed transcript
             // lives inside the container, which may not be up at acquire time.
+            // Keyed on the built-in binary rather than the resolved agent: a
+            // wrapper is free to redirect `CLAUDE_CONFIG_DIR` itself, which
+            // reads here as "no transcript" and would downgrade a live
+            // conversation to a `--session-id` Claude rejects (#3399).
             if self.tool == "claude"
                 && !self.is_sandboxed()
                 && crate::session::capture::claude_host_transcript_confirmed_absent(
@@ -155,9 +160,9 @@ impl Instance {
         &self,
         mint_fresh_id: &dyn Fn(&str) -> Option<String>,
     ) -> Option<String> {
-        match self.tool.as_str() {
-            "claude" => Some(generate_session_uuid()),
-            "opencode" | "pi" => mint_fresh_id(&self.project_path),
+        match self.capture_agent_name() {
+            Some("claude") => Some(generate_session_uuid()),
+            Some("opencode" | "pi") => mint_fresh_id(&self.project_path),
             _ => None,
         }
     }
@@ -352,7 +357,7 @@ impl Instance {
             }
             return override_if_distinct(self.agent_session_id.as_deref(), authoritative);
         }
-        if self.tool == "claude" {
+        if self.capture_agent_name() == Some("claude") {
             if let Some(authoritative) = crate::hooks::read_hook_session_id(&self.id) {
                 if self.retroactive_capture_excludes.contains(&authoritative) {
                     return None;
@@ -635,16 +640,20 @@ impl Instance {
     }
 
     pub(super) fn apply_session_flags(&mut self, cmd: &mut String, context: &str) -> bool {
+        // Owned: the rest of this fn takes `&mut self`, and the unresolved
+        // fallback borrows `self.tool`.
+        let resolved = self.capture_agent_name().unwrap_or(&self.tool).to_string();
+        let resume_tool = resolved.as_str();
         if let ResumeIntent::Fork { from } = self.resume_intent.clone() {
             let child = self.agent_session_id.clone();
             if let Some(child_id) = child.as_deref() {
-                let fork_part = build_fork_flags(&self.tool, &from, child_id);
+                let fork_part = build_fork_flags(resume_tool, &from, child_id);
                 if !fork_part.is_empty() {
                     // Codex's fork is a subcommand and must sit right after the
                     // binary (before other flags), like its resume subcommand.
                     // Flag-shaped forks (claude, opencode) append.
                     let is_subcommand = matches!(
-                        crate::agents::get_agent(&self.tool).map(|a| &a.fork_strategy),
+                        crate::agents::get_agent(resume_tool).map(|a| &a.fork_strategy),
                         Some(crate::agents::ForkStrategy::CodexFork)
                     );
                     splice_subcommand_or_append(cmd, &fork_part, is_subcommand);
@@ -674,7 +683,7 @@ impl Instance {
         // pinned sid would launch `--resume <id>` against an id that does
         // not resolve there. Capture is already host-only above; drop the sid
         // to gate emission too.
-        if matches!(self.tool.as_str(), "copilot" | "kimi" | "prime-agent") && self.is_sandboxed() {
+        if matches!(resume_tool, "copilot" | "kimi" | "prime-agent") && self.is_sandboxed() {
             session_id = None;
         }
         // A transcript the pane published outranks its id: `--session <path>`
@@ -692,7 +701,7 @@ impl Instance {
             }
         }
         let emitted = append_resume_flags(
-            &self.tool,
+            resume_tool,
             session_id.as_deref(),
             flag_arm_is_existing,
             cmd,
@@ -1471,6 +1480,47 @@ mod tests {
         // fails "Session not found".
         inst.command = "opencode-wrapper".to_string();
         assert!(!inst.opencode_launch_mirrorable_by_ambient_serve());
+    }
+
+    /// A custom agent that wraps a supported one has no `AgentDef` of its
+    /// own, so every capture and resume path used to miss on `tool` raw: no
+    /// id was pinned at launch and no resume flag was emitted, and each
+    /// restart silently started a fresh conversation (#3638).
+    #[test]
+    fn custom_agent_pins_and_resumes_through_its_detect_as_base() {
+        const PROFILE: &str = "custom-agent-resume-test";
+        let _registry = install_aliases(
+            PROFILE,
+            &[("claude-personal", "claude"), ("cursor-personal", "cursor")],
+        );
+
+        let mut inst = Instance::new("wrapper", "/tmp/custom-agent-resume");
+        inst.source_profile = PROFILE.to_string();
+        inst.tool = "claude-personal".to_string();
+        inst.command = "claude-personal".to_string();
+
+        let mut fresh = "claude-personal".to_string();
+        assert!(!inst.apply_session_flags(&mut fresh, "test"));
+        let sid = inst
+            .agent_session_id
+            .clone()
+            .expect("a wrapper launch must pin the conversation it is about to start");
+        assert_eq!(fresh, format!("claude-personal --session-id {sid}"));
+
+        let mut restart = "claude-personal".to_string();
+        assert!(inst.apply_session_flags(&mut restart, "test"));
+        assert_eq!(restart, format!("claude-personal --resume {sid}"));
+        assert_eq!(inst.agent_session_id.as_deref(), Some(sid.as_str()));
+
+        // A wrapper whose base cannot resume stays silent, pinned id and all.
+        let mut unsupported = Instance::new("wrapper", "/tmp/custom-agent-resume");
+        unsupported.source_profile = PROFILE.to_string();
+        unsupported.tool = "cursor-personal".to_string();
+        unsupported.command = "cursor-personal".to_string();
+        unsupported.resume_intent = ResumeIntent::Use(sid.clone());
+        let mut cursor = "cursor-personal".to_string();
+        assert!(!unsupported.apply_session_flags(&mut cursor, "test"));
+        assert_eq!(cursor, "cursor-personal");
     }
 
     #[test]

@@ -423,26 +423,57 @@ pub(crate) fn claude_poll_fn(
 /// is still being appended. The host scan reads through links for the same
 /// reason (#3454), and the two have to agree for
 /// `claude_host_transcript_confirmed_absent` to mean anything.
+///
+/// `docker exec` inherits the container's environment, not the pane's, so
+/// `$CLAUDE_CONFIG_DIR` here is the value AoE injected at `docker run`. A
+/// wrapper that exports its own before `exec claude` writes where this never
+/// looked, and the session captures nothing (#3638). A declared
+/// `agent_config_dir` cannot stand in for it: the user mounts that directory
+/// themselves and AoE never sees its container path. So each distinct
+/// `CLAUDE_CONFIG_DIR` a live process declares is tried first, the first
+/// directory holding fresh transcripts winning, and the injected value is the
+/// fallback.
 fn claude_container_list_snippet(dir_name: &str) -> String {
     format!(
         r#"
-CLAUDE_HOME="${{CLAUDE_CONFIG_DIR:-$HOME/.claude}}"
-DIR="$CLAUDE_HOME/projects/{dir_name}"
-[ -d "$DIR" ] || exit 0
-for f in $(ls -tL "$DIR"/*.jsonl 2>/dev/null); do
-  [ -f "$f" ] || continue
-  [ -n "$(find -L "$f" -mmin -5 2>/dev/null)" ] || continue
-  basename "$f" .jsonl
+# A process can exit between the glob and the read; its redirect error is
+# noise, and nothing here reports through stderr.
+exec 2>/dev/null
+list_fresh() {{
+  DIR="$1/projects/{dir_name}"
+  [ -d "$DIR" ] || return 1
+  missed=1
+  for f in $(ls -tL "$DIR"/*.jsonl 2>/dev/null); do
+    [ -f "$f" ] || continue
+    [ -n "$(find -L "$f" -mmin -5 2>/dev/null)" ] || continue
+    basename "$f" .jsonl
+    missed=0
+  done
+  return $missed
+}}
+FALLBACK="${{CLAUDE_CONFIG_DIR:-$HOME/.claude}}"
+SEEN=""
+for e in /proc/[0-9]*/environ; do
+  [ -r "$e" ] || continue
+  d=$(tr '\0' '\n' < "$e" | sed -n 's/^CLAUDE_CONFIG_DIR=//p' | head -n 1)
+  [ -n "$d" ] || continue
+  [ "$d" = "$FALLBACK" ] && continue
+  case "$SEEN" in *"|$d|"*) continue ;; esac
+  SEEN="$SEEN|$d|"
+  list_fresh "$d" && exit 0
 done
+list_fresh "$FALLBACK"
+exit 0
 "#
     )
 }
 
 /// Capture Claude Code session ID inside a Docker container.
 ///
-/// Lists every fresh (≤ 5 min mtime) UUID-named jsonl in
-/// `$CLAUDE_CONFIG_DIR/projects/<encoded-cwd>/` newest-first via
-/// `docker exec`, wrapped in [`run_with_timeout`] (5 s) so a hung exec
+/// Lists every fresh (≤ 5 min mtime) UUID-named jsonl in the Claude config
+/// dir's `projects/<encoded-cwd>/` newest-first via `docker exec` (see
+/// [`claude_container_list_snippet`] for which dir that is), wrapped in
+/// [`run_with_timeout`] (5 s) so a hung exec
 /// cannot block the poller thread, then delegates per-pane attribution to
 /// [`select_claude_session_in_container`].
 pub(crate) fn capture_claude_session_id_in_container(
@@ -3722,6 +3753,67 @@ mod tests {
             None,
         );
         assert!(result.is_err());
+    }
+
+    /// A wrapper binary exports its own `CLAUDE_CONFIG_DIR` inside the pane,
+    /// after AoE has already decided what to inject at `docker run`, so the
+    /// scan used to read a directory the agent never writes and the session
+    /// never captured an id (#3638). The live process environment is the only
+    /// side of that boundary that answers.
+    ///
+    /// Linux-only: the discovery reads `/proc`, which is what the container
+    /// always is. Skipped elsewhere rather than asserted away.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn container_snippet_prefers_a_running_process_config_dir() {
+        let project_path = "/tmp/aoe-wrapper-scan";
+        let injected = tempfile::tempdir().unwrap();
+        let wrapper = tempfile::tempdir().unwrap();
+        let wrapper_sid = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+        let injected_sid = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+        for (home, sid) in [(&injected, injected_sid), (&wrapper, wrapper_sid)] {
+            let dir = home
+                .path()
+                .join("projects")
+                .join(encode_claude_project_path(project_path));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(format!("{sid}.jsonl")), "{}\n").unwrap();
+        }
+        let snippet = claude_container_list_snippet(&encode_claude_project_path(project_path));
+
+        // Nothing running declares another directory: the injected value.
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&snippet)
+            .env("CLAUDE_CONFIG_DIR", injected.path())
+            .output()
+            .expect("snippet invocation failed");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.lines().any(|l| l.trim() == injected_sid),
+            "expected the injected dir's transcript, got {stdout:?}"
+        );
+
+        // A live process declaring its own outranks it.
+        let mut pane = std::process::Command::new("sleep")
+            .arg("30")
+            .env("CLAUDE_CONFIG_DIR", wrapper.path())
+            .spawn()
+            .expect("spawn stand-in for the wrapped agent");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&snippet)
+            .env("CLAUDE_CONFIG_DIR", injected.path())
+            .output()
+            .expect("snippet invocation failed");
+        let _ = pane.kill();
+        let _ = pane.wait();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            stdout.lines().map(str::trim).collect::<Vec<_>>(),
+            vec![wrapper_sid],
+            "the wrapper's own directory must win outright"
+        );
     }
 
     /// Runs the production snippet under `sh` against a real directory, so the

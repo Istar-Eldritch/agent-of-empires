@@ -8,12 +8,17 @@ impl Instance {
     /// while running another tool, and inactive peers that still own records
     /// in a shared host store.
     pub(super) fn retroactive_capture_exclusion_set(&self) -> HashSet<String> {
+        // The tool argument stays raw: peers are matched on their own stored
+        // `tool`, and resolving only this side would stop two sessions of the
+        // same wrapper from seeing each other. Which stores need the
+        // inactive-peer sweep is agent behavior, so that resolves.
+        let capture_agent = self.capture_agent_name().unwrap_or(&self.tool);
         crate::session::capture::compose_exclusion_with_persisted_peers(
             &self.id,
             &self.project_path,
             &self.tool,
-            self.tool == "claude"
-                || (matches!(self.tool.as_str(), "codex" | "kimi") && !self.is_sandboxed()),
+            capture_agent == "claude"
+                || (matches!(capture_agent, "codex" | "kimi") && !self.is_sandboxed()),
             &self.effective_profile(),
             &self.retroactive_capture_excludes,
         )
@@ -33,8 +38,8 @@ impl Instance {
     }
 
     pub(crate) fn try_retroactive_capture(&self) -> Option<String> {
-        let result: Option<String> = match self.tool.as_str() {
-            "claude" => {
+        let result: Option<String> = match self.capture_agent_name() {
+            Some("claude") => {
                 // Claude additionally extends the common live and parked-id
                 // exclusion with stopped, archived, or pane-less peer sids so
                 // the mtime fallback skips peers whose jsonl outlived their
@@ -59,7 +64,7 @@ impl Instance {
                     .ok()
                 }
             }
-            "opencode" => {
+            Some("opencode") => {
                 let exclusion = self.retroactive_capture_exclusion_set();
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
@@ -74,7 +79,7 @@ impl Instance {
                     try_capture_opencode_session_id(&self.project_path, &exclusion, None).ok()
                 }
             }
-            "vibe" => {
+            Some("vibe") => {
                 let exclusion = self.retroactive_capture_exclusion_set();
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
@@ -88,13 +93,13 @@ impl Instance {
                     capture_vibe_session_id(&self.project_path, &exclusion).ok()
                 }
             }
-            "pi" => {
+            Some("pi") => {
                 // Never: identity comes from the pin or the floored poller,
                 // and this path has no floor at all. Sandboxed panes share one
                 // `~/.pi/sandbox`, so they are no more attributable.
                 None
             }
-            "omp" => {
+            Some("omp") => {
                 let options = self.omp_capture_options()?;
                 let exclusion = self.retroactive_capture_exclusion_set();
                 let tmux_session_name = self
@@ -115,7 +120,7 @@ impl Instance {
                     capture_omp_session_id(&metadata, &exclusion, &tmux_session_name).ok()
                 }
             }
-            "codex" => {
+            Some("codex") => {
                 if self.is_sandboxed() {
                     // Sandboxed Codex sessions have instance-private homes, so
                     // their transcript stores cannot contain a sibling's
@@ -137,7 +142,7 @@ impl Instance {
                     capture_codex_session_id(&self.project_path, &exclusion).ok()
                 }
             }
-            "gemini" => {
+            Some("gemini") => {
                 let exclusion = self.retroactive_capture_exclusion_set();
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
@@ -151,7 +156,7 @@ impl Instance {
                     capture_gemini_session_id(&self.project_path, &exclusion).ok()
                 }
             }
-            "hermes" => {
+            Some("hermes") => {
                 let exclusion = self.retroactive_capture_exclusion_set();
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
@@ -165,7 +170,7 @@ impl Instance {
                     capture_hermes_session_id(&self.project_path, &exclusion).ok()
                 }
             }
-            "copilot" => {
+            Some("copilot") => {
                 // Copilot stores sessions in a SQLite db. Host capture reads it
                 // directly; sandbox resume is a follow-up (the container's db is
                 // not read over `docker exec`), so a sandboxed Copilot session
@@ -177,7 +182,7 @@ impl Instance {
                     capture_copilot_session_id(&self.project_path, &exclusion).ok()
                 }
             }
-            "kimi" => {
+            Some("kimi") => {
                 // Kimi records sessions in `session_index.jsonl` under the
                 // resolved `KIMI_CODE_HOME`, keyed by workDir. Host capture
                 // reads it through the launched pane's environment; sandbox
@@ -209,7 +214,7 @@ impl Instance {
                     .ok()
                 }
             }
-            "prime-agent" => {
+            Some("prime-agent") => {
                 // Prime Agent writes one JSONL per session under
                 // `~/.prime/agent/sessions`, header line keyed by cwd. Host
                 // capture reads it directly; sandbox resume is a follow-up

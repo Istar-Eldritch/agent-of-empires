@@ -187,6 +187,14 @@ impl Instance {
             .or_else(|| crate::agents::get_agent(&self.effective_detect_as()))
     }
 
+    /// The built-in agent name whose capture and resume behavior applies to
+    /// this session. Both paths fail closed on an unknown tool, so keying them
+    /// off `tool` raw leaves a custom wrapper with no poller, no pre-minted id
+    /// and no resume flag, silently and forever (#3638).
+    pub(super) fn capture_agent_name(&self) -> Option<&'static str> {
+        self.resolved_agent().map(|a| a.name)
+    }
+
     pub fn is_sub_session(&self) -> bool {
         self.parent_session_id.is_some()
     }
