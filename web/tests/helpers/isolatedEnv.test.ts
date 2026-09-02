@@ -25,14 +25,24 @@ const PATHS: IsolatedPaths = {
 const NON_SUFFIX_HOST_STATE: Record<string, string> = {
   AGENT_OF_EMPIRES_DEBUG: "1",
   AGENT_OF_EMPIRES_PROFILE: "work",
+  AOE_ACP_AGENT_ENV: '[["ANTHROPIC_API_KEY","host-key"]]',
   AOE_ACP_NODE: `${HOST}/.nvm/versions/node/v22.0.0/bin/node`,
+  AOE_CAPTURED_SESSION_ID: "host-captured",
+  AOE_CITYHALL_BUNDLE_TOKEN: "host-bundle-token",
+  AOE_CITYHALL_BUNDLE_URL: "https://host.invalid/bundle",
   AOE_CITYHALL_MODE: "1",
   AOE_DAEMON_TOKEN: "host-token",
   AOE_DAEMON_URL: "http://a-real-daemon.internal:8080",
   AOE_GITHUB_CLONE_BASE: `file://${HOST}/plugins`,
   AOE_INSTANCE_ID: "host-session",
+  AOE_OMP_CAPTURE_META: "host-meta",
+  AOE_OMP_CAPTURE_READY: "1",
+  AOE_OMP_LAUNCH_ID: "host-launch",
+  AOE_OPEN_URL_TO: `${HOST}/opened-urls.txt`,
+  AOE_SERVE_INSTANCE_ID: "host-daemon",
   AOE_SERVE_PASSPHRASE: "host-secret",
   AOE_TELEMETRY_ENDPOINT: "https://host.invalid/v1/telemetry",
+  AOE_TMUX_SOCKET: "/tmp/tmux-1000/aoe.sock",
   AOE_UPDATE_API_BASE: "https://host.invalid/api",
   AOE_UPDATE_BASE_URL: "https://host.invalid",
   GIT_CONFIG_GLOBAL: `${HOST}/.gitconfig`,
@@ -76,6 +86,9 @@ const INHERITED_BY_CONTRACT = new Set([
   "AOE_TERMINAL_TRACE",
   "AOE_TEST_TOKEN_GRACE_SECS",
   "AOE_TEST_TOKEN_LIFETIME_SECS",
+  // A marker `aoe` echoes into a pane to probe a login shell, not a variable
+  // the daemon resolves anything from.
+  "AOE_AGENT_OK",
   // Reaches a real agent binary, never the daemon's own state, and every live
   // spec runs a fake agent shim.
   "CLAUDE_CODE_USE_VERTEX",
@@ -161,6 +174,7 @@ describe("isolateEnv", () => {
     expect(names).toEqual(
       expect.arrayContaining([
         "AOE_ACP_NODE",
+        "AOE_CITYHALL_BUNDLE_URL",
         "AOE_GITHUB_CLONE_BASE",
         "CLAUDE_CONFIG_DIR",
         "OPENCODE_DB",
@@ -186,8 +200,10 @@ describe("isolateEnv", () => {
 
 /**
  * Every environment variable `src/` reads: `env::var` / `env::var_os` calls,
- * clap's `env = "..."` attributes, and any quoted path-shaped name, which
- * catches the ones the daemon forwards to an agent rather than reads itself.
+ * clap's `env = "..."` attributes, any quoted path-shaped name, which catches
+ * the ones the daemon forwards to an agent rather than reads itself, and the
+ * `const NAME: &str = "AOE_..."` declarations the call-site patterns cannot
+ * see, since `env::var(SOME_ENV)` names the constant and not the variable.
  */
 function daemonEnvVars(): string[] {
   const srcDir = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "src");
@@ -195,6 +211,7 @@ function daemonEnvVars(): string[] {
     /env::var(?:_os)?\(\s*"([A-Z][A-Z0-9_]*)"/g,
     /\benv\s*=\s*"([A-Z][A-Z0-9_]*)"/g,
     /"([A-Z][A-Z0-9_]*_(?:HOME|DIR|DB|PATH|CREDENTIALS))"/g,
+    /const\s+[A-Z0-9_]+\s*:\s*&(?:'static\s+)?str\s*=\s*"([A-Z][A-Z0-9_]*)"/g,
   ];
   const names = new Set<string>();
   for (const file of rustFiles(srcDir)) {

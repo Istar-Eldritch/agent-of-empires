@@ -48,29 +48,48 @@ const GIT_VAR = /^GIT_/;
  * or the host session the test runner was launched from.
  */
 export const HOST_STATE_VARS = new Set([
-  // Both move the app dir, port, and tmux prefix off the ones `appDirFor`
-  // and `tmuxSocketPath` compute for a spec.
+  // Raises the daemon to debug logging whenever `AOE_LOG_LEVEL` is unset
+  // (`LogConfig::from_env`), adding the log I/O `spawnAoeServe` pins at
+  // `info` on purpose.
   "AGENT_OF_EMPIRES_DEBUG",
+  // clap's `--profile`, which moves the profile dir and the config the daemon
+  // resolves its port and `[tmux]` options from.
   "AGENT_OF_EMPIRES_PROFILE",
+  "AOE_ACP_AGENT_ENV", // the daemon -> runner env carrier, decoded into agents
   "AOE_ACP_NODE", // an arbitrary host Node executable for the ACP runner
   "AOE_CITYHALL_MODE", // serves the daemon as a client of a host CityHall
+  // `apply_cityhall_bundle` runs on the boot path: a host URL is fetched and
+  // applied as config, and a first boot that cannot reach it aborts the
+  // daemon outright.
+  "AOE_CITYHALL_BUNDLE_TOKEN",
+  "AOE_CITYHALL_BUNDLE_URL",
   // `discovery::discover()` prefers these over the local daemon, so every
   // `aoe` call the harness makes with this env, teardown's `acp stop --all`
   // included, would hit the developer's own daemon and kill its workers.
   "AOE_DAEMON_TOKEN",
   "AOE_DAEMON_URL",
   "AOE_GITHUB_CLONE_BASE", // redirects plugin clones at a host path or tree
+  "AOE_OPEN_URL_TO", // appends every URL the TUI opens to a host file
+  "AOE_SERVE_INSTANCE_ID", // identifies a host daemon process as this one
   "AOE_SERVE_PASSPHRASE", // host credential for the daemon's own auth
   // Host endpoints for the daemon's outbound calls.
   "AOE_TELEMETRY_ENDPOINT",
   "AOE_UPDATE_API_BASE",
   "AOE_UPDATE_BASE_URL",
   // The session the test runner was launched from: `aoe` resolves "the
-  // current session" from `TMUX_PANE`, and `AOE_INSTANCE_ID` names a host
-  // session directly.
+  // current session" from `TMUX_PANE`, `AOE_INSTANCE_ID` names a host session
+  // directly, and the capture markers `aoe` writes into a pane make the
+  // daemon read a host launch as its own.
+  "AOE_CAPTURED_SESSION_ID",
   "AOE_INSTANCE_ID",
+  "AOE_OMP_CAPTURE_META",
+  "AOE_OMP_CAPTURE_READY",
+  "AOE_OMP_LAUNCH_ID",
   "TMUX",
   "TMUX_PANE",
+  // The host tmux server. `spawnAoeServe` re-pins it at `tmuxSocketPath`
+  // after this filter, so dropping it only removes the host fallback.
+  "AOE_TMUX_SOCKET",
 ]);
 
 /**
@@ -93,8 +112,9 @@ export const INHERITED_PATH_VARS = new Set([
  * Variables pinned rather than dropped, because dropping them only falls back
  * to another host location: git reads `/etc/gitconfig` for the system file,
  * and `$HOME/.gitconfig` for the global one. Pinning the global file inside
- * the test home keeps a daemon-side `git config --global` write in the tree
- * the harness deletes. `gitFixture.ts` pins the same pair for the fixture
+ * the test home keeps a daemon-side `git config --global` write
+ * (`session::cityhall_bundle`) in the tree the harness deletes.
+ * `gitFixture.ts` pins both names at `/dev/null` for the fixture
  * subprocesses; this covers the daemon's own git calls.
  */
 export function pinnedVars(paths: IsolatedPaths): Record<string, string> {
