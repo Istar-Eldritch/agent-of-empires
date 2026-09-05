@@ -151,13 +151,22 @@ test("model menu stays on-screen and scrollable on a short viewport", async ({ p
   const menu = page.locator('[id^="config-option-menu-model"]');
   await expect(menu).toBeVisible();
 
+  const viewportSize = page.viewportSize();
+  expect(viewportSize).not.toBeNull();
   const menuBox = await menu.boundingBox();
   expect(menuBox).not.toBeNull();
   expect(menuBox!.y).toBeGreaterThanOrEqual(0);
+  expect(menuBox!.y + menuBox!.height).toBeLessThanOrEqual(viewportSize!.height);
 
-  const lastOption = page.getByTestId("config-option-model-value-model-39");
-  await lastOption.scrollIntoViewIfNeeded();
-  await expect(lastOption).toBeVisible();
+  // The capped menu must actually scroll, not just fit on-screen by
+  // silently truncating the option list: the scrollable list's content
+  // height must exceed what's visible.
+  const scrollContainer = menu.locator(".overflow-y-auto");
+  const { scrollHeight, clientHeight } = await scrollContainer.evaluate((el) => ({
+    scrollHeight: el.scrollHeight,
+    clientHeight: el.clientHeight,
+  }));
+  expect(scrollHeight).toBeGreaterThan(clientHeight);
 });
 
 test("rejected switch renders a dismissable non-blocking notice", async ({ page }) => {

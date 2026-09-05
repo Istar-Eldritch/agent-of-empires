@@ -33,12 +33,16 @@ interface Props {
 
 const MODEL_LABEL_MAX = 24;
 // Cap and floor for the menu's dynamically computed max-height (px). The
-// cap keeps a short list from looking absurdly tall; the floor keeps a
-// handful of options reachable even on a very short viewport.
+// cap keeps a short list from looking absurdly tall. The floor is a
+// best-effort minimum, not a reachability guarantee: below ~128px of
+// available space (e.g. a short viewport with a software keyboard
+// raised) the menu is still taller than the room above the trigger and
+// its top can clip off-screen. An unusably short menu is worse, so this
+// is an accepted tradeoff.
 const MENU_MAX_HEIGHT_CAP = 288;
 const MENU_MAX_HEIGHT_FLOOR = 120;
-// Gap kept between the menu's top edge and the viewport top (mirrors the
-// `mb-1` gap already kept between the menu and its trigger button).
+// Small buffer kept beyond the trigger's own `mb-1` (4px) gap so the
+// menu's top edge never touches the viewport edge.
 const MENU_VIEWPORT_MARGIN = 8;
 const EFFORT_SEGMENTED_MAX_COUNT = 5;
 const EFFORT_SEGMENTED_MAX_TOTAL_LABEL_LEN = 40;
