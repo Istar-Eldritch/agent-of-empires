@@ -225,6 +225,8 @@ describe("ModelDropdown menu direction and height", () => {
       rectTop: number;
       rectBottom: number;
       innerHeight: number;
+      vvHeight?: number;
+      vvOffsetTop?: number;
       direction: "up" | "down";
       maxHeightPx: number;
     }> = [
@@ -275,14 +277,46 @@ describe("ModelDropdown menu direction and height", () => {
         direction: "up",
         maxHeightPx: 50,
       },
+      {
+        // visualViewport.offsetTop shifts where the visible area actually
+        // starts (e.g. after pinch-zoom), so it must shift both edges of
+        // the visible interval, not just its size. Ignoring it here (i.e.
+        // treating the visible top as layout y=0) would compute spaceAbove
+        // as 242px (>= floor) and wrongly pick "up"; correctly offsetting
+        // by 200px puts the trigger only 42px below the true visible top
+        // (< floor), so it correctly flips to "down", where 722px is
+        // available (clamped to the 288px cap).
+        name: "non-zero visualViewport.offsetTop flips the chosen direction",
+        rectTop: 250,
+        rectBottom: 270,
+        innerHeight: 1000,
+        vvHeight: 800,
+        vvOffsetTop: 200,
+        direction: "down",
+        maxHeightPx: 288,
+      },
     ];
 
-    const originalInnerHeight = window.innerHeight;
+    const originalInnerHeightDescriptor = Object.getOwnPropertyDescriptor(window, "innerHeight");
+    const originalVisualViewportDescriptor = Object.getOwnPropertyDescriptor(window, "visualViewport");
     const rectSpy = vi.spyOn(Element.prototype, "getBoundingClientRect");
 
     try {
       for (const c of cases) {
-        Object.defineProperty(window, "innerHeight", { value: c.innerHeight, configurable: true });
+        Object.defineProperty(window, "innerHeight", { value: c.innerHeight, configurable: true, writable: true });
+        Object.defineProperty(window, "visualViewport", {
+          value:
+            c.vvHeight == null
+              ? undefined
+              : {
+                  height: c.vvHeight,
+                  offsetTop: c.vvOffsetTop ?? 0,
+                  addEventListener: vi.fn(),
+                  removeEventListener: vi.fn(),
+                },
+          configurable: true,
+          writable: true,
+        });
         rectSpy.mockReturnValue({
           top: c.rectTop,
           bottom: c.rectBottom,
@@ -312,7 +346,14 @@ describe("ModelDropdown menu direction and height", () => {
       }
     } finally {
       rectSpy.mockRestore();
-      Object.defineProperty(window, "innerHeight", { value: originalInnerHeight, configurable: true });
+      if (originalInnerHeightDescriptor) {
+        Object.defineProperty(window, "innerHeight", originalInnerHeightDescriptor);
+      }
+      if (originalVisualViewportDescriptor) {
+        Object.defineProperty(window, "visualViewport", originalVisualViewportDescriptor);
+      } else {
+        delete (window as unknown as { visualViewport?: unknown }).visualViewport;
+      }
     }
   });
 });

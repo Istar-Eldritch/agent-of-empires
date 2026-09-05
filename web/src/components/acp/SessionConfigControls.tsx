@@ -115,10 +115,14 @@ const DEFAULT_MENU_LAYOUT: MenuLayout = { direction: "up", maxHeight: MENU_MAX_H
  *  window.innerHeight`: on iOS Safari, `innerHeight` stays at the full
  *  layout height while the software keyboard is raised, so it alone
  *  would report room below the trigger that the keyboard has actually
- *  covered. */
-function computeMenuLayout(rect: DOMRect, viewportHeight: number): MenuLayout {
-  const spaceAbove = rect.top - MENU_VIEWPORT_MARGIN;
-  const spaceBelow = viewportHeight - rect.bottom - MENU_VIEWPORT_MARGIN;
+ *  covered. `viewportTop` should be `window.visualViewport?.offsetTop ??
+ *  0`: `getBoundingClientRect()` is relative to the layout viewport, but
+ *  the visible vertical interval is `offsetTop .. offsetTop + height`
+ *  (CSSOM View); a non-zero offset (e.g. after pinch-zoom) shifts both
+ *  edges of that interval, not just its size. */
+function computeMenuLayout(rect: DOMRect, viewportHeight: number, viewportTop = 0): MenuLayout {
+  const spaceAbove = rect.top - viewportTop - MENU_VIEWPORT_MARGIN;
+  const spaceBelow = viewportTop + viewportHeight - rect.bottom - MENU_VIEWPORT_MARGIN;
   let direction: "up" | "down";
   let available: number;
   if (spaceAbove >= MENU_MAX_HEIGHT_FLOOR) {
@@ -172,16 +176,18 @@ function ModelDropdown({ option, pending, onSelect }: SubProps) {
     const recompute = () => {
       const rect = ref.current?.getBoundingClientRect();
       if (!rect) return;
-      setMenuLayout(computeMenuLayout(rect, vv?.height ?? window.innerHeight));
+      setMenuLayout(computeMenuLayout(rect, vv?.height ?? window.innerHeight, vv?.offsetTop ?? 0));
     };
     recompute();
     window.addEventListener("resize", recompute);
     window.addEventListener("scroll", recompute, true);
     vv?.addEventListener("resize", recompute);
+    vv?.addEventListener("scroll", recompute);
     return () => {
       window.removeEventListener("resize", recompute);
       window.removeEventListener("scroll", recompute, true);
       vv?.removeEventListener("resize", recompute);
+      vv?.removeEventListener("scroll", recompute);
     };
   }, [open]);
 
