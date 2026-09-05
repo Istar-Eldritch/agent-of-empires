@@ -981,8 +981,8 @@ pub struct SessionConfig {
     )]
     pub agent_extra_args: HashMap<String, String>,
 
-    /// Per-agent command override replacing the binary (e.g.
-    /// claude=my-wrapper).
+    /// Per-agent command override. Native conversation resume requires the
+    /// resolved agent binary first; wrappers and shell syntax disable it.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[setting(
         label = "Agent Command Override",
@@ -1088,15 +1088,11 @@ pub struct SessionConfig {
         category = "Agents"
     )]
     pub auto_resume_on_restart: bool,
-
-    /// Pre-assign opencode's session id before launch instead of capturing it
-    /// afterward by polling opencode's SQLite store. AoE creates the session up
-    /// front through a short-lived `opencode serve` HTTP call, so the id is
-    /// known before the first prompt (symmetric with Claude's `--session-id`).
-    /// Eliminates the post-launch capture race, at the cost of spawning a
-    /// throwaway server (~2s) on each new host opencode launch. Off by default;
-    /// the SQLite poller stays the fallback. Host sessions only, a sandboxed
-    /// agent cannot reach the loopback server.
+    /// Pre-assign OpenCode's session id before launch so AoE knows the exact
+    /// native identity before the first prompt. AoE creates the session through
+    /// a short-lived `opencode serve` call. This avoids guessing from the shared
+    /// SQLite store, at the cost of about two seconds on each new host launch.
+    /// Off by default. Sandboxed OpenCode automatic capture is unsupported.
     #[serde(default)]
     #[setting(
         label = "Pre-assign opencode session id",
@@ -1105,7 +1101,6 @@ pub struct SessionConfig {
         advanced
     )]
     pub opencode_preassign_session_id: bool,
-
     /// Request xterm mouse tracking so the TUI handles the scroll wheel
     /// (preview-pane scroll) and click-to-select rows. Disable to hand the
     /// wheel and text selection back to the terminal, e.g. iOS Mosh +
@@ -1159,15 +1154,12 @@ pub struct SessionConfig {
     )]
     pub agent_acp_cmd: HashMap<String, String>,
 
-    /// Config directory an agent reads instead of its built-in default, keyed
-    /// by the agent name the session runs (e.g. `claude-personal =
-    /// "~/.claude-personal"` for a wrapper that exports `CLAUDE_CONFIG_DIR`).
-    /// The value is a host path in both contexts: host sessions use the
-    /// directory itself, sandboxed sessions its `sandbox` subdirectory, which
-    /// is the layout AoE already uses for the built-in agents. Consulted for
-    /// folder-trust records and for native MCP discovery, so the servers AoE
-    /// reconciles are the ones the agent actually loads; status hooks keep
-    /// resolving their config dir from the agent's own env var.
+    /// Config directory read by the session's agent instead of its built-in
+    /// default. Host sessions use the directory directly. Sandboxed sessions
+    /// use its `sandbox` subdirectory, which AoE mounts at the resolved
+    /// built-in config path and uses for hooks, credentials, and native-session
+    /// capture. Native MCP discovery reads it too, so AoE reconciles the
+    /// servers the agent loads.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[setting(
         label = "Agent Config Dir",
@@ -2467,6 +2459,86 @@ pub struct SandboxConfig {
     )]
     pub selinux_relabel: bool,
 
+    /// Run the container with `--privileged`: full device access and all
+    /// capabilities. Needed to run a container engine (rootless podman,
+    /// dockerd) inside the sandbox.
+    #[serde(default)]
+    #[setting(
+        label = "Privileged",
+        widget = "toggle",
+        web = "local_only:grants the container full host privileges",
+        repo = "deny",
+        advanced
+    )]
+    pub privileged: bool,
+
+    /// Capabilities to add to the container (`--cap-add`), e.g. "SYS_ADMIN".
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "super::serde_helpers::string_or_vec"
+    )]
+    #[setting(
+        label = "Add Capabilities",
+        widget = "list",
+        validate = "capability_list",
+        web = "local_only:grants the container extra Linux capabilities",
+        repo = "deny",
+        advanced
+    )]
+    pub cap_add: Vec<String>,
+
+    /// Capabilities to drop from the container (`--cap-drop`), e.g. "ALL".
+    /// A write replaces rather than adds, so clearing it undoes hardening.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "super::serde_helpers::string_or_vec"
+    )]
+    #[setting(
+        label = "Drop Capabilities",
+        widget = "list",
+        validate = "capability_list",
+        web = "local_only:a write replaces the list, so it can undo hardening",
+        repo = "deny",
+        advanced
+    )]
+    pub cap_drop: Vec<String>,
+
+    /// Security options for the container (`--security-opt`), e.g.
+    /// "seccomp=unconfined" or "no-new-privileges:true".
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "super::serde_helpers::string_or_vec"
+    )]
+    #[setting(
+        label = "Security Options",
+        widget = "list",
+        validate = "security_opt_list",
+        web = "local_only:relaxes the container security profile",
+        repo = "deny",
+        advanced
+    )]
+    pub security_opt: Vec<String>,
+
+    /// Extra arguments appended verbatim to the container `run` invocation,
+    /// before the image. Unvalidated, so entries bypass `sandbox.network`'s
+    /// refusal of `host`.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "super::serde_helpers::string_or_vec"
+    )]
+    #[setting(
+        label = "Extra Run Args",
+        widget = "list",
+        web = "local_only:arbitrary container runtime argv, a host execution surface",
+        repo = "deny",
+        advanced
+    )]
+    pub extra_run_args: Vec<String>,
+
     /// Custom instruction text appended to the agent's system prompt in
     /// sandboxed sessions (Claude, Codex only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2532,6 +2604,11 @@ impl Default for SandboxConfig {
             volume_ignores_strategy: VolumeIgnoresStrategy::default(),
             mount_ssh: false,
             selinux_relabel: false,
+            privileged: false,
+            cap_add: Vec::new(),
+            cap_drop: Vec::new(),
+            security_opt: Vec::new(),
+            extra_run_args: Vec::new(),
             custom_instruction: None,
             container_runtime: ContainerRuntimeName::default(),
         }
@@ -2625,11 +2702,12 @@ pub struct TmuxConfig {
     )]
     pub socket_name: Option<String>,
 
-    /// Render native agent and tool previews from a persistent VT channel
-    /// (`tmux pipe-pane` into an in-process terminal grid) instead of polling
-    /// `capture-pane` and forking `send-keys` per keystroke. Terminal previews,
-    /// including the web terminal, always use tmux's rendered capture and keep
-    /// OSC 52 forwarding through a raw observer.
+    /// Render agent previews and the web dashboard's agent terminal from a
+    /// persistent VT channel (`tmux pipe-pane` into an in-process terminal
+    /// grid) instead of polling `capture-pane` and forking `send-keys` per
+    /// keystroke. The paired host and container shells, split windows, and
+    /// every fallback keep tmux's rendered capture, with OSC 52 forwarding
+    /// through a raw observer.
     #[serde(default = "default_true")]
     #[setting(label = "VT Live Transport", widget = "toggle", advanced, global_only)]
     pub vt_live: bool,

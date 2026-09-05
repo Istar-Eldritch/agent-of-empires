@@ -292,6 +292,63 @@ impl ContainerRuntime {
             })
     }
 
+    fn apple_container_inspect_label<'a>(payload: &'a Value, key: &str) -> Result<Option<&'a str>> {
+        let Some(labels) = payload.pointer("/0/configuration/labels") else {
+            return Ok(None);
+        };
+        let labels = labels.as_object().ok_or_else(|| {
+            DockerError::InspectFailed(
+                "apple container inspect: /0/configuration/labels is not an object".to_string(),
+            )
+        })?;
+        let Some(value) = labels.get(key) else {
+            return Ok(None);
+        };
+        value.as_str().map(Some).ok_or_else(|| {
+            DockerError::InspectFailed(format!(
+                "apple container inspect: label {key} is not a string"
+            ))
+        })
+    }
+
+    fn inspect_container_label(&self, name: &str, key: &str) -> Result<Option<String>> {
+        let mut cmd = self.base.command();
+        match self.kind {
+            RuntimeKind::Docker | RuntimeKind::Podman => {
+                cmd.args([
+                    "container",
+                    "inspect",
+                    "-f",
+                    &format!(r#"{{{{index .Config.Labels "{key}"}}}}"#),
+                    name,
+                ]);
+            }
+            RuntimeKind::AppleContainer => {
+                cmd.args(["inspect", name]);
+            }
+        }
+        let output = self
+            .base
+            .probe_output(&mut cmd)
+            .map_err(|error| DockerError::InspectFailed(error.to_string()))?;
+        if !output.status.success() {
+            return Err(DockerError::InspectFailed(
+                String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            ));
+        }
+        match self.kind {
+            RuntimeKind::Docker | RuntimeKind::Podman => {
+                let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                Ok((!value.is_empty()).then_some(value))
+            }
+            RuntimeKind::AppleContainer => {
+                let payload: Value = serde_json::from_slice(&output.stdout)
+                    .map_err(|error| DockerError::InspectFailed(error.to_string()))?;
+                Ok(Self::apple_container_inspect_label(&payload, key)?.map(str::to_owned))
+            }
+        }
+    }
+
     /// The container's configured working directory (`Config.WorkingDir`), or
     /// `None` if it can't be determined (container gone, inspect failed, or the
     /// field is empty). Used to backfill the create-time-pinned workdir for
@@ -313,6 +370,26 @@ impl ContainerRuntime {
         }
         let wd = String::from_utf8_lossy(&output.stdout).trim().to_string();
         (!wd.is_empty()).then_some(wd)
+    }
+
+    pub fn sandbox_store_generation_matches(&self, name: &str) -> Result<Option<bool>> {
+        if !self.base.supports_labels {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.inspect_container_label(name, "com.agent-of-empires.sandbox-store-generation")?
+                .is_some_and(|value| value == "2"),
+        ))
+    }
+
+    pub fn mount_fingerprint_matches(&self, name: &str, expected: &str) -> Result<Option<bool>> {
+        if !self.base.supports_labels {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.inspect_container_label(name, "com.agent-of-empires.mount-fingerprint")?
+                .is_some_and(|value| value == expected),
+        ))
     }
 
     pub fn build_create_args(
@@ -691,6 +768,28 @@ mod tests {
                 None => assert!(result.is_err(), "expected Err for {payload}"),
             }
         }
+
+        let key = "com.agent-of-empires.mount-fingerprint";
+        let payload = json!([{"configuration": {"labels": {(key): "expected"}}}]);
+        assert_eq!(
+            ContainerRuntime::apple_container_inspect_label(&payload, key).unwrap(),
+            Some("expected")
+        );
+        for payload in [json!([{}]), json!([{"configuration": {"labels": {}}}])] {
+            assert_eq!(
+                ContainerRuntime::apple_container_inspect_label(&payload, key).unwrap(),
+                None
+            );
+        }
+        for payload in [
+            json!([{"configuration": {"labels": []}}]),
+            json!([{"configuration": {"labels": {(key): 3}}}]),
+        ] {
+            assert!(
+                ContainerRuntime::apple_container_inspect_label(&payload, key).is_err(),
+                "expected Err for {payload}"
+            );
+        }
     }
 
     #[test]
@@ -805,10 +904,18 @@ mod tests {
         // separate elements, so the prompt is never shell-parsed.
         assert_eq!(&argv[9..], &oneshot_argv()[..]);
 
+        // `printf` sits in /usr/bin on macOS and in /bin on most Linux
+        // images. The probe is about an absolute path running without a
+        // usable PATH, not about where that path happens to be, so resolve it
+        // rather than hardcoding one layout and failing on the other.
+        let printf = ["/usr/bin/printf", "/bin/printf"]
+            .into_iter()
+            .find(|candidate| std::path::Path::new(candidate).exists())
+            .expect("an absolute printf to prove PATH independence with");
         let executable = ContainerRuntime::apple_container().build_exec_argv(
             "aoe-sandbox-test1234",
             "",
-            &["/bin/printf".to_string(), "PATH_INDEPENDENT".to_string()],
+            &[printf.to_string(), "PATH_INDEPENDENT".to_string()],
         );
         let output = std::process::Command::new(&executable[3])
             .args(&executable[4..])
@@ -816,7 +923,10 @@ mod tests {
             .env("PATH", "/definitely-missing")
             .output()
             .unwrap();
-        assert!(output.status.success());
+        assert!(
+            output.status.success(),
+            "{printf} must run with no usable PATH, got {output:?}"
+        );
         assert_eq!(output.stdout, b"PATH_INDEPENDENT");
     }
 
