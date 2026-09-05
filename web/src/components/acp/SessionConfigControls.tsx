@@ -21,7 +21,7 @@
 //   shares the dismiss callback's home.
 
 import { ChevronUp } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import type { ConfigOptionDescriptor, AcpState } from "../../lib/acpTypes";
 
@@ -32,6 +32,14 @@ interface Props {
 }
 
 const MODEL_LABEL_MAX = 24;
+// Cap and floor for the menu's dynamically computed max-height (px). The
+// cap keeps a short list from looking absurdly tall; the floor keeps a
+// handful of options reachable even on a very short viewport.
+const MENU_MAX_HEIGHT_CAP = 288;
+const MENU_MAX_HEIGHT_FLOOR = 120;
+// Gap kept between the menu's top edge and the viewport top (mirrors the
+// `mb-1` gap already kept between the menu and its trigger button).
+const MENU_VIEWPORT_MARGIN = 8;
 const EFFORT_SEGMENTED_MAX_COUNT = 5;
 const EFFORT_SEGMENTED_MAX_TOTAL_LABEL_LEN = 40;
 
@@ -85,6 +93,7 @@ interface SubProps {
 
 function ModelDropdown({ option, pending, onSelect }: SubProps) {
   const [open, setOpen] = useState(false);
+  const [menuMaxHeight, setMenuMaxHeight] = useState(MENU_MAX_HEIGHT_CAP);
   const ref = useRef<HTMLDivElement | null>(null);
   const menuId = `config-option-menu-${option.id}`;
   const current = option.options.find((o) => o.value === option.current_value) ?? option.options[0];
@@ -103,6 +112,27 @@ function ModelDropdown({ option, pending, onSelect }: SubProps) {
     return () => {
       document.removeEventListener("mousedown", onClick);
       document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  // The menu opens upward (`bottom-full`), so its real ceiling is the
+  // trigger button's distance from the top of the viewport, not a fixed
+  // guess. Recomputed on open and on resize/scroll so a short viewport
+  // (or one that shrinks after opening) still leaves the menu reachable.
+  useLayoutEffect(() => {
+    if (!open) return;
+    const recompute = () => {
+      const rect = ref.current?.getBoundingClientRect();
+      if (!rect) return;
+      const available = rect.top - MENU_VIEWPORT_MARGIN;
+      setMenuMaxHeight(Math.max(MENU_MAX_HEIGHT_FLOOR, Math.min(MENU_MAX_HEIGHT_CAP, available)));
+    };
+    recompute();
+    window.addEventListener("resize", recompute);
+    window.addEventListener("scroll", recompute, true);
+    return () => {
+      window.removeEventListener("resize", recompute);
+      window.removeEventListener("scroll", recompute, true);
     };
   }, [open]);
 
@@ -129,7 +159,8 @@ function ModelDropdown({ option, pending, onSelect }: SubProps) {
       {open && (
         <div
           id={menuId}
-          className="absolute bottom-full left-0 z-30 mb-1 flex w-64 max-h-72 flex-col overflow-hidden rounded-md border border-surface-700 bg-surface-850 shadow-xl"
+          className="absolute bottom-full left-0 z-30 mb-1 flex w-64 flex-col overflow-hidden rounded-md border border-surface-700 bg-surface-850 shadow-xl"
+          style={{ maxHeight: menuMaxHeight }}
           role="menu"
         >
           <div className="border-b border-surface-800 px-3 py-1.5 text-[10px] uppercase tracking-wider text-text-dim">
