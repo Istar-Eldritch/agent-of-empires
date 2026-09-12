@@ -1506,6 +1506,46 @@ impl EventStore {
         rows.filter_map(|r| r.ok()).collect()
     }
 
+    /// Agent ids of `BackgroundAgentLaunched` events for the session that
+    /// lack a later `BackgroundAgentCompleted` with the same id. Used on
+    /// reattach/spawn to detect sub-agents whose tailer died with the
+    /// previous daemon: no tailer will ever resume them (they are not
+    /// replayed to the fresh connection), so they would otherwise stay
+    /// `Running`/`Stalled` in the UI forever. See `Detached`.
+    pub fn unresolved_background_agent_ids(&self, session_id: &str) -> Vec<String> {
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let mut stmt = match conn.prepare(
+            "SELECT json_extract(event_json, '$.BackgroundAgentLaunched.agent_id') AS agent_id
+             FROM acp_events
+             WHERE session_id = ?1
+               AND discriminant = 'BackgroundAgentLaunched'
+               AND json_extract(event_json, '$.BackgroundAgentLaunched.agent_id') NOT IN (
+                   SELECT json_extract(event_json, '$.BackgroundAgentCompleted.agent_id')
+                   FROM acp_events
+                   WHERE session_id = ?1
+                     AND discriminant = 'BackgroundAgentCompleted'
+               )
+             ORDER BY seq ASC",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(target: "acp.event_store", "prepare unresolved_background_agent_ids for {session_id}: {e}");
+                return Vec::new();
+            }
+        };
+        let rows = match stmt.query_map(params![session_id], |row| row.get::<_, String>(0)) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(target: "acp.event_store", "query unresolved_background_agent_ids for {session_id}: {e}");
+                return Vec::new();
+            }
+        };
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
     /// Full `Approval` payloads for the session's `ApprovalRequested` events
     /// that lack a later `ApprovalResolved` with the same nonce, in request
     /// order. Unlike [`Self::unresolved_approval_nonces`] (a bare-nonce
