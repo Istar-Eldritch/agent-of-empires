@@ -325,8 +325,21 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
         }
 
         // `publish_persisted` folds this event into the control cache before
-        // broadcasting the frame, so the cached `turn_active` already
-        // reflects it (#4001).
+        // broadcasting the frame, so a hydrated cache already reflects it. A
+        // cold cache (nothing has hydrated this session since the daemon
+        // started, e.g. right after a restart with a reattached worker)
+        // never received that fold, so hydrate it here before reading: the
+        // replay picks up this frame's own event too, since it is persisted
+        // to the store before being broadcast. `fold_control_state` hydrates
+        // through the cache's per-session lock, so a second frame for the
+        // same cold session waits for the first rather than double-hydrating
+        // (#4001).
+        if !state.acp_control_cache.is_hydrated(&frame.session_id) {
+            state
+                .session_service
+                .fold_control_state(&frame.session_id)
+                .await;
+        }
         let turn_active_after = state.acp_control_cache.turn_active(&frame.session_id);
         let background_agent_active_after = state
             .acp_control_cache
@@ -1908,6 +1921,248 @@ mod tests {
         let instances = state.instances.read().await;
         let row = instances.iter().find(|i| i.id == id).expect("row present");
         assert_eq!(row.status, Status::Idle, "the Stopped applied");
+    }
+
+    /// #4001: after a daemon restart the control cache is cold, and the
+    /// live listener's own reads of it never hydrate. A worker reattaching
+    /// mid-turn then emits its background sub-agent's completion live, with
+    /// no Stopped in between; without hydrating first, both activity flags
+    /// read false and the completion wrongly derives Idle, marking the
+    /// still-open turn unread. Hydrating must pick up the whole log,
+    /// including the still-open `UserPromptSent`, and keep the row Running.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn acp_event_listener_hydrates_a_cold_cache_for_a_reattached_mid_turn_completion() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: serialized test; no other test mutates HOME concurrently.
+        unsafe { std::env::set_var("HOME", temp.path()) };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        }
+        crate::session::set_unread_enabled(true);
+
+        let profile = "acp-listener-cold-reattach";
+        let mut inst = Instance::new("acp-cold-reattach", "/tmp/acp");
+        inst.view = crate::session::View::Structured;
+        inst.source_profile = profile.to_string();
+        // What boot-time seeding would have left: the turn was open when the
+        // previous daemon died.
+        inst.status = Status::Running;
+        let id = inst.id.clone();
+        seed_profile_store(profile, vec![inst.clone()]);
+
+        let state = test_support::build_test_app_state(vec![inst]);
+
+        // The whole pre-restart log, persisted but never folded into this
+        // (fresh, cold) process's cache: the turn is still open, a sub-agent
+        // was launched, and it has now completed. No Stopped.
+        state
+            .acp_event_store
+            .record(
+                &id,
+                1,
+                &crate::acp::Event::UserPromptSent {
+                    text: "spawn and go".into(),
+                    attachments: Vec::new(),
+                    prompt_id: None,
+                },
+            )
+            .expect("record prompt");
+        state
+            .acp_event_store
+            .record(
+                &id,
+                2,
+                &crate::acp::Event::BackgroundAgentLaunched {
+                    agent_id: "bg-1".into(),
+                    tool_call_id: "tc-1".into(),
+                    description: "map backend".into(),
+                    prompt: "do it".into(),
+                    model: "claude-opus-4-8".into(),
+                    output_file: "/tmp/bg-1.output".into(),
+                    started_at: chrono::Utc::now(),
+                },
+            )
+            .expect("record launch");
+        let completed = crate::acp::Event::BackgroundAgentCompleted {
+            agent_id: "bg-1".into(),
+            status: crate::acp::state::BackgroundAgentStatus::Completed,
+            tools: Vec::new(),
+            result: Some("done".into()),
+            warning: None,
+            ended_at: chrono::Utc::now(),
+        };
+        state
+            .acp_event_store
+            .record(&id, 3, &completed)
+            .expect("record completion");
+
+        assert!(
+            !state.acp_control_cache.is_hydrated(&id),
+            "precondition: a fresh process starts with a cold cache"
+        );
+
+        let listener = tokio::spawn(acp_event_listener(state.clone()));
+        for _ in 0..500 {
+            if state.acp_events_tx.receiver_count() > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(
+            state.acp_events_tx.receiver_count() > 0,
+            "listener never subscribed"
+        );
+
+        // The reattached worker's tailer resumes and emits the sub-agent's
+        // completion as the first live frame this process sees.
+        state
+            .acp_events_tx
+            .send(AcpBroadcastFrame {
+                session_id: id.clone(),
+                seq: 3,
+                event: Arc::new(completed),
+                worker_generation: None,
+            })
+            .expect("listener is subscribed");
+
+        let mut hydrated = false;
+        for _ in 0..500 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            if state.acp_control_cache.is_hydrated(&id) {
+                hydrated = true;
+                break;
+            }
+        }
+        // apply_status_intent and the unread check run synchronously right
+        // after the hydrating await returns, with no yield point in between,
+        // so by the time the cache reports hydrated the write has landed.
+        listener.abort();
+
+        assert!(hydrated, "the listener never hydrated the cold session");
+        assert!(
+            state.acp_control_cache.turn_active(&id),
+            "the replay must pick up the still-open UserPromptSent"
+        );
+
+        let instances = state.instances.read().await;
+        let row = instances.iter().find(|i| i.id == id).expect("row present");
+        assert_eq!(
+            row.status,
+            Status::Running,
+            "a live turn must not drop to Idle off a cold-cache miss"
+        );
+        assert!(!row.unread, "an unfinished turn must not be marked unread");
+    }
+
+    /// #4001: a `BackgroundAgentLaunched` must not clobber a pending
+    /// approval's Waiting dot even when the cache that computes its target
+    /// status is cold and needs hydrating first.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn acp_event_listener_hydrating_a_cold_cache_does_not_clobber_a_pending_approval() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: serialized test; no other test mutates HOME concurrently.
+        unsafe { std::env::set_var("HOME", temp.path()) };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        }
+        crate::session::set_unread_enabled(true);
+
+        let profile = "acp-listener-cold-waiting";
+        let mut inst = Instance::new("acp-cold-waiting", "/tmp/acp");
+        inst.view = crate::session::View::Structured;
+        inst.source_profile = profile.to_string();
+        // What boot-time seeding would have left: an approval was pending
+        // when the previous daemon died.
+        inst.status = Status::Waiting;
+        let id = inst.id.clone();
+        seed_profile_store(profile, vec![inst.clone()]);
+
+        let state = test_support::build_test_app_state(vec![inst]);
+
+        let tool_call = crate::acp::state::ToolCall {
+            id: "tc-1".into(),
+            name: "Edit".into(),
+            kind: "edit".into(),
+            args_preview: String::new(),
+            started_at: chrono::Utc::now(),
+            diffs: Vec::new(),
+            memory_recall: None,
+            parent_tool_call_id: None,
+        };
+        state
+            .acp_event_store
+            .record(
+                &id,
+                1,
+                &crate::acp::Event::ApprovalRequested {
+                    approval: crate::acp::permissions::build_approval(tool_call, Vec::new()),
+                },
+            )
+            .expect("record approval");
+        let launched = crate::acp::Event::BackgroundAgentLaunched {
+            agent_id: "bg-1".into(),
+            tool_call_id: "tc-2".into(),
+            description: "map backend".into(),
+            prompt: "do it".into(),
+            model: "claude-opus-4-8".into(),
+            output_file: "/tmp/bg-1.output".into(),
+            started_at: chrono::Utc::now(),
+        };
+        state
+            .acp_event_store
+            .record(&id, 2, &launched)
+            .expect("record launch");
+
+        let listener = tokio::spawn(acp_event_listener(state.clone()));
+        for _ in 0..500 {
+            if state.acp_events_tx.receiver_count() > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(
+            state.acp_events_tx.receiver_count() > 0,
+            "listener never subscribed"
+        );
+
+        state
+            .acp_events_tx
+            .send(AcpBroadcastFrame {
+                session_id: id.clone(),
+                seq: 2,
+                event: Arc::new(launched),
+                worker_generation: None,
+            })
+            .expect("listener is subscribed");
+
+        let mut hydrated = false;
+        for _ in 0..500 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            if state.acp_control_cache.is_hydrated(&id) {
+                hydrated = true;
+                break;
+            }
+        }
+        listener.abort();
+
+        assert!(hydrated, "the listener never hydrated the cold session");
+        assert!(
+            state.acp_control_cache.has_active_background_agent(&id),
+            "the replay must pick up the launch even though the guard below \
+             ignores it"
+        );
+
+        let instances = state.instances.read().await;
+        let row = instances.iter().find(|i| i.id == id).expect("row present");
+        assert_eq!(
+            row.status,
+            Status::Waiting,
+            "a background launch must not clobber a pending approval"
+        );
     }
 
     // #2237: a worker coming live (AcpSessionAssigned) must clear a stale
