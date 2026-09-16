@@ -991,10 +991,12 @@ pub(crate) enum StatusIntent {
 /// Whether `derive_acp_status` reads either activity flag for `event`,
 /// i.e. whether a caller must hydrate a cold control cache before calling
 /// it. Adjacent to the two flag-reading arms below, not structurally tied to
-/// them: `derive_acp_status_ignores_the_flags_off_the_two_reading_arms`
-/// enumerates every other named arm and asserts each ignores the flags, so a
-/// new arm that starts reading them without being added here fails that
-/// test rather than silently under-hydrating the live listener.
+/// them: nothing enforces the pairing at compile time.
+/// `derive_acp_status_ignores_the_flags_off_the_two_reading_arms` covers
+/// every arm named today and fails if one of those starts reading the flags
+/// without being added here; the two functions sit next to each other so a
+/// genuinely new `Event` variant with a flag-reading arm is still on the
+/// reviewer to catch in the diff, the test cannot see it.
 pub(super) fn reads_activity_flags(event: &crate::acp::Event) -> bool {
     matches!(
         event,
@@ -2832,12 +2834,14 @@ mod tests {
         use crate::acp::state::ToolCall;
         use crate::acp::Event;
         // Every arm `derive_acp_status` currently gives a name to, other than
-        // `Stopped` and `BackgroundAgentCompleted`. If a future arm starts
+        // `Stopped` and `BackgroundAgentCompleted`. If one of these starts
         // reading `turn_active_after` / `background_agent_active_after`
-        // without extending `reads_activity_flags`, its entry here still
-        // returns `false`, the assertion below calls it with `(false, false)`
-        // and `(true, true)`, and a flag-sensitive result makes them differ:
-        // this fails instead of silently under-hydrating the live listener.
+        // without extending `reads_activity_flags`, this table still calls it
+        // with `(false, false)` and `(true, true)` below, and a flag-sensitive
+        // result makes them differ: this fails. A brand-new `Event` variant
+        // with its own flag-reading arm is in neither this table nor the
+        // predicate, so it passes silently; extending both stays a
+        // reviewer-caught convention, not something this test can enforce.
         let tool_call = ToolCall {
             id: "t".into(),
             name: "shell".into(),

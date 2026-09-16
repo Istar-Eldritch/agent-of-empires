@@ -5880,45 +5880,10 @@ cursor-acp-bridge = "agent acp"
         let _home = crate::session::test_support::isolate_home(tmp.path());
         let sink = VecSink::new();
         let sup = Supervisor::new(sink.clone());
-        let dummy_spec = AgentSpec {
-            command: "/bin/true".into(),
-            args: vec![],
-            description: "test fixture".into(),
-            env_allowlist: None,
-        };
-        let dummy_config = SpawnConfig {
-            wrapper_substitution: None,
-            agent_key: "claude".into(),
-            tool: "claude".into(),
-            spec: dummy_spec,
-            cwd: std::env::temp_dir(),
-            additional_dirs: vec![],
-            provider_env: vec![],
-            host_environment: vec![],
-            default_effort: None,
-            default_effort_explicit: false,
-            default_mode: None,
-            socket_path: Some(tmp.path().join("dummy.sock")),
-            stored_acp_session_id: None,
-            fork_from: None,
-            seed_history_replay: false,
-            generation: 0,
-            artifact_dir: None,
-            sandbox_info: None,
-            source_profile: None,
-            mcp_servers: Vec::new(),
-        };
         {
             let (client, _tx) = AcpClient::fake_for_test(AcpSessionId("s-stop".into()));
-            sup.test_install_handle(
-                "s-stop",
-                client,
-                WorkerKind::Runner {
-                    spawn_config: Box::new(dummy_config),
-                },
-                None,
-            )
-            .await;
+            sup.test_install_handle("s-stop", client, dummy_runner_kind(&tmp), None)
+                .await;
         }
 
         sup.shutdown("s-stop")
@@ -6002,8 +5967,8 @@ cursor-acp-bridge = "agent acp"
             .filter(|(id, _, _)| id == "s-detach")
             .collect();
         assert_eq!(mine.len(), 3, "two detach completions plus the Stopped");
-        for (id, expected_agent) in [(0, "bg-1"), (1, "bg-2")] {
-            match &mine[id].2 {
+        for (idx, expected_agent) in [(0, "bg-1"), (1, "bg-2")] {
+            match &mine[idx].2 {
                 Event::BackgroundAgentCompleted {
                     agent_id, status, ..
                 } => {
@@ -6080,9 +6045,7 @@ cursor-acp-bridge = "agent acp"
     /// `StopDecision::CancelRequested` (a resume is still in flight, no
     /// worker handle installed yet): the detach scan and the `Stopped` it
     /// rides with both live inside `TearDown`, so a shutdown that lands
-    /// before the resume finishes building must publish neither. The resume
-    /// itself tears down whatever it built (see the case above once it
-    /// lands).
+    /// before the resume finishes building must publish neither.
     #[tokio::test]
     #[serial_test::serial]
     async fn shutdown_during_an_in_flight_resume_publishes_nothing() {
@@ -6102,6 +6065,97 @@ cursor-acp-bridge = "agent acp"
         assert!(
             sink.frames.lock().unwrap().is_empty(),
             "a resume-in-flight cancel must publish nothing, detach included"
+        );
+    }
+
+    /// #4001, end to end: the four detach tests above all go through
+    /// `VecSink`, a canned stand-in that never exercises `ChannelSink`'s own
+    /// `unresolved_background_agent_ids` override or the real SQL scan
+    /// behind it, so a wrong json path or session key there would pass the
+    /// whole suite. Build a real disk-backed `EventStore`, record a launch
+    /// through it exactly as a live worker would, tear the session down
+    /// through a real `ChannelSink`, then read the same store back: the
+    /// maintainer's Stop -> resume/prompt -> completion scenario, minus the
+    /// resume (already covered by the fold-only tests in `state.rs` and
+    /// `acp_events.rs`).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn shutdown_detaches_through_a_real_channel_sink_and_event_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        }
+
+        let event_store = Arc::new(
+            crate::acp::event_store::EventStore::open(&tmp.path().join("acp.db"), 1000).unwrap(),
+        );
+        event_store
+            .record(
+                "s-real-teardown",
+                1,
+                &Event::BackgroundAgentLaunched {
+                    agent_id: "bg-real".into(),
+                    tool_call_id: "tc-real".into(),
+                    description: "map backend".into(),
+                    prompt: "do it".into(),
+                    model: "claude-opus-4-8".into(),
+                    output_file: "/tmp/bg-real.output".into(),
+                    started_at: chrono::Utc::now(),
+                },
+            )
+            .unwrap();
+
+        let (tx, _rx) = tokio::sync::broadcast::channel(16);
+        let sink = Arc::new(ChannelSink {
+            tx,
+            event_store: event_store.clone(),
+            control_cache: Arc::new(crate::acp::control_cache::ControlStateCache::new()),
+        });
+        let sup = Supervisor::new(sink);
+        // The pre-existing seq=1 was written straight to the store, not
+        // through the supervisor, so next_seqs needs the same hydrate a
+        // real daemon restart performs, or teardown's seq=1 publish would
+        // collide with it and the synthetic completion would be silently
+        // dropped (INSERT OR IGNORE on the (session_id, seq) primary key).
+        sup.hydrate_seqs([("s-real-teardown".to_string(), 1)]);
+        {
+            let (client, _tx) = AcpClient::fake_for_test(AcpSessionId("s-real-teardown".into()));
+            sup.test_install_handle("s-real-teardown", client, dummy_runner_kind(&tmp), None)
+                .await;
+        }
+
+        sup.shutdown("s-real-teardown")
+            .await
+            .expect("shutdown should succeed");
+
+        // Replay the disk log back, independent of the supervisor: this is
+        // what the WS-on-connect drain and /acp/replay actually read.
+        let replayed = event_store.replay_from("s-real-teardown", 0);
+        assert_eq!(replayed.len(), 3, "launch, detach completion, stopped");
+        assert_eq!(replayed[0].0, 1);
+        assert!(matches!(
+            replayed[0].1,
+            Event::BackgroundAgentLaunched { .. }
+        ));
+        assert_eq!(replayed[1].0, 2);
+        match &replayed[1].1 {
+            Event::BackgroundAgentCompleted {
+                agent_id, status, ..
+            } => {
+                assert_eq!(agent_id, "bg-real");
+                assert_eq!(*status, BackgroundAgentStatus::Detached);
+            }
+            other => panic!("expected a Detached completion at seq 2, got {other:?}"),
+        }
+        assert_eq!(replayed[2].0, 3);
+        assert!(matches!(replayed[2].1, Event::Stopped { .. }));
+
+        assert!(
+            event_store
+                .unresolved_background_agent_ids("s-real-teardown")
+                .is_empty(),
+            "the real ChannelSink override must reach the real scan and close it out"
         );
     }
 
