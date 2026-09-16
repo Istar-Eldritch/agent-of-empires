@@ -526,9 +526,10 @@ pub(crate) async fn seed_acp_statuses(state: Arc<AppState>) {
             continue;
         };
         // No live control-state fold to consult at boot (the cache is
-        // cold), so a background sub-agent outstanding across a restart
-        // reads as Idle here same as before #4001; the reconciler and the
-        // next live event correct it once the tailer resumes.
+        // cold and boot deliberately does not hydrate it), so a background
+        // sub-agent outstanding across a restart reads as Idle here; the
+        // reconciler and the next live event correct it once the tailer
+        // resumes (#4001).
         let Some(intent) = derive_acp_status(&event, false, false) else {
             continue;
         };
@@ -1403,9 +1404,10 @@ mod tests {
                 )
                 .expect("record stopped");
         }
-        // A cold control cache for these sessions: never hydrated, so the
-        // reads miss and degrade to boot's conservative `(false, false)`
-        // verdict, the pre-#4001 Idle+unread behavior this test pins.
+        // A cold control cache for these sessions: lag recovery never
+        // hydrates it, so the reads miss and degrade to boot's conservative
+        // `(false, false)` verdict, the Idle+unread behavior this test pins
+        // (#4001).
         let control_cache = crate::acp::control_cache::ControlStateCache::new();
 
         let instances = RwLock::new(rows);
