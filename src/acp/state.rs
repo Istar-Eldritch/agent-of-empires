@@ -1929,6 +1929,61 @@ mod tests {
         assert!(!s.has_active_background_agent());
     }
 
+    /// #4001: `Supervisor::shutdown_with_reason`'s teardown path publishes a
+    /// synthetic `BackgroundAgentCompleted { Detached }` for an agent the
+    /// dying worker's tailer will never report on again. It must close the
+    /// record exactly like any other terminal status: `ended_at` set,
+    /// `has_active_background_agent` false, and immune to a late Progress
+    /// (there is none coming, but the guard is shared with `Completed`/
+    /// `Error` and must not special-case this variant out of it).
+    #[test]
+    fn background_agent_completed_detached_closes_the_record() {
+        let mut s = fresh_state();
+        s.apply_event(Event::BackgroundAgentLaunched {
+            agent_id: "a1".into(),
+            tool_call_id: "tc1".into(),
+            description: "map backend".into(),
+            prompt: "do the thing".into(),
+            model: "claude-opus-4-8".into(),
+            output_file: "/tmp/a1.output".into(),
+            started_at: Utc::now(),
+        })
+        .unwrap();
+        assert!(s.has_active_background_agent());
+
+        s.apply_event(Event::BackgroundAgentCompleted {
+            agent_id: "a1".into(),
+            status: BackgroundAgentStatus::Detached,
+            tools: vec![],
+            result: None,
+            warning: None,
+            ended_at: Utc::now(),
+        })
+        .unwrap();
+        assert_eq!(
+            s.background_agents[0].status,
+            BackgroundAgentStatus::Detached
+        );
+        assert!(s.background_agents[0].ended_at.is_some());
+        assert!(!s.has_active_background_agent());
+
+        s.apply_event(Event::BackgroundAgentProgress {
+            agent_id: "a1".into(),
+            status: BackgroundAgentStatus::Running,
+            tool_count: 9,
+            tools: vec![],
+            last_tool: None,
+            last_text: None,
+            at: Utc::now(),
+        })
+        .unwrap();
+        assert_eq!(
+            s.background_agents[0].status,
+            BackgroundAgentStatus::Detached,
+            "a terminal Detached record must not reopen to Running"
+        );
+    }
+
     /// A non-terminal `Progress{stalled}` (no `ended_at` yet, only the
     /// eventual `BackgroundAgentCompleted` sets that) still resumes normally
     /// on the next `Progress{running}`.

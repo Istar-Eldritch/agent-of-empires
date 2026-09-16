@@ -2690,6 +2690,78 @@ mod tests {
         );
     }
 
+    /// #4001: stopping a session mid-sub-agent must not leave it reading
+    /// Running forever. `Supervisor::shutdown_with_reason`'s teardown path
+    /// now publishes a synthetic `BackgroundAgentCompleted { Detached }` for
+    /// every outstanding agent before its own `Stopped`; replay this exact
+    /// sequence through a real `AcpState` (not hand-fed booleans) to prove
+    /// the fold actually clears `has_active_background_agent`, and that the
+    /// resumed session's terminating `Stopped` derives Idle off it.
+    #[test]
+    fn derive_acp_status_resolves_idle_once_teardown_detaches_the_last_agent() {
+        use crate::acp::state::{AcpSessionId, AcpState, AgentName, BackgroundAgentStatus};
+        use crate::acp::Event;
+
+        let mut state = AcpState::new(AcpSessionId("s-1".into()), AgentName("claude".into()), None);
+        state
+            .apply_event(Event::UserPromptSent {
+                prompt_id: None,
+                text: "spawn and go".into(),
+                attachments: Vec::new(),
+            })
+            .unwrap();
+        state
+            .apply_event(Event::BackgroundAgentLaunched {
+                agent_id: "bg-1".into(),
+                tool_call_id: "tc-1".into(),
+                description: "map backend".into(),
+                prompt: "do it".into(),
+                model: "claude-opus-4-8".into(),
+                output_file: "/tmp/bg-1.output".into(),
+                started_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        assert!(
+            state.has_active_background_agent(),
+            "precondition: the launch is still outstanding"
+        );
+
+        // Without this event the fold below would still see the agent as
+        // outstanding and the final Stopped would derive Running: this is
+        // the bug (#4001), not a hypothetical.
+        state
+            .apply_event(Event::BackgroundAgentCompleted {
+                agent_id: "bg-1".into(),
+                status: BackgroundAgentStatus::Detached,
+                tools: Vec::new(),
+                result: None,
+                warning: None,
+                ended_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        assert!(
+            !state.has_active_background_agent(),
+            "a Detached completion closes the record like any other terminal status"
+        );
+
+        state
+            .apply_event(Event::Stopped {
+                reason: "user_stopped".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            derive_acp_status(
+                &Event::Stopped {
+                    reason: "user_stopped".into()
+                },
+                state.turn_active,
+                state.has_active_background_agent(),
+            ),
+            Some(StatusIntent::Set(Status::Idle)),
+            "the resumed session's turn-end must not read Running forever"
+        );
+    }
+
     #[test]
     fn derive_acp_session_change_extracts_assigned_id() {
         use crate::acp::Event;
