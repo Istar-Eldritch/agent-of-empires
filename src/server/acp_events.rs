@@ -600,7 +600,7 @@ pub(crate) fn apply_status_intent(
         // likewise stays until the main turn's own lifecycle moves it. The
         // main turn's own events (plain `Set`) resolve Waiting and Error;
         // Error also heals on a fresh worker attach.
-        StatusIntent::SetUnlessWaiting(s) => {
+        StatusIntent::SetUnlessHeld(s) => {
             if matches!(
                 inst.status,
                 Status::Stopped | Status::Waiting | Status::Error
@@ -984,7 +984,7 @@ pub(crate) enum StatusIntent {
     /// respawn). Background sub-agent lifecycle events must not speak for
     /// the main turn; its own events (plain `Set`) and `HealError` resolve
     /// those. Used only by the `BackgroundAgent*` arms (#4001).
-    SetUnlessWaiting(Status),
+    SetUnlessHeld(Status),
     HealError,
 }
 
@@ -1037,13 +1037,11 @@ pub(crate) fn derive_acp_status(
         // dot lit even while the main turn is between its own events. Must
         // not override a pending approval/elicitation's Waiting dot, which
         // speaks to the main turn, not the sub-agent (#4001).
-        Event::BackgroundAgentLaunched { .. } => {
-            Some(StatusIntent::SetUnlessWaiting(Status::Running))
-        }
+        Event::BackgroundAgentLaunched { .. } => Some(StatusIntent::SetUnlessHeld(Status::Running)),
         Event::BackgroundAgentProgress {
             status: crate::acp::state::BackgroundAgentStatus::Running,
             ..
-        } => Some(StatusIntent::SetUnlessWaiting(Status::Running)),
+        } => Some(StatusIntent::SetUnlessHeld(Status::Running)),
         // A pending approval or elicitation both block the turn on the
         // user, so the sidebar dot goes yellow either way.
         Event::ApprovalRequested { .. } | Event::ElicitationRequested { .. } => {
@@ -1072,10 +1070,10 @@ pub(crate) fn derive_acp_status(
         // once neither the main turn nor a sibling agent is still active
         // (`turn_active_after` covers a sub-agent launched mid-turn that
         // outlives its own completion event's ordering; the `Stopped` arm
-        // consults the same flags). `SetUnlessWaiting`
+        // consults the same flags). `SetUnlessHeld`
         // because a sibling agent finishing must not clobber a pending
         // approval/elicitation on the main turn (#4001).
-        Event::BackgroundAgentCompleted { .. } => Some(StatusIntent::SetUnlessWaiting(
+        Event::BackgroundAgentCompleted { .. } => Some(StatusIntent::SetUnlessHeld(
             if turn_active_after || background_agent_active_after {
                 Status::Running
             } else {
@@ -2535,7 +2533,7 @@ mod tests {
                 false,
                 true,
             ),
-            Some(StatusIntent::SetUnlessWaiting(Status::Running)),
+            Some(StatusIntent::SetUnlessHeld(Status::Running)),
             "a sibling background agent is still active"
         );
         // The main turn that launched this agent is still going (it landed
@@ -2554,7 +2552,7 @@ mod tests {
                 true,
                 false,
             ),
-            Some(StatusIntent::SetUnlessWaiting(Status::Running)),
+            Some(StatusIntent::SetUnlessHeld(Status::Running)),
             "the main turn is still active"
         );
         assert_eq!(
@@ -2570,7 +2568,7 @@ mod tests {
                 false,
                 false,
             ),
-            Some(StatusIntent::SetUnlessWaiting(Status::Idle)),
+            Some(StatusIntent::SetUnlessHeld(Status::Idle)),
             "the last background agent finished and the main turn already stopped"
         );
         assert_eq!(
@@ -2587,7 +2585,7 @@ mod tests {
                 false,
                 false,
             ),
-            Some(StatusIntent::SetUnlessWaiting(Status::Running))
+            Some(StatusIntent::SetUnlessHeld(Status::Running))
         );
         assert_eq!(
             derive_acp_status(
@@ -2603,7 +2601,7 @@ mod tests {
                 false,
                 false,
             ),
-            Some(StatusIntent::SetUnlessWaiting(Status::Running))
+            Some(StatusIntent::SetUnlessHeld(Status::Running))
         );
         // Rate-limit park: NOT an error; sidebar stays grey, the
         // dedicated RateLimit banner carries the reset time. See #1281.
@@ -3019,7 +3017,7 @@ mod tests {
     fn set_unless_waiting_is_a_noop_while_waiting_but_plain_set_still_recovers() {
         let mut inst = stopped_structured_instance();
         inst.status = Status::Waiting;
-        apply(&mut inst, StatusIntent::SetUnlessWaiting(Status::Running));
+        apply(&mut inst, StatusIntent::SetUnlessHeld(Status::Running));
         assert_eq!(
             inst.status,
             Status::Waiting,
@@ -3038,7 +3036,7 @@ mod tests {
     fn set_unless_waiting_behaves_like_set_when_not_waiting() {
         let mut inst = stopped_structured_instance();
         inst.status = Status::Idle;
-        apply(&mut inst, StatusIntent::SetUnlessWaiting(Status::Running));
+        apply(&mut inst, StatusIntent::SetUnlessHeld(Status::Running));
         assert_eq!(inst.status, Status::Running);
     }
 
@@ -3046,19 +3044,19 @@ mod tests {
     /// connection's Error banner: the tailer keeps draining on a cloned
     /// sender while the supervisor evaluates a respawn. The main turn's
     /// own events (plain `Set`) and `HealError` from a fresh worker attach
-    /// both still resolve Error; only `SetUnlessWaiting` preserves it.
+    /// both still resolve Error; only `SetUnlessHeld` preserves it.
     #[test]
     fn set_unless_waiting_never_clears_a_main_agent_error() {
         let mut inst = stopped_structured_instance();
         inst.status = Status::Error;
-        apply(&mut inst, StatusIntent::SetUnlessWaiting(Status::Running));
+        apply(&mut inst, StatusIntent::SetUnlessHeld(Status::Running));
         assert_eq!(
             inst.status,
             Status::Error,
             "a background sub-agent starting must not clear the main connection's error"
         );
 
-        apply(&mut inst, StatusIntent::SetUnlessWaiting(Status::Idle));
+        apply(&mut inst, StatusIntent::SetUnlessHeld(Status::Idle));
         assert_eq!(
             inst.status,
             Status::Error,

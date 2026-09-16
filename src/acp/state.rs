@@ -529,7 +529,7 @@ pub struct AcpState {
     /// (`acp::dispatch::decide`) and the queue drain
     /// (`session_service::drain_queued_prompts_once`) gate on this directly,
     /// so it must track only the main turn, never a background sub-agent's
-    /// lifecycle; use [`Self::is_visibly_busy`] for a display-only signal.
+    /// lifecycle; display signals combine it with `has_active_background_agent()`.
     #[serde(default)]
     pub turn_active: bool,
     /// Whether the running turn is steerable (a mid-turn prompt is injected
@@ -1178,13 +1178,6 @@ impl AcpState {
         self.background_agents.iter().any(|a| a.ended_at.is_none())
     }
 
-    /// Display-only busy signal: the main turn or an outstanding background
-    /// sub-agent. Distinct from `turn_active`, which gates prompt dispatch
-    /// and the queue drain and must track only the main turn.
-    pub fn is_visibly_busy(&self) -> bool {
-        self.turn_active || self.has_active_background_agent()
-    }
-
     /// Apply a single event. Returns the new `last_seq` on success.
     pub fn apply_event(&mut self, event: Event) -> Result<u64, StateError> {
         match event {
@@ -1386,7 +1379,7 @@ impl AcpState {
                 // keeps running past its parent's `Stopped`, but `turn_active`
                 // gates prompt dispatch and the queue drain, not just display
                 // (#4001): it must clear unconditionally here. Use
-                // `is_visibly_busy` at display boundaries for the combined
+                // display boundaries combine both flags for the busy signal;
                 // signal.
                 self.turn_active = false;
                 self.cancelling = false;
@@ -2036,7 +2029,7 @@ mod tests {
     /// #4001: `Stopped` must clear `turn_active` unconditionally, even while
     /// a background sub-agent it spawned is still running. `turn_active`
     /// gates prompt dispatch and the queue drain, not just display; the busy
-    /// *display* signal is the separate `is_visibly_busy`.
+    /// *display* signal combines this with `has_active_background_agent()`.
     #[test]
     fn stopped_clears_turn_active_regardless_of_a_running_background_agent() {
         let mut s = fresh_state();
@@ -2066,7 +2059,7 @@ mod tests {
              instead of queuing it behind a background agent"
         );
         assert!(
-            s.is_visibly_busy(),
+            s.has_active_background_agent(),
             "the background agent is still running, so the display signal stays busy"
         );
 
@@ -2084,7 +2077,7 @@ mod tests {
             "BackgroundAgentCompleted must not touch turn_active"
         );
         assert!(
-            !s.is_visibly_busy(),
+            !s.has_active_background_agent(),
             "the last background agent finished, so the display signal goes idle"
         );
     }
@@ -2122,7 +2115,6 @@ mod tests {
             !s.has_active_background_agent(),
             "a terminal Stalled completion (ended_at set) must not count as active"
         );
-        assert!(!s.is_visibly_busy());
     }
 
     /// A background agent finishing while the main turn is still genuinely
