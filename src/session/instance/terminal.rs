@@ -326,14 +326,19 @@ impl Instance {
 mod tests {
     use super::*;
     use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
     use std::process::{Command, Stdio};
 
+    /// Writes from a child `sh` so this binary never holds the writable
+    /// descriptor: a concurrent spawn forking inside that window would make
+    /// the later execve fail with ETXTBSY (#3861).
     fn write_executable(path: &std::path::Path, contents: &str) {
-        std::fs::write(path, contents).unwrap();
-        let mut permissions = std::fs::metadata(path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(path, permissions).unwrap();
+        let status = Command::new("/bin/sh")
+            .args(["-c", r#"printf %s "$1" > "$2" && chmod 755 "$2""#, "sh"])
+            .arg(contents)
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "writing {}", path.display());
     }
 
     #[test]
@@ -673,31 +678,39 @@ exec /usr/bin/env -i PATH="$TARGET_PATH" SHELL="$FALLBACK_SHELL" "$@"
             }
             let inst = Instance::new("ktid_alive", "/tmp");
             let name = crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title);
+            let _guard = crate::tmux::test_helpers::TmuxTestSession::from_name(name.clone());
             spawn_remain_on_exit(&name, "sleep 30");
-            // Give tmux a moment to register the pane.
-            std::thread::sleep(std::time::Duration::from_millis(200));
+            let pane = crate::tmux::test_helpers::only_pane_id(&name);
+            let session = inst.terminal_tmux_session().unwrap();
+            assert!(session.exists());
+            assert!(!session.is_pane_dead());
 
-            let result = inst.kill_terminal_if_dead();
-            cleanup(&name);
-
-            assert!(!result.unwrap(), "live pane should not trigger a kill");
+            assert!(
+                !inst.kill_terminal_if_dead().unwrap(),
+                "live pane should not trigger a kill"
+            );
+            assert_eq!(crate::tmux::test_helpers::only_pane_id(&name), pane);
+            assert!(session.exists());
+            assert!(!session.is_pane_dead());
         }
 
         #[test]
         #[serial_test::serial]
         fn kills_dead_pane_session() {
+            use crate::tmux::test_helpers::{only_pane_id, wait_for_pane_dead, TmuxTestSession};
+
             if !tmux_available() {
                 eprintln!("Skipping: tmux not available");
                 return;
             }
             let inst = Instance::new("ktid_dead", "/tmp");
             let name = crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title);
+            let _guard = TmuxTestSession::from_name(name.clone());
             // `true` exits immediately; remain-on-exit keeps the session alive
             // with a dead pane (matches the production failure mode: shell
             // exited via Ctrl+D / `exit` / SIGHUP, session still listed).
             spawn_remain_on_exit(&name, "true");
-            // Allow the pane to transition to dead.
-            std::thread::sleep(std::time::Duration::from_millis(300));
+            wait_for_pane_dead(&only_pane_id(&name));
 
             let session = inst.terminal_tmux_session().unwrap();
             assert!(

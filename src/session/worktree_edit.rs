@@ -447,6 +447,81 @@ pub fn edit_worktree_workdir(
     })
 }
 
+/// Rename a managed branch without moving its directory or touching its files.
+/// The caller holds the session identity and lifecycle locks and persists the result.
+pub fn rename_worktree_branch(
+    info: &WorktreeInfo,
+    path: &Path,
+    branch: &str,
+) -> anyhow::Result<bool> {
+    anyhow::ensure!(
+        info.managed_by_aoe,
+        "Branch-only rename requires a managed worktree"
+    );
+    anyhow::ensure!(
+        !branch.is_empty() && branch.trim() == branch && !branch.starts_with('-'),
+        "Provide an exact Git branch name"
+    );
+    anyhow::ensure!(
+        git2::Reference::is_valid_name(&format!("refs/heads/{branch}")),
+        "Provide an exact valid Git branch name"
+    );
+    let git = GitWorktree::new(PathBuf::from(&info.main_repo_path))?;
+    let canonical = path.canonicalize()?;
+    anyhow::ensure!(
+        Path::new(&info.main_repo_path).canonicalize()? != canonical,
+        "The main checkout cannot be renamed as a task"
+    );
+    let worktrees = git.list_worktrees()?;
+    anyhow::ensure!(
+        worktrees.iter().any(
+            |wt| wt.path.canonicalize().ok().as_ref() == Some(&canonical)
+                && wt.branch.as_deref() == Some(&info.branch)
+        ),
+        "Worktree path or branch no longer matches session metadata"
+    );
+    anyhow::ensure!(
+        GitWorktree::get_current_branch(path)? == info.branch,
+        "Worktree branch changed; refresh session metadata before renaming"
+    );
+    if branch == info.branch {
+        return Ok(false);
+    }
+    let protected = git.protected_default_branch_names()?;
+    anyhow::ensure!(
+        !["main", "master"].contains(&info.branch.as_str()) && !protected.contains(&info.branch),
+        "The default branch cannot be renamed as a task"
+    );
+    anyhow::ensure!(
+        !worktrees.iter().any(|wt| {
+            wt.branch.as_deref() == Some(&info.branch)
+                && wt.path.canonicalize().ok().as_ref() != Some(&canonical)
+        }),
+        "Source branch is shared by another Git worktree"
+    );
+    anyhow::ensure!(
+        !git.branch_exists(branch)?,
+        "Target branch already exists: {branch}"
+    );
+    git.rename_branch(&info.branch, branch)?;
+    Ok(true)
+}
+
+/// Roll back a branch rename only while the worktree still uses the renamed branch.
+pub fn rollback_worktree_branch(
+    info: &WorktreeInfo,
+    path: &Path,
+    renamed_branch: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        GitWorktree::get_current_branch(path)? == renamed_branch,
+        "Worktree branch changed concurrently; refusing branch rollback"
+    );
+    GitWorktree::new(PathBuf::from(&info.main_repo_path))?
+        .rename_branch(renamed_branch, &info.branch)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,24 +640,36 @@ mod tests {
         assert!(!ensure_sandbox_container_released("any-session-id", false));
     }
 
+    #[cfg(unix)]
     #[test]
     fn discard_after_move_short_circuits_without_sandbox() {
-        // After the #2596 fix, the `is_sandboxed` guard is the ONLY thing that
-        // keeps a plain (non-sandbox) worktree rename from spawning a `docker`
-        // subprocess. Time-bound to catch a future edit that reorders the
-        // guard below the runtime call: the sandbox-off path returns before
-        // any `DockerContainer::from_session_id` allocation, so wall time is
-        // sub-millisecond; 100 ms is a CI-safe upper bound that still catches
-        // a real `docker inspect` (dozens to hundreds of ms) or a
-        // `container.discard()` shell-out. The Teardown-variant branches
-        // (Removed / AlreadyGone / Failed) are covered by the
-        // `classify_removal` unit tests in `containers::mod`.
-        let start = std::time::Instant::now();
-        discard_sandbox_container_after_move("any-session-id", false);
-        let elapsed = start.elapsed();
+        use std::os::unix::fs::PermissionsExt;
+        let home = crate::session::test_support::isolate_app_dir();
+        let bin = home.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let marker = home.path().join("runtime-calls");
+        let _env =
+            crate::session::test_support::EnvGuard::set(&[("AOE_TEST_RUNTIME_CALLS", &marker)]);
+        for binary in ["docker", "podman", "container"] {
+            let script = bin.join(binary);
+            std::fs::write(
+                &script,
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$AOE_TEST_RUNTIME_CALLS\"\nexit 0\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _path = crate::session::test_support::path_prepended(&bin);
+        discard_sandbox_container_after_move("worktree-discard-probe", false);
         assert!(
-            elapsed < std::time::Duration::from_millis(100),
-            "non-sandbox path must short-circuit before any container runtime call; elapsed = {elapsed:?}"
+            !marker.exists(),
+            "non-sandbox move invoked the native runtime"
+        );
+        discard_sandbox_container_after_move("worktree-discard-probe", true);
+        let calls = std::fs::read_to_string(marker).unwrap();
+        assert!(
+            calls.lines().any(|line| line.starts_with("rm ")),
+            "sandbox control must reach the runtime removal command: {calls}"
         );
     }
 

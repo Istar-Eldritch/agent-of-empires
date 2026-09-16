@@ -327,7 +327,9 @@ Remove a session
 * `--force` — Force worktree removal even with untracked/modified files
 * `--keep-container` — Keep container instead of deleting it (default: delete per config)
 * `--keep-scratch` — For scratch sessions, keep the scratch directory on disk instead of removing it. The session record is still deleted; the kept path is logged so you can find the files later. No effect on non-scratch sessions
-* `--purge` — Permanently delete instead of moving to trash. By default `rm` moves the session to the trash (when `session.delete_to_trash` is enabled, the default) so it can be restored; `--purge` forces the irreversible teardown (worktree/branch/container cleanup per the other flags, plus transcript removal)
+* `--purge` — Permanently delete instead of moving to trash.
+
+   By default `rm` moves the session to the trash (when `session.delete_to_trash` is enabled, the default) so it can be restored; `--purge` forces the irreversible teardown (worktree/branch/container cleanup per the other flags) and removes the session's structured-view transcript. Removing the sandbox container also attempts to remove its private agent stores, including its config home; keeping the container keeps those stores. Host agent conversation history outside these stores is not removed.
 
 
 
@@ -497,6 +499,7 @@ Rename a session
 * `-t`, `--title <TITLE>` — New title for the session
 * `-g`, `--group <GROUP>` — New group for the session (empty string to ungroup)
 * `--rename-branch` — When the session is tied (session.tie_workdir_to_name) and an aoe-managed worktree, also rename the underlying git branch to match. Off by default; ignored for untied / non-worktree sessions
+* `--branch <BRANCH>` — Rename the Git branch without moving the worktree directory
 
 
 
@@ -825,7 +828,7 @@ Manage plugins (list, info, enable, disable, install, update, uninstall)
 * `enable` — Enable a plugin's contributions
 * `disable` — Disable a plugin; its settings stay on disk for re-enabling
 * `install` — Install an external plugin from a `gh:owner/repo[@ref]` slug or a local directory. With no `@ref`, installs the repo's latest release; an explicit `@ref` installs unverified, un-audited code. Community plugins run at your own risk
-* `update` — Update an installed external plugin from its recorded source. Prompts to re-approve capabilities if the update changes the capability set
+* `update` — Update an installed external plugin from its recorded source and restart its worker in a running daemon. Prompts to re-approve capabilities if the update changes the capability set
 * `uninstall` — Uninstall an external plugin, removing its files and capability grant
 * `hash` — Print the deterministic source tree hash for a plugin directory, the value a maintainer pins in the featured index
 * `discover` — Search GitHub's `aoe-plugin` topic for installable plugins
@@ -895,7 +898,7 @@ Install an external plugin from a `gh:owner/repo[@ref]` slug or a local director
 
 ## `aoe plugin update`
 
-Update an installed external plugin from its recorded source. Prompts to re-approve capabilities if the update changes the capability set
+Update an installed external plugin from its recorded source and restart its worker in a running daemon. Prompts to re-approve capabilities if the update changes the capability set
 
 **Usage:** `aoe plugin update <ID>`
 

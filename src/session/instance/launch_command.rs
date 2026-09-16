@@ -475,9 +475,6 @@ impl Instance {
             let extension_configured = identity_extension.is_some();
             self.pi_extension_launched = extension_configured
                 && extension_backend == Some(crate::agents::SessionCaptureBackend::Pi);
-            if extension_backend == Some(crate::agents::SessionCaptureBackend::PrimeAgent) {
-                self.identity_publisher_launched = extension_configured;
-            }
             if let Some((ref flag, _)) = identity_extension {
                 tool_cmd.push_str(flag);
             }
@@ -509,6 +506,11 @@ impl Instance {
                 shell_escape(&profile),
                 shell_escape(&self.id)
             ));
+            if let Some(agent) = agent {
+                env_info
+                    .docker_args
+                    .push_str(&format!(" -e AOE_AGENT_BIN={}", shell_escape(agent.binary)));
+            }
             if let Some(&(key, expected)) = agent.and_then(|agent| {
                 agent
                     .container_env
@@ -708,7 +710,7 @@ mod tests {
     fn sandboxed_pi_launch_line_carries_the_sidecar_env() {
         let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
         let temp_home = tempfile::tempdir().unwrap();
-        let _home = crate::session::test_support::EnvGuard::set(&[("HOME", temp_home.path())]);
+        let _home = crate::session::test_support::isolate_home(temp_home.path());
 
         let project = temp_home.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
@@ -758,7 +760,7 @@ mod tests {
         // The extension is written under `HOME`, so this owns one: the
         // global lock keeps it from racing another test's `HOME` swap.
         let temp_home = tempfile::tempdir().unwrap();
-        let _home = crate::session::test_support::EnvGuard::set(&[("HOME", temp_home.path())]);
+        let _home = crate::session::test_support::isolate_home(temp_home.path());
 
         let mut inst = Instance::new("pi-sandbox", "/tmp/pi-sandbox");
         inst.tool = "pi".to_string();
@@ -1002,9 +1004,12 @@ mod tests {
             "wrapped command failed: {}",
             String::from_utf8_lossy(&output.stderr),
         );
+        // `pwd` prints the logical path on BSD and the physical one under GNU
+        // coreutils, so compare the directories rather than their spellings.
+        let printed = String::from_utf8_lossy(&output.stdout);
         assert_eq!(
-            String::from_utf8_lossy(&output.stdout).trim(),
-            working_dir.to_string_lossy(),
+            std::path::Path::new(printed.trim()).canonicalize().unwrap(),
+            working_dir.canonicalize().unwrap(),
         );
     }
 

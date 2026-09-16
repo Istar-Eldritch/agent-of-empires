@@ -109,12 +109,10 @@ impl SessionSandbox {
     }
 }
 
-/// Result of constructing the `docker exec` argv for a sandboxed structured view
-/// spawn. `docker_binary` is argv[0] (the docker/podman runtime);
-/// `docker_args` is everything after it (including the container name
-/// and the in-container agent argv). `inherit_env` is the set of
-/// (key, value) pairs the parent process must export so docker can
-/// forward them via the matching `-e KEY` flags already in `docker_args`.
+/// `docker exec` arguments for a sandboxed structured view spawn.
+/// `docker_binary` is `argv[0]` (docker/podman); `docker_args` contains the
+/// remaining arguments. Export `inherit_env` so the `-e KEY` flags in
+/// `docker_args` forward those values into the container.
 pub(super) struct SandboxArgv {
     pub(super) docker_binary: String,
     pub(super) docker_args: Vec<String>,
@@ -319,7 +317,7 @@ mod tests {
     /// Sandboxed structured view spawn must wrap the agent command in
     /// `docker exec` argv with `-i`, the container workdir, an `-e`
     /// flag per env entry, then the container name, then the agent
-    /// argv. The docker binary must be argv[0]. Mirrors the tmux
+    /// argv. The docker binary must be `argv[0]`. Mirrors the tmux
     /// view's wrap so the same `claude-agent-acp` invocation
     /// goes inside the container instead of running on the host.
     #[test]
@@ -474,9 +472,7 @@ mod tests {
     /// when the adapter's `env_allowlist` names it (#3238). The path resolves
     /// to nothing inside the container, so forwarding it points the adapter
     /// away from the config dir `AGENT_CONFIG_MOUNTS` bind-mounts at the
-    /// canonical container location. `CLAUDE_CONFIG_DIR` established the rule;
-    /// `CODEX_HOME` and `GOOGLE_APPLICATION_CREDENTIALS` reach the same
-    /// function through the per-adapter allowlists.
+    /// canonical container location.
     ///
     /// Tagged `#[serial]` because the test mutates the process-wide
     /// env; parallel readers of `std::env::var` would race.
@@ -494,6 +490,16 @@ mod tests {
             (
                 "GOOGLE_APPLICATION_CREDENTIALS",
                 "/Users/operator/gcp-key.json",
+            ),
+            ("AWS_CONFIG_FILE", "/Users/operator/.aws/config"),
+            (
+                "AWS_SHARED_CREDENTIALS_FILE",
+                "/Users/operator/.aws/credentials",
+            ),
+            ("AWS_WEB_IDENTITY_TOKEN_FILE", "/Users/operator/.aws/token"),
+            (
+                "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+                "/Users/operator/.aws/container-token",
             ),
             ("OPENAI_API_KEY", "sk-test-value"),
         ]);
@@ -520,6 +526,10 @@ mod tests {
                     "CLAUDE_CONFIG_DIR".into(),
                     "CODEX_HOME".into(),
                     "GOOGLE_APPLICATION_CREDENTIALS".into(),
+                    "AWS_CONFIG_FILE".into(),
+                    "AWS_SHARED_CREDENTIALS_FILE".into(),
+                    "AWS_WEB_IDENTITY_TOKEN_FILE".into(),
+                    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE".into(),
                     "OPENAI_API_KEY".into(),
                 ]),
             },
@@ -547,6 +557,10 @@ mod tests {
             "CLAUDE_CONFIG_DIR",
             "CODEX_HOME",
             "GOOGLE_APPLICATION_CREDENTIALS",
+            "AWS_CONFIG_FILE",
+            "AWS_SHARED_CREDENTIALS_FILE",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
         ] {
             assert!(
                 !argv.docker_args.iter().any(|a| a == key),

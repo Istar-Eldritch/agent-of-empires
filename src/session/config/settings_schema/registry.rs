@@ -119,6 +119,16 @@ mod tests {
     }
 
     #[test]
+    fn session_host_tab_title_is_an_interaction_toggle() {
+        let d = descriptor("session", "host_tab_title").expect("host_tab_title");
+        assert_eq!(d.category, "Interaction");
+        assert_eq!(d.widget, WidgetKind::Toggle);
+        assert!(d.profile_overridable);
+        assert!(!d.advanced);
+        assert!(matches!(d.web_write, WebWritePolicy::Allow));
+    }
+
+    #[test]
     fn session_row_tag_is_select_with_options() {
         let d = descriptor("session", "row_tag").expect("row_tag");
         match &d.widget {
@@ -227,6 +237,7 @@ mod tests {
             // Declared on the field.
             ("sandbox", "extra_volumes", RepoPolicy::Deny),
             ("sandbox", "selinux_relabel", RepoPolicy::Deny),
+            ("worktree", "path_template", RepoPolicy::Deny),
             ("session", "default_tool", RepoPolicy::Deny),
             ("session", "agent_detect_as", RepoPolicy::Allow),
             // Inherited: `session` declares repo_default = "deny", every other
@@ -234,7 +245,7 @@ mod tests {
             ("session", "yolo_mode_default", RepoPolicy::Deny),
             ("sandbox", "memory_limit", RepoPolicy::Allow),
             ("sandbox", "container_runtime", RepoPolicy::Allow),
-            ("worktree", "path_template", RepoPolicy::Allow),
+            ("worktree", "auto_cleanup", RepoPolicy::Allow),
         ] {
             let d = descriptor(section, field).unwrap_or_else(|| panic!("{section}.{field}"));
             assert_eq!(d.repo_policy, expected, "{section}.{field}");

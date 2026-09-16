@@ -180,6 +180,17 @@ jobs:
           persist-credentials: false
       - run: python3 .github/scripts/select-internal-pr.py --self-test
 
+  cachix-alert-selftest:
+    name: Cachix Alert Self-Test
+    runs-on: ubuntu-latest
+    # Guards the classifier cachix-push.yml uses to decide whether a failed
+    # build on main opens an issue. No toolchain; runs in seconds.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: python3 .github/scripts/classify-cachix-failure.py --self-test
+
   nix:
     name: Nix Eval
     runs-on: ubuntu-latest
@@ -195,7 +206,7 @@ jobs:
           set -euo pipefail
           python3 scripts/check-nix-embedded-assets.py --self-test
           python3 scripts/check-nix-embedded-assets.py
-      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
+      - uses: ./.github/actions/install-nix
       - name: Evaluate flake outputs (all systems)
         run: |
           set -euo pipefail
@@ -301,7 +312,7 @@ jobs:
             echo "relevant=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
+      - uses: ./.github/actions/install-nix
         if: steps.changes.outputs.relevant == 'true'
 
       - name: Build default package
@@ -349,7 +360,7 @@ jobs:
             echo "relevant=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
+      - uses: ./.github/actions/install-nix
         if: steps.changes.outputs.relevant == 'true'
 
       - name: Build aoe-web-frontend

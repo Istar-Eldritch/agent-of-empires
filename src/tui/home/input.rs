@@ -1274,12 +1274,8 @@ impl HomeView {
         );
     }
 
-    /// Discard unsaved Settings changes: force-close the view, clear the
-    /// confirm state, and revert any live theme preview back to the saved
-    /// config theme. Shared by the keyboard (Esc/q -> confirm) and mouse
-    /// (click [Yes]) discard paths so the two can't drift. The mouse path
-    /// previously skipped the theme revert, so discarding via a click left a
-    /// previewed theme applied until the next restart.
+    /// Discard unsaved Settings changes and restore the saved config theme.
+    /// Both keyboard confirmation and clicking `[Yes]` must undo live previews.
     pub(super) fn discard_settings_changes(&mut self) -> Action {
         if let Some(ref mut settings) = self.settings_view {
             settings.force_close();
@@ -4022,14 +4018,13 @@ impl HomeView {
             return;
         }
 
-        // Pass 2: fall back to the most-recently-accessed Idle session, skipping
-        // the cursor. Sessions never attached (last_accessed_at == None) rank
-        // last but remain eligible.
-        let mut best: Option<(usize, Option<chrono::DateTime<chrono::Utc>>)> = None;
-        for idx in 0..len {
-            if idx == self.cursor {
-                continue;
-            }
+        // Pass 2: fall back to the next non-dismissed Idle session in list
+        // order, skipping the cursor. Recomputing a global
+        // most-recently-accessed row here made older idle sessions
+        // unreachable: repeated `w` presses only toggled between the newest
+        // rows.
+        for i in 0..len - 1 {
+            let idx = (start + i) % len;
             let id = match self.flat_items.get(idx) {
                 Some(Item::Session { id, .. }) => id.clone(),
                 _ => continue,
@@ -4037,35 +4032,14 @@ impl HomeView {
             let Some(inst) = self.get_instance(&id) else {
                 continue;
             };
-            if inst.is_dismissed() {
-                continue;
-            }
-            if inst.status != Status::Idle {
-                continue;
-            }
-            let ts = inst.last_accessed_at;
-            let beats = match best {
-                None => true,
-                Some((_, b)) => match (ts, b) {
-                    (Some(a), Some(b)) => a > b,
-                    (Some(_), None) => true,
-                    (None, _) => false,
-                },
-            };
-            if beats {
-                best = Some((idx, ts));
+            if !inst.is_dismissed() && inst.status == Status::Idle {
+                self.jump_to_session_id(&id);
+                return;
             }
         }
 
-        if let Some((idx, _)) = best {
-            let id = match self.flat_items.get(idx) {
-                Some(Item::Session { id, .. }) => id.clone(),
-                _ => return,
-            };
-            self.jump_to_session_id(&id);
-            return;
-        }
-
+        // A collapsed group may hide an idle session from `flat_items`. Keep
+        // the existing most-recently-accessed selection for hidden rows.
         let mut best_hidden: Option<(String, Option<chrono::DateTime<chrono::Utc>>)> = None;
         for inst in self.instances.values() {
             if visible_sessions.contains(&inst.id)

@@ -185,6 +185,9 @@ pub struct App {
     /// effect without a restart. When false, `sync_mouse_capture` keeps xterm
     /// tracking off entirely.
     mouse_capture_allowed: bool,
+    /// Last OSC 0 host-tab title written. Dedups unchanged selections and
+    /// is invalidated after `tmux attach` so the dashboard title is restored.
+    host_title: super::host_title::HostTitleTracker,
     /// True when running under Mosh (`MOSH_CONNECTION` set). Mosh mangles
     /// xterm mouse-tracking escapes, so `tui::run` skips the startup
     /// `EnableMouseCapture` and `sync_mouse_capture` must not re-enable
@@ -514,6 +517,7 @@ impl App {
             // `mouse_capture_allowed` is permission only and ignores Mosh.
             mouse_captured: crate::tui::mouse_capture_requested(&config.session) && !mosh_active,
             mouse_capture_allowed: crate::tui::mouse_capture_requested(&config.session),
+            host_title: super::host_title::HostTitleTracker::default(),
             mosh_active,
             pending_structured_view_open: None,
             pending_daemon_start_open: None,
@@ -553,6 +557,24 @@ impl App {
             crossterm::execute!(terminal.backend_mut(), DisableMouseCapture)?;
         }
         self.mouse_captured = desired;
+        Ok(())
+    }
+
+    /// Write OSC 0 when the dashboard selection (or its title) changes.
+    ///
+    /// Emitted after the frame so it does not interleave with OSC 8 runs
+    /// inside `HyperlinkBackend::draw`. No-ops when the setting is off
+    /// and we have never written, so opt-out users keep the terminal's
+    /// own naming.
+    fn sync_host_title(&mut self, terminal: &mut Terminal<TuiBackend>) -> Result<()> {
+        let Some(title) = self
+            .host_title
+            .sync(self.home.host_tab_title, self.home.selected_session_title())
+        else {
+            return Ok(());
+        };
+        crossterm::execute!(terminal.backend_mut(), crossterm::terminal::SetTitle(title))?;
+        super::host_title::note_emitted();
         Ok(())
     }
 
@@ -612,6 +634,7 @@ impl App {
         );
         draw_result?;
         end_result?;
+        self.sync_host_title(terminal)?;
         Ok(())
     }
 
@@ -684,6 +707,9 @@ impl App {
         // to the serve view. sync_mouse_capture itself respects the Mouse
         // Capture setting and the AOE_MOUSE_CAPTURE opt-out.
         self.sync_mouse_capture(terminal)?;
+        // Attach may have overwritten the host tab via the pane's OSC 0.
+        self.host_title.invalidate();
+        self.sync_host_title(terminal)?;
         std::io::Write::flush(terminal.backend_mut())?;
 
         // Recreate the event stream with a fresh reader before re-entering the
@@ -692,6 +718,16 @@ impl App {
         // born into raw mode rather than attached to a briefly-cooked tty.
         self.event_stream = Some(EventStream::new());
         crate::tui::clear_terminal(terminal)?;
+        #[cfg(feature = "e2e-tests")]
+        if let Some(path) = std::env::var_os("AOE_E2E_INPUT_BARRIER") {
+            let path = std::path::PathBuf::from(path).with_extension("resumed");
+            let previous = match std::fs::read_to_string(&path) {
+                Ok(value) => value.parse::<u64>()?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                Err(error) => return Err(error.into()),
+            };
+            std::fs::write(path, (previous + 1).to_string())?;
+        }
 
         Ok(result)
     }
@@ -771,6 +807,8 @@ impl App {
         // Otherwise the user would have to press a key first.
         self.sync_mouse_capture(terminal)?;
         self.draw(terminal)?;
+        #[cfg(feature = "e2e-tests")]
+        e2e_render_ack(true)?;
 
         // Spawn async update check at startup. The periodic re-check below
         // covers long-running sessions (#1471). `last_update_check` stays
@@ -1916,6 +1954,11 @@ impl App {
                 refresh_needed = true;
                 needs_full_refresh = true;
             }
+            for session_id in self.home.take_restarted_attaches() {
+                self.attach_live_session(&session_id, terminal)?;
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
 
             if self.home.apply_attach_project_results() {
                 refresh_needed = true;
@@ -2914,12 +2957,36 @@ fn quit_intent(
     QuitIntent::Quit
 }
 
+#[cfg(feature = "e2e-tests")]
+pub(crate) fn e2e_render_ack(initial: bool) -> Result<()> {
+    let Some(path) = std::env::var_os("AOE_E2E_INPUT_BARRIER") else {
+        return Ok(());
+    };
+    let sequence = if initial {
+        0
+    } else {
+        std::fs::read_to_string(&path)?.parse::<u64>()? + 1
+    };
+    std::fs::write(path, sequence.to_string())?;
+    crossterm::execute!(
+        std::io::stdout(),
+        crossterm::terminal::SetTitle(format!("aoe-e2e-{sequence}"))
+    )?;
+    Ok(())
+}
+
 impl App {
     async fn handle_key(
         &mut self,
         key: KeyEvent,
         terminal: &mut Terminal<TuiBackend>,
     ) -> Result<()> {
+        #[cfg(feature = "e2e-tests")]
+        if key.code == KeyCode::F(12) && std::env::var_os("AOE_E2E_INPUT_BARRIER").is_some() {
+            self.draw(terminal)?;
+            e2e_render_ack(false)?;
+            return Ok(());
+        }
         // An ACTIVE embedded structured view owns the keyboard, just as
         // the full-screen view owned the whole event stream: letters must
         // reach the composer, not home-view shortcuts (q, n, d…). A merely
@@ -3804,50 +3871,24 @@ impl App {
                 return Ok(());
             }
 
-            // Get terminal size to pass to tmux session creation
-            // This ensures the session starts at the correct size instead of 80x24 default
-            let size = crate::terminal::get_size();
-
             // Skip on_launch hooks if they already ran in the background creation poller
             let skip_on_launch = self.home.take_on_launch_hooks_ran(session_id);
-
+            // The attach follows from the tick loop; failures surface as the
+            // restart worker's dialogs.
             self.home
-                .set_instance_status(session_id, crate::session::Status::Starting);
-            match self
-                .home
-                .restart_instance_with_size_opts(session_id, size, skip_on_launch)
-            {
-                Err(e) => {
-                    let err_str = e.to_string();
-                    self.home
-                        .set_instance_error(session_id, Some(err_str.clone()));
-                    self.home
-                        .set_instance_status(session_id, crate::session::Status::Error);
-                    // Without a toast, set_instance_error + Status::Error are
-                    // invisible to the user: the TUI redraws on home as if Enter
-                    // did nothing. Toast text is single-line; the bar truncates
-                    // at terminal width without us needing to pre-clip.
-                    self.update_status = Some(UpdateStatus::transient(format!(
-                        "restart failed: {err_str}"
-                    )));
-                    return Ok(());
-                }
-                Ok(crate::session::StartOutcome::ResumeFailed { sid }) => {
-                    self.update_status = Some(UpdateStatus::transient(format!(
-                        "Resume failed for sid {sid}; preserved for retry"
-                    )));
-                    return Ok(());
-                }
-                Ok(crate::session::StartOutcome::FreshAfterFailedResume { sid }) => {
-                    self.update_status = Some(UpdateStatus::transient(format!(
-                        "Started fresh; resume previously failed for sid {sid}"
-                    )));
-                }
-                Ok(_) => {}
-            }
-            self.home.set_instance_error(session_id, None);
+                .restart_then_attach(session_id, crate::terminal::get_size(), skip_on_launch);
+            return Ok(());
         }
 
+        self.attach_live_session(session_id, terminal)
+    }
+
+    /// Attach to `session_id`'s running tmux pane and settle the row on return.
+    fn attach_live_session(
+        &mut self,
+        session_id: &str,
+        terminal: &mut Terminal<TuiBackend>,
+    ) -> Result<()> {
         let tmux_session = match self.home.get_instance(session_id) {
             Some(inst) => inst.tmux_session()?,
             None => return Ok(()),

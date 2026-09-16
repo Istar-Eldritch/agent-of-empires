@@ -592,20 +592,12 @@ fn shorten_path(path: &str) -> String {
         if let (Ok(canonical_path), Ok(canonical_home)) =
             (path_buf.canonicalize(), home.canonicalize())
         {
-            let path_str = canonical_path.to_string_lossy();
-            if let Some(home_str) = canonical_home.to_str() {
-                if let Some(stripped) = path_str.strip_prefix(home_str) {
-                    return format!("~{}", stripped);
-                }
-            }
-            return path_str.into_owned();
+            return crate::util::collapse_home(
+                &canonical_path.to_string_lossy(),
+                &canonical_home.to_string_lossy(),
+            );
         }
-
-        if let Some(home_str) = home.to_str() {
-            if let Some(stripped) = path.strip_prefix(home_str) {
-                return format!("~{}", stripped);
-            }
-        }
+        return crate::util::collapse_home(path, &home.to_string_lossy());
     }
     path.to_string()
 }
@@ -635,7 +627,7 @@ mod tests {
             (
                 "a similar prefix",
                 format!("{home_str}extra/not/home"),
-                "~extra/not/home",
+                &*format!("{home_str}extra/not/home"),
             ),
             (
                 "a trailing slash",
@@ -649,6 +641,8 @@ mod tests {
 
     #[test]
     fn test_shorten_path_without_home_prefix() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
         let path = "/tmp/some/path";
         let shortened = shorten_path(path);
         assert_eq!(shortened, "/tmp/some/path");

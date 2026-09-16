@@ -590,6 +590,11 @@ pub struct HomeView {
     /// Suppresses the StatusPoller's missing-tmux Error transition until the
     /// worker reports back via `apply_restart_results`.
     pub(super) restart_in_flight: std::collections::HashSet<String>,
+    /// Sessions to attach once their in-flight restart launches the agent.
+    pub(super) attach_after_restart: std::collections::HashSet<String>,
+    /// Restarted sessions ready for the event loop to attach; see
+    /// `take_restarted_attaches`.
+    pub(super) restarted_attaches: Vec<String>,
 
     // Performance: background sandbox store move. A session still on the
     // shared store copies it before its first launch, which can take
@@ -763,6 +768,10 @@ pub struct HomeView {
     // When true, pressing `q` to leave the home screen shows a quit
     // confirmation first (guards against accidental exits, #1569).
     pub(super) confirm_before_quit: bool,
+
+    /// Cached `session.host_tab_title`. The App loop reads this to emit
+    /// OSC 0; refreshed from config at construction and on reload.
+    pub(super) host_tab_title: bool,
 
     // Number of live `aoe` TUI processes (including this one), refreshed on a
     // throttle from the app loop. The footer surfaces it when >1 so the user

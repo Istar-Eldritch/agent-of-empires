@@ -282,11 +282,11 @@ impl SyncHoldPlan {
     }
 
     /// Applied before the chunk reaches the parser.
-    fn begin(&self, signals: &ViewerSignals) {
+    fn begin(&self, signals: &ViewerSignals, now: impl FnOnce() -> u64) {
         if self.restart {
-            signals.restart_hold();
+            signals.restart_hold(now());
         } else if self.open {
-            signals.begin_hold();
+            signals.begin_hold(now());
         }
     }
 
@@ -343,8 +343,8 @@ impl ViewerSignals {
         self.clipboard_seq.fetch_add(1, Ordering::Release);
     }
 
-    fn begin_hold(&self) {
-        let now = chunk_now_ms().max(1);
+    fn begin_hold(&self, now: u64) {
+        let now = now.max(1);
         if self.sync_hold_since_ms.load(Ordering::Relaxed) == 0 {
             self.sync_hold_since_ms.store(now, Ordering::Relaxed);
         }
@@ -370,8 +370,8 @@ impl ViewerSignals {
     /// shown would let a continuously repainting app hold the view forever. A
     /// read that opens, closes and reopens over a settled grid starts one,
     /// because it too leaves a repaint half applied.
-    fn restart_hold(&self) {
-        let now = chunk_now_ms().max(1);
+    fn restart_hold(&self, now: u64) {
+        let now = now.max(1);
         self.sync_hold_since_ms.store(now, Ordering::Relaxed);
         if self.incomplete_since_ms.load(Ordering::Relaxed) == 0 {
             self.incomplete_since_ms.store(now, Ordering::Relaxed);
@@ -380,10 +380,13 @@ impl ViewerSignals {
 
     /// True while a synchronized-output bracket is open and has not outlived
     /// [`SYNC_HOLD_MAX_MS`]. Gates wakeups and publication. Never outlives
-    /// [`Self::frame_incomplete`]: once the grid is publishable there is
+    /// [`Self::incomplete_within`]: once the grid is publishable there is
     /// nothing left to suppress wakeups for.
     pub(crate) fn hold_active(&self) -> bool {
-        let now = chunk_now_ms();
+        self.hold_active_at(chunk_now_ms())
+    }
+
+    fn hold_active_at(&self, now: u64) -> bool {
         open_within(
             self.sync_hold_since_ms.load(Ordering::Relaxed),
             now,
@@ -397,10 +400,6 @@ impl ViewerSignals {
     /// bounded from the START of the run of brackets none of which produced a
     /// frame a viewer could sample, so tearing is the worst case and a frozen
     /// view is never one.
-    pub(crate) fn frame_incomplete(&self) -> bool {
-        self.incomplete_within(chunk_now_ms())
-    }
-
     fn incomplete_within(&self, now_ms: u64) -> bool {
         open_within(
             self.incomplete_since_ms.load(Ordering::Relaxed),
@@ -612,27 +611,73 @@ fn pump_pane_output_with_hook<F: FnMut()>(
     }
 }
 
+#[cfg(test)]
+struct TestRendezvous {
+    entered: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+impl TestRendezvous {
+    fn new() -> (
+        Self,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (entered, observed) = std::sync::mpsc::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        (Self { entered, resume }, observed, release)
+    }
+
+    // Dropping either test endpoint cancels the held operation on unwind.
+    fn hold(self) -> bool {
+        self.entered.send(()).is_ok() && self.resume.recv().is_ok()
+    }
+}
+
 #[derive(Default)]
 struct DrainControl {
     stream: Option<UnixStream>,
     next_generation: u64,
+    #[cfg(test)]
+    before_deadline: Option<TestRendezvous>,
+    #[cfg(test)]
+    next_now: Option<Instant>,
 }
 
 /// Ask the forwarder to put every byte it already read from `pipe-pane` onto
 /// the data socket. A matching generation acknowledgement and an empty
 /// `FIONREAD` queue form one snapshot boundary without reusing an old ACK.
 fn drain_forwarder(control: &Mutex<DrainControl>) -> bool {
+    drain_forwarder_with_io(control, Instant::now, |stream| read_drain_frame(stream))
+}
+
+fn drain_forwarder_with_io(
+    control: &Mutex<DrainControl>,
+    now: impl Fn() -> Instant,
+    mut read_frame: impl FnMut(&mut UnixStream) -> std::io::Result<(u8, u64)>,
+) -> bool {
     use std::io::Write;
 
     let Ok(mut control) = control.lock() else {
         return false;
     };
+    #[cfg(test)]
+    let before_deadline = control.before_deadline.take();
+    #[cfg(test)]
+    let fixed_now = control.next_now.take();
+    #[cfg(test)]
+    let now = || fixed_now.unwrap_or_else(&now);
     let generation = control.next_generation;
     control.next_generation = control.next_generation.wrapping_add(1);
     let Some(stream) = control.stream.as_mut() else {
         return false;
     };
-    let deadline = Instant::now() + Duration::from_millis(100);
+    #[cfg(test)]
+    if before_deadline.is_some_and(|boundary| !boundary.hold()) {
+        return false;
+    }
+    let deadline = now() + Duration::from_millis(100);
     if stream
         .write_all(&drain_frame(DRAIN_PROBE, generation))
         .is_err()
@@ -640,13 +685,13 @@ fn drain_forwarder(control: &Mutex<DrainControl>) -> bool {
         return false;
     }
     loop {
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        let Some(remaining) = deadline.checked_duration_since(now()) else {
             return false;
         };
         if stream.set_read_timeout(Some(remaining)).is_err() {
             return false;
         }
-        match read_drain_frame(&mut *stream) {
+        match read_frame(&mut *stream) {
             Ok((DRAIN_ACK, ack_generation)) if ack_generation == generation => return true,
             Ok(_) => continue,
             Err(_) => return false,
@@ -1076,6 +1121,9 @@ struct SeedGuard<'a> {
     pipe: Option<&'a UnixStream>,
 }
 
+/// Grid generation and received chunk sequence, sampled for one capture.
+type SeedFenceSample = (Option<u64>, Option<u64>);
+
 struct SeedInstallFence<'a> {
     snapshot: Option<&'a Mutex<()>>,
     socket: Option<&'a Mutex<Option<UnixStream>>>,
@@ -1105,14 +1153,42 @@ fn refresh_commits_geometry(result: VtRefreshResult) -> bool {
 fn seed_parser(
     target: &str,
     sink: SeedSink<'_>,
-    since: Option<u64>,
+    guarded: bool,
     size: (u16, u16),
     deadline: &crate::tmux::TmuxCommandDeadline,
-    guard: SeedGuard<'_>,
+    chunk: Option<(&AtomicU64, &AtomicU64)>,
     fence: SeedInstallFence<'_>,
 ) -> VtRefreshResult {
-    let Some(stream) = capture_seed_stream(target, size, deadline) else {
+    seed_parser_with(sink, guarded, size, chunk, fence, |sample| {
+        capture_seed_stream(target, size, deadline, sample)
+    })
+}
+
+/// Capture through `capture` and install behind the fence. `guarded` enables
+/// the generation guard; `chunk` is the reader's received/settled pair.
+fn seed_parser_with(
+    sink: SeedSink<'_>,
+    guarded: bool,
+    size: (u16, u16),
+    chunk: Option<(&AtomicU64, &AtomicU64)>,
+    fence: SeedInstallFence<'_>,
+    capture: impl FnOnce(&mut dyn FnMut() -> SeedFenceSample) -> Option<(Vec<u8>, SeedFenceSample)>,
+) -> VtRefreshResult {
+    let grid_gen = sink.grid_gen;
+    let mut sample = || -> SeedFenceSample {
+        (
+            guarded.then(|| grid_gen.load(Ordering::Relaxed)),
+            chunk.map(|(received, _)| received.load(Ordering::Acquire)),
+        )
+    };
+    let Some((stream, (since, expected))) = capture(&mut sample) else {
         return VtRefreshResult::Failed;
+    };
+    let guard = SeedGuard {
+        chunk: chunk
+            .zip(expected)
+            .map(|((received, settled), expected)| (received, settled, expected)),
+        pipe: None,
     };
     install_seeded_parser(sink, since, &stream, size, guard, fence)
 }
@@ -1164,17 +1240,18 @@ fn install_seeded_parser(
     )
 }
 /// Capture the pane and weave its modes and cursor into one replayable byte
-/// stream, or `None` when the pane could not be captured. Split from the swap
-/// so a caller can bracket the (forking, multi-millisecond) capture with the
-/// generation check `swap_seeded_parser` needs.
-fn capture_seed_stream(
+/// stream, or `None` when the pane could not be captured. `sample` runs
+/// immediately before the capture fork, and its value is returned with the
+/// snapshot it fences.
+fn capture_seed_stream<S>(
     target: &str,
     size: (u16, u16),
     deadline: &crate::tmux::TmuxCommandDeadline,
-) -> Option<Vec<u8>> {
+    sample: impl FnMut() -> S,
+) -> Option<(Vec<u8>, S)> {
     let (cols, rows) = size;
-    let (body, state) = capture_seed_snapshot(target, (cols, rows), deadline)?;
-    Some(assemble_seed_stream(&body, &state, rows))
+    let (body, state, sampled) = capture_seed_snapshot(target, (cols, rows), deadline, sample)?;
+    Some((assemble_seed_stream(&body, &state, rows), sampled))
 }
 
 fn pipe_has_unread_bytes(pipe: &UnixStream) -> bool {
@@ -1288,13 +1365,14 @@ const SEED_INSTALL_RETRY: Duration = Duration::from_millis(20);
 /// from the final snapshot (its post-probe rode the same fork as the capture,
 /// so it is the tightest pairing available, and the next live chunk heals any
 /// residue).
-fn capture_seed_snapshot(
+fn capture_seed_snapshot<S>(
     target: &str,
     want: (u16, u16),
     deadline: &crate::tmux::TmuxCommandDeadline,
-) -> Option<(Vec<u8>, PaneSeedState)> {
+    mut sample: impl FnMut() -> S,
+) -> Option<(Vec<u8>, PaneSeedState, S)> {
     let seed_start = format!("-{SCROLLBACK_LINES}");
-    let mut last: Option<(Vec<u8>, PaneSeedState)> = None;
+    let mut last: Option<(Vec<u8>, PaneSeedState, S)> = None;
     for attempt in 0..SEED_PROBE_ATTEMPTS {
         if attempt > 0 {
             std::thread::sleep(SEED_RETRY_SETTLE);
@@ -1326,6 +1404,9 @@ fn capture_seed_snapshot(
         ]);
         let mut command = crate::tmux::tmux_command();
         command.args(&args);
+        // tmux parses pane output before it can run a command sent after it, so
+        // every chunk the reader already holds is in this capture.
+        let sampled = sample();
         let Ok(out) = deadline.run(&mut command) else {
             break;
         };
@@ -1348,12 +1429,12 @@ fn capture_seed_snapshot(
         // entered while the pane disagrees, so the settled case still returns on
         // the first pass.
         let at_want = (post.pane_width, post.pane_height) == want;
-        last = Some((body.to_vec(), post));
+        last = Some((body.to_vec(), post, sampled));
         if agreed && at_want {
             return last;
         }
     }
-    if let Some((_, state)) = last.as_ref() {
+    if let Some((_, state, _)) = last.as_ref() {
         tracing::debug!(
             %target,
             attempts = SEED_PROBE_ATTEMPTS,
@@ -1844,6 +1925,8 @@ fn grid_content(
 /// function tests can drive against a raw socket without arming a real
 /// `pipe-pane`.
 struct ReaderCtx {
+    #[cfg(test)]
+    snapshot_contended: Option<std::sync::mpsc::Sender<()>>,
     parser: Arc<Mutex<vt100::Parser>>,
     stop: Arc<AtomicBool>,
     seeded: Arc<AtomicBool>,
@@ -2006,6 +2089,16 @@ pub(crate) fn pane_links_generation(session: &str) -> u64 {
 }
 
 impl ReaderCtx {
+    fn lock_snapshot(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, ()>> {
+        #[cfg(test)]
+        if let Some(contended) = &self.snapshot_contended {
+            return crate::session::test_support::lock_reporting_contention(&self.snapshot, || {
+                let _ = contended.send(());
+            });
+        }
+        self.snapshot.lock()
+    }
+
     /// Wake the in-process poller and every watch subscriber.
     fn notify_viewers(&self) {
         notify_change_wakeup(&self.wakeup);
@@ -2022,7 +2115,16 @@ fn stop_and_wake_reader(stop: &AtomicBool, sock_path: &std::path::Path) {
 /// writable half for input dispatch, then pump pane output into the vt100
 /// grid, waking viewers on every change. Runs on its own thread; exits on
 /// pipe EOF, socket error, or `stop`.
-fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
+fn run_reader(listener: UnixListener, ctx: ReaderCtx, clock: impl Fn() -> u64) {
+    run_reader_with_wait(listener, ctx, clock, |fd| unsafe { libc::poll(fd, 1, 200) });
+}
+
+fn run_reader_with_wait(
+    listener: UnixListener,
+    ctx: ReaderCtx,
+    clock: impl Fn() -> u64,
+    mut wait: impl FnMut(&mut libc::pollfd) -> i32,
+) {
     let Ok((conn, _)) = listener.accept() else {
         VtLifecycle::fail(&ctx.lifecycle);
         return;
@@ -2045,20 +2147,23 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
             events: libc::POLLIN,
             revents: 0,
         };
-        let ready = unsafe { libc::poll(&mut fd, 1, 200) };
+        let ready = wait(&mut fd);
         if ready == -1 {
             if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
             break;
         }
-        if ready == 0 || fd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) == 0 {
+        if ready == 0 {
+            continue;
+        }
+        if fd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) == 0 {
             continue;
         }
         // A snapshot holds this same mutex from its forwarder drain through
         // parser replacement. Readiness waits outside it, but a received
         // chunk settles before the snapshot can inspect the socket queue.
-        let Ok(_snapshot) = ctx.snapshot.lock() else {
+        let Ok(_snapshot) = ctx.lock_snapshot() else {
             break;
         };
         let received = unsafe {
@@ -2079,7 +2184,7 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
                 sync_events.clear();
                 sync.feed(&buf[..n], &mut sync_events);
                 let sync_plan = SyncHoldPlan::from_events(&sync_events);
-                sync_plan.begin(&ctx.signals);
+                sync_plan.begin(&ctx.signals, &clock);
                 // The vt100 parser below silently drops OSC 52, and in
                 // live-send no tmux client is attached for `set-clipboard`
                 // to forward to, so this tap is the ONLY path an agent's
@@ -2132,7 +2237,7 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
                     ctx.grid_gen.fetch_add(1, Ordering::Relaxed);
                     // Stamp this chunk's arrival so the capture worker can tell a
                     // lone chunk from a back-to-back stream and wait for settling.
-                    let now = chunk_now_ms();
+                    let now = clock();
                     let prev = ctx.last_chunk_ms.swap(now, Ordering::Relaxed);
                     ctx.prev_gap_ms.store(
                         if seq == 0 {
@@ -2150,7 +2255,7 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
                     ctx.settled_chunk_seq.store(seq + 1, Ordering::Release);
                     // Inside a synchronized-output bracket the grid is a
                     // half-drawn frame; viewers wake when it closes.
-                    if sync_plan.close || !ctx.signals.hold_active() {
+                    if sync_plan.close || !ctx.signals.hold_active_at(clock()) {
                         ctx.notify_viewers();
                     }
                 }
@@ -2350,8 +2455,8 @@ fn pack_size(cols: u16, rows: u16) -> u64 {
     ((cols as u64) << 16) | rows as u64
 }
 
-/// One cached [`VtChannel::sample`] assembly, valid while the grid
-/// generation, requested window, and grid size all match.
+/// Cached [`VtChannel::sample_with_deadline`] output, keyed by grid generation,
+/// requested window, and grid size.
 struct SampleCache {
     grid_gen: u64,
     max_lines: usize,
@@ -2361,7 +2466,7 @@ struct SampleCache {
     cursor: PaneCursor,
 }
 
-/// One [`VtChannel::sample`] result and whether it may be published.
+/// [`VtChannel::sample_with_deadline`] output and its publishability.
 pub(crate) struct VtSample {
     pub(crate) content: String,
     pub(crate) cursor: Option<PaneCursor>,
@@ -2582,6 +2687,8 @@ impl VtChannel {
         let signals = Arc::new(ViewerSignals::new());
         let reader = {
             let ctx = ReaderCtx {
+                #[cfg(test)]
+                snapshot_contended: None,
                 parser: parser.clone(),
                 stop: stop.clone(),
                 seeded: seeded.clone(),
@@ -2599,7 +2706,7 @@ impl VtChannel {
                 grid_gen: grid_gen.clone(),
                 signals: signals.clone(),
             };
-            std::thread::spawn(move || run_reader(listener, ctx))
+            std::thread::spawn(move || run_reader(listener, ctx, chunk_now_ms))
         };
 
         let pipe_cmd = format!(
@@ -2666,7 +2773,6 @@ impl VtChannel {
             if attempt > 0 {
                 std::thread::sleep(SEED_INSTALL_RETRY);
             }
-            let expected_chunk_seq = chunk_seq.load(Ordering::Acquire);
             seed_result = seed_parser(
                 &target,
                 SeedSink {
@@ -2675,13 +2781,10 @@ impl VtChannel {
                     grid_gen: &grid_gen,
                     links: &links,
                 },
-                None,
+                false,
                 (cols, rows),
                 deadline,
-                SeedGuard {
-                    chunk: Some((&chunk_seq, &settled_chunk_seq, expected_chunk_seq)),
-                    pipe: None,
-                },
+                Some((&chunk_seq, &settled_chunk_seq)),
                 SeedInstallFence {
                     snapshot: Some(&snapshot),
                     socket: Some(&stream),
@@ -2870,7 +2973,6 @@ impl VtChannel {
         guarded: bool,
         deadline: &crate::tmux::TmuxCommandDeadline,
     ) -> VtRefreshResult {
-        let since = guarded.then(|| self.grid_gen.load(Ordering::Relaxed));
         // A resize is the one caller whose Busy is expected rather than
         // informative: tmux repaints the whole pane, so the fence almost
         // always finds those bytes in flight on the first attempt. Retry it
@@ -2883,7 +2985,6 @@ impl VtChannel {
             if attempt > 0 {
                 std::thread::sleep(SEED_INSTALL_RETRY);
             }
-            let expected_chunk_seq = self.chunk_seq.load(Ordering::Acquire);
             result = seed_parser(
                 &self.target,
                 SeedSink {
@@ -2892,13 +2993,10 @@ impl VtChannel {
                     grid_gen: &self.grid_gen,
                     links: &self.links,
                 },
-                since,
+                guarded,
                 (cols, rows),
                 deadline,
-                SeedGuard {
-                    chunk: Some((&self.chunk_seq, &self.settled_chunk_seq, expected_chunk_seq)),
-                    pipe: None,
-                },
+                Some((&self.chunk_seq, &self.settled_chunk_seq)),
                 SeedInstallFence {
                     snapshot: Some(&self.snapshot),
                     socket: Some(&self.stream),
@@ -2944,6 +3042,15 @@ impl VtChannel {
         max_lines: usize,
         deadline: &crate::tmux::TmuxCommandDeadline,
     ) -> VtSample {
+        self.sample_with_clock(max_lines, deadline, chunk_now_ms)
+    }
+
+    fn sample_with_clock(
+        &self,
+        max_lines: usize,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+        clock: impl Fn() -> u64,
+    ) -> VtSample {
         // Both fork tmux and take the parser lock themselves, so they run
         // before this sampler takes it.
         self.reconcile_grid(deadline);
@@ -2959,7 +3066,7 @@ impl VtChannel {
         // grid therefore cannot change identity between these reads and the
         // assembly below.
         let grid_gen = self.grid_gen.load(Ordering::Relaxed);
-        let incomplete = self.signals.frame_incomplete();
+        let incomplete = self.signals.incomplete_within(clock());
         if let Ok(guard) = self.sample_cache.lock() {
             if let Some(c) = guard.as_ref() {
                 let same_window = (c.max_lines, c.cols, c.rows) == (max_lines, cols, rows);
@@ -3006,21 +3113,21 @@ impl VtChannel {
     /// briefly disagree with the grid mid-resize. Padding and truncating to the
     /// requested rectangle keeps that frame merely stale instead of shifting
     /// every pane to its right.
-    #[cfg(test)]
-    pub(crate) fn sample_rows_padded(
-        &self,
-        want_cols: u16,
-        want_rows: u16,
-    ) -> Option<VtRowsSample> {
-        let deadline = crate::tmux::TmuxCommandDeadline::new();
-        self.sample_rows_padded_with_deadline(want_cols, want_rows, &deadline)
-    }
-
     pub(crate) fn sample_rows_padded_with_deadline(
         &self,
         want_cols: u16,
         want_rows: u16,
         deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> Option<VtRowsSample> {
+        self.sample_rows_padded_with_clock(want_cols, want_rows, deadline, chunk_now_ms)
+    }
+
+    fn sample_rows_padded_with_clock(
+        &self,
+        want_cols: u16,
+        want_rows: u16,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+        clock: impl Fn() -> u64,
     ) -> Option<VtRowsSample> {
         self.reconcile_grid(deadline);
         self.refresh_owner_heartbeat(deadline);
@@ -3033,7 +3140,7 @@ impl VtChannel {
         // Read under the lock that renders these rows, like the scrollback
         // sampler: a composite spliced from a half-drawn pane 0 tears the same
         // way a whole-window frame does.
-        let incomplete = self.signals.frame_incomplete();
+        let incomplete = self.signals.incomplete_within(clock());
         let screen = p.screen();
         let readable_cols = cols.min(want_cols);
         let out = (0..want_rows)
@@ -3676,6 +3783,94 @@ pub(crate) fn register_live_for_test(
 }
 
 #[cfg(test)]
+pub(crate) struct HeldVtDrain {
+    drain: Arc<Mutex<DrainControl>>,
+    original: Option<DrainControl>,
+    peer: UnixStream,
+    probes: std::sync::mpsc::Receiver<()>,
+    reader: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+}
+
+#[cfg(test)]
+impl HeldVtDrain {
+    pub(crate) fn observed_probe(&mut self) -> bool {
+        self.probes.recv_timeout(Duration::from_secs(5)).is_ok()
+    }
+
+    pub(crate) fn acknowledge_next(&mut self) {
+        use std::io::Write;
+        let mut control = self.drain.lock().unwrap();
+        control.next_now = Some(Instant::now());
+        let queued = self
+            .peer
+            .write_all(&drain_frame(DRAIN_ACK, control.next_generation));
+        drop(control);
+        queued.expect("queue next native drain ACK before its deadline");
+    }
+}
+
+#[cfg(test)]
+impl Drop for HeldVtDrain {
+    fn drop(&mut self) {
+        // Wake the native reader before joining, including on assertion unwind.
+        let shutdown = self.peer.shutdown(std::net::Shutdown::Both);
+        let joined = self.reader.take().unwrap().join();
+        *self.drain.lock().unwrap() = self.original.take().unwrap();
+        if !std::thread::panicking() {
+            shutdown.expect("shut down held drain socket");
+            joined
+                .expect("held drain reader exits")
+                .expect("read native drain probes");
+        }
+    }
+}
+
+#[cfg(test)]
+impl VtChannel {
+    pub(crate) fn hold_drain_for_test(&self) -> HeldVtDrain {
+        let (stream, peer) = UnixStream::pair().expect("held native drain socket");
+        peer.set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("held drain ACK timeout");
+        let mut input = peer.try_clone().expect("held drain reader socket");
+        let (observed, probes) = std::sync::mpsc::channel();
+        // Withhold ACKs, not reads: otherwise repeated reseeds fill the control
+        // socket on platforms with smaller buffers and test write backpressure
+        // instead of the intended missing acknowledgement.
+        let reader = std::thread::spawn(move || loop {
+            match read_drain_frame(&mut input) {
+                Ok((DRAIN_PROBE, _)) => {
+                    if observed.send(()).is_err() {
+                        return Ok(());
+                    }
+                }
+                Ok(frame) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("unexpected held drain frame: {frame:?}"),
+                    ));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(err) => return Err(err),
+            }
+        });
+        let original = std::mem::replace(
+            &mut *self.drain.lock().unwrap(),
+            DrainControl {
+                stream: Some(stream),
+                ..DrainControl::default()
+            },
+        );
+        HeldVtDrain {
+            drain: self.drain.clone(),
+            original: Some(original),
+            peer,
+            probes,
+            reader: Some(reader),
+        }
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn unregister_for_test(name: &str) {
     REGISTRY.lock().unwrap().remove(name);
 }
@@ -3917,13 +4112,10 @@ mod tests {
                     grid_gen: &grid_gen,
                     links: &LinkTable::default(),
                 },
-                None,
+                false,
                 (80, 24),
                 &deadline,
-                SeedGuard {
-                    chunk: None,
-                    pipe: None,
-                },
+                None,
                 SeedInstallFence {
                     snapshot: None,
                     socket: None,
@@ -4462,14 +4654,16 @@ mod tests {
         let name = format!("aoe_test_vt_padded_{}", std::process::id());
         let dir = tempfile::tempdir().expect("tempdir");
         let (ch, _alive) = dummy_channel(&name, dir.path());
-        // Grid is 4 rows x 20 cols (see `dummy_channel`).
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        let sample_rows =
+            |cols, rows| ch.sample_rows_padded_with_clock(cols, rows, &deadline, || 100);
         ch.parser
             .lock()
             .unwrap()
             .process(b"hello\r\nworld\r\n\x1b[41mfilled");
 
         // Exact rectangle.
-        let sample = ch.sample_rows_padded(20, 4).expect("sample");
+        let sample = sample_rows(20, 4).expect("sample");
         let (rows, cursor) = (sample.rows, sample.cursor);
         assert!(!sample.incomplete, "no bracket open: publishable");
         assert_eq!(rows.len(), 4);
@@ -4486,7 +4680,7 @@ mod tests {
         assert!(cursor.position_reliable);
 
         // Narrower and shorter than the grid: truncate, never overflow.
-        let rows = ch.sample_rows_padded(6, 2).expect("sample").rows;
+        let rows = sample_rows(6, 2).expect("sample").rows;
         assert_eq!(rows.len(), 2);
         for r in &rows {
             assert_eq!(crate::tmux::utils::strip_ansi(r).chars().count(), 6);
@@ -4495,7 +4689,7 @@ mod tests {
         // Taller than the grid (tmux says the pane grew before the grid caught
         // up): the extra rows are blank filler at the right width, not rows
         // borrowed from elsewhere.
-        let rows = ch.sample_rows_padded(10, 6).expect("sample").rows;
+        let rows = sample_rows(10, 6).expect("sample").rows;
         assert_eq!(rows.len(), 6);
         for (i, r) in rows.iter().enumerate() {
             let plain = crate::tmux::utils::strip_ansi(r);
@@ -4508,11 +4702,11 @@ mod tests {
         // Mid-bracket the rows are a half-drawn repaint. A composite splices
         // them into the window next to panes captured whole, so the sample says
         // so and the preview keeps the frame it has.
-        ch.signals.begin_hold();
-        let held = ch.sample_rows_padded(20, 4).expect("sample");
+        ch.signals.begin_hold(100);
+        let held = sample_rows(20, 4).expect("sample");
         assert!(held.incomplete, "mid-bracket rows are not publishable");
         ch.signals.end_hold();
-        assert!(!ch.sample_rows_padded(20, 4).expect("sample").incomplete);
+        assert!(!sample_rows(20, 4).expect("sample").incomplete);
     }
 
     #[test]
@@ -4555,10 +4749,26 @@ mod tests {
             .unwrap()
             .insert(name.clone(), Arc::downgrade(&dead));
 
+        let arm_lock = Arc::new(Mutex::new(()));
+        ARM_LOCKS
+            .lock()
+            .unwrap()
+            .insert(name.clone(), arm_lock.clone());
+        let held_arm = arm_lock.lock().unwrap();
         let n1 = name.clone();
         let t1 = std::thread::spawn(move || VtChannel::acquire(&n1));
         let n2 = name.clone();
         let t2 = std::thread::spawn(move || VtChannel::acquire(&n2));
+        let arrival = Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(&arm_lock) < 4 {
+            assert!(
+                Instant::now() < arrival,
+                "both acquires must reach the held arm lock"
+            );
+            std::thread::yield_now();
+        }
+        drop(held_arm);
+        drop(arm_lock);
         let r1 = t1.join().expect("thread 1");
         let r2 = t2.join().expect("thread 2");
         assert!(
@@ -4658,6 +4868,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let grid_gen = Arc::new(AtomicU64::new(0));
         let ctx = ReaderCtx {
+            snapshot_contended: None,
             parser: Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0))),
             stop: stop.clone(),
             seeded: Arc::new(AtomicBool::new(true)),
@@ -4675,7 +4886,7 @@ mod tests {
             grid_gen: grid_gen.clone(),
             signals: Arc::new(ViewerSignals::new()),
         };
-        let reader = std::thread::spawn(move || run_reader(listener, ctx));
+        let reader = std::thread::spawn(move || run_reader(listener, ctx, chunk_now_ms));
         let mut conn = UnixStream::connect(&sock).expect("connect");
         conn.write_all(b"first-chunk").expect("write");
 
@@ -4691,22 +4902,22 @@ mod tests {
     }
 
     #[test]
-    fn idle_reader_does_not_hold_snapshot_fence() {
+    fn idle_reader_leaves_snapshot_available_during_readiness_wait() {
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("s.sock");
         let listener = UnixListener::bind(&sock).expect("bind");
         let stop = Arc::new(AtomicBool::new(false));
-        let lifecycle = Arc::new(AtomicU8::new(VtLifecycle::Starting as u8));
         let snapshot = Arc::new(Mutex::new(()));
-        let snapshot_guard = snapshot.lock().expect("hold snapshot before reader starts");
+        let (waiting, idle_rx, resume_tx) = TestRendezvous::new();
         let ctx = ReaderCtx {
+            snapshot_contended: None,
             parser: Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0))),
             stop: stop.clone(),
             seeded: Arc::new(AtomicBool::new(true)),
             snapshot: snapshot.clone(),
             stream: Arc::new(Mutex::new(None)),
             app_cursor: Arc::new(AtomicBool::new(false)),
-            lifecycle: lifecycle.clone(),
+            lifecycle: Arc::new(AtomicU8::new(VtLifecycle::Starting as u8)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
             links: Arc::new(LinkTable::default()),
@@ -4717,24 +4928,30 @@ mod tests {
             grid_gen: Arc::new(AtomicU64::new(0)),
             signals: Arc::new(ViewerSignals::new()),
         };
-        let reader = std::thread::spawn(move || run_reader(listener, ctx));
         let conn = UnixStream::connect(&sock).expect("connect");
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while VtLifecycle::load(&lifecycle) != VtLifecycle::Live {
-            assert!(Instant::now() < deadline, "reader never connected");
-            std::thread::sleep(Duration::from_millis(2));
-        }
-
-        drop(snapshot_guard);
-        std::thread::sleep(Duration::from_millis(20));
-        assert!(
-            snapshot.try_lock().is_ok(),
-            "an idle reader must not hold the snapshot fence while it waits for input"
-        );
+        let reader = std::thread::spawn(move || {
+            let mut waiting = Some(waiting);
+            run_reader_with_wait(listener, ctx, chunk_now_ms, |_| {
+                if let Some(boundary) = waiting.take() {
+                    boundary.hold();
+                }
+                0
+            });
+        });
+        let reached_idle = idle_rx.recv_timeout(Duration::from_secs(5));
+        let available = snapshot.try_lock().is_ok();
 
         stop.store(true, Ordering::Relaxed);
         drop(conn);
-        reader.join().expect("reader exits");
+        drop(resume_tx);
+        let joined = reader.join();
+
+        reached_idle.expect("reader entered the held readiness operation");
+        joined.expect("reader exits");
+        assert!(
+            available,
+            "snapshot must stay available during the readiness wait"
+        );
     }
 
     #[test]
@@ -4748,6 +4965,7 @@ mod tests {
         let lifecycle = Arc::new(AtomicU8::new(VtLifecycle::Starting as u8));
         let stream = Arc::new(Mutex::new(None));
         let ctx = ReaderCtx {
+            snapshot_contended: None,
             parser: Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0))),
             stop: stop.clone(),
             seeded: Arc::new(AtomicBool::new(true)),
@@ -4765,51 +4983,89 @@ mod tests {
             grid_gen: Arc::new(AtomicU64::new(0)),
             signals: Arc::new(ViewerSignals::new()),
         };
-        let reader = std::thread::spawn(move || run_reader(listener, ctx));
         let mut peer = UnixStream::connect(&sock).expect("connect");
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while VtLifecycle::load(&lifecycle) != VtLifecycle::Live {
-            assert!(Instant::now() < deadline, "reader never connected");
-            std::thread::sleep(Duration::from_millis(2));
-        }
+        peer.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let reader = std::thread::spawn(move || run_reader(listener, ctx, chunk_now_ms));
+        let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while VtLifecycle::load(&lifecycle) != VtLifecycle::Live {
+                assert!(Instant::now() < deadline, "reader never connected");
+                std::thread::sleep(Duration::from_millis(2));
+            }
 
-        let flags = unsafe {
-            libc::fcntl(
-                stream
+            let mut prefilled = 0;
+            {
+                let mut published = stream.lock().expect("published stream");
+                let input = published.as_mut().expect("reader published input socket");
+                let flags = unsafe { libc::fcntl(input.as_raw_fd(), libc::F_GETFL) };
+                assert!(flags >= 0, "read input socket flags");
+                assert_eq!(flags & libc::O_NONBLOCK, 0, "input socket must block");
+
+                // Darwin send(MSG_DONTWAIT) only avoids waiting for the socket
+                // buffer lock; it can still wait for buffer space. Saturate with
+                // bounded blocking writes instead, without changing O_NONBLOCK
+                // on the open-file description shared with the reader.
+                input
+                    .set_write_timeout(Some(Duration::from_millis(20)))
+                    .unwrap();
+                let fill = [b'p'; 4096];
+                loop {
+                    match input.write(&fill) {
+                        Ok(0) => panic!("saturating write made no progress"),
+                        Ok(sent) => prefilled += sent,
+                        Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(err) => {
+                            assert!(
+                                matches!(
+                                    err.kind(),
+                                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                                ),
+                                "saturating write failed: {err}"
+                            );
+                            break;
+                        }
+                    }
+                }
+                // A broken delivery must not strand the writer during teardown.
+                input
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+            }
+            let payload = vec![b'x'; 1024 * 1024];
+            let writer_stream = stream.clone();
+            let writer_payload = payload.clone();
+            let writer = std::thread::spawn(move || {
+                writer_stream
                     .lock()
                     .expect("published stream")
-                    .as_ref()
+                    .as_mut()
                     .expect("reader published input socket")
-                    .as_raw_fd(),
-                libc::F_GETFL,
-            )
-        };
-        assert_eq!(flags & libc::O_NONBLOCK, 0, "input socket must block");
-
-        let payload = vec![b'x'; 1024 * 1024];
-        let writer_stream = stream.clone();
-        let writer_payload = payload.clone();
-        let writer = std::thread::spawn(move || {
-            writer_stream
-                .lock()
-                .expect("published stream")
-                .as_mut()
-                .expect("reader published input socket")
-                .write_all(&writer_payload)
-                .is_ok()
-        });
-        std::thread::sleep(Duration::from_millis(20));
-        peer.set_read_timeout(Some(Duration::from_secs(1)))
-            .expect("read timeout");
-        let mut received = vec![0; payload.len()];
-        peer.read_exact(&mut received)
-            .expect("read complete input payload");
-        assert!(writer.join().expect("input writer exits"));
-        assert_eq!(received, payload, "input payload must arrive exactly once");
+                    .write_all(&writer_payload)
+            });
+            let mut prefix = vec![0; prefilled];
+            let prefix_read = peer.read_exact(&mut prefix);
+            let mut received = vec![0; payload.len()];
+            let payload_read = peer.read_exact(&mut received);
+            let shutdown = peer.shutdown(std::net::Shutdown::Both);
+            let written = writer.join();
+            prefix_read.expect("drain saturated socket");
+            payload_read.expect("read complete input payload");
+            shutdown.expect("shut down native socket");
+            written
+                .expect("input writer exits")
+                .expect("write complete payload");
+            assert!(prefix.iter().all(|byte| *byte == b'p'));
+            assert_eq!(received, payload, "input payload must arrive exactly once");
+        }));
 
         stop.store(true, Ordering::Relaxed);
         drop(peer);
-        reader.join().expect("reader exits");
+        let joined = reader.join();
+        if let Err(panic) = checked {
+            std::panic::resume_unwind(panic);
+        }
+        joined.expect("reader exits");
     }
 
     #[test]
@@ -4832,6 +5088,7 @@ mod tests {
         let chunk_seq = Arc::new(AtomicU64::new(0));
         let settled_chunk_seq = Arc::new(AtomicU64::new(0));
         let ctx = ReaderCtx {
+            snapshot_contended: None,
             parser: parser.clone(),
             stop: stop.clone(),
             seeded: Arc::new(AtomicBool::new(true)),
@@ -4849,7 +5106,7 @@ mod tests {
             grid_gen: grid_gen.clone(),
             signals: Arc::new(ViewerSignals::new()),
         };
-        let reader = std::thread::spawn(move || run_reader(listener, ctx));
+        let reader = std::thread::spawn(move || run_reader(listener, ctx, chunk_now_ms));
         let mut conn = UnixStream::connect(&sock).expect("connect");
 
         // The generation a snapshot swap reads before forking its capture.
@@ -4914,6 +5171,119 @@ mod tests {
         assert!(
             grid.contains("snapshot-body") && !grid.contains("post-snapshot-chunk"),
             "snapshot must replace the grid:\n{grid:?}"
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        drop(conn);
+        let _ = reader.join();
+    }
+
+    #[test]
+    fn seed_counts_output_from_before_the_capture_fork_as_captured() {
+        use std::io::Write;
+
+        // Arming probes the pane before forking the capture, and a repainting
+        // pane lands chunks in that window. tmux parses a chunk before it can
+        // run a command sent after it, so those chunks are in the snapshot and
+        // must not make the install stand down. A chunk after the fork still must.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("s.sock");
+        let listener = UnixListener::bind(&sock).expect("bind");
+        let stop = Arc::new(AtomicBool::new(false));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        let app_cursor = Arc::new(AtomicBool::new(false));
+        let grid_gen = Arc::new(AtomicU64::new(0));
+        let chunk_seq = Arc::new(AtomicU64::new(0));
+        let settled_chunk_seq = Arc::new(AtomicU64::new(0));
+        let ctx = ReaderCtx {
+            snapshot_contended: None,
+            parser: parser.clone(),
+            stop: stop.clone(),
+            seeded: Arc::new(AtomicBool::new(true)),
+            snapshot: Arc::new(Mutex::new(())),
+            stream: Arc::new(Mutex::new(None)),
+            app_cursor: app_cursor.clone(),
+            lifecycle: Arc::new(AtomicU8::new(VtLifecycle::Starting as u8)),
+            wakeup: Arc::new(Mutex::new(None)),
+            clipboard: Arc::new(Mutex::new(None)),
+            links: Arc::new(LinkTable::default()),
+            chunk_seq: chunk_seq.clone(),
+            settled_chunk_seq: settled_chunk_seq.clone(),
+            last_chunk_ms: Arc::new(AtomicU64::new(0)),
+            prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
+            grid_gen: grid_gen.clone(),
+            signals: Arc::new(ViewerSignals::new()),
+        };
+        let reader = std::thread::spawn(move || run_reader(listener, ctx, chunk_now_ms));
+        let mut conn = UnixStream::connect(&sock).expect("connect");
+        let links = LinkTable::default();
+        let wait_settled = |n: u64| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while settled_chunk_seq.load(Ordering::Acquire) < n {
+                assert!(Instant::now() < deadline, "reader never settled chunk {n}");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        let no_fence = || SeedInstallFence {
+            snapshot: None,
+            socket: None,
+            control: None,
+        };
+        let sink = || SeedSink {
+            parser: &parser,
+            app_cursor: &app_cursor,
+            grid_gen: &grid_gen,
+            links: &links,
+        };
+
+        let result = seed_parser_with(
+            sink(),
+            true,
+            (80, 24),
+            Some((&chunk_seq, &settled_chunk_seq)),
+            no_fence(),
+            |sample| {
+                conn.write_all(b"probe-window-chunk").expect("write");
+                wait_settled(1);
+                let sampled = sample();
+                let body = assemble_seed_stream(b"snapshot-body\n", &PaneSeedState::default(), 24);
+                Some((body, sampled))
+            },
+        );
+        assert_eq!(
+            result,
+            VtRefreshResult::Refreshed,
+            "output settled before the capture fork is part of the snapshot"
+        );
+        let grid = parser.lock().expect("parser").screen().contents();
+        assert!(
+            grid.contains("snapshot-body"),
+            "snapshot must be installed:\n{grid:?}"
+        );
+
+        let result = seed_parser_with(
+            sink(),
+            true,
+            (80, 24),
+            Some((&chunk_seq, &settled_chunk_seq)),
+            no_fence(),
+            |sample| {
+                let sampled = sample();
+                conn.write_all(b"capture-window-chunk").expect("write");
+                wait_settled(2);
+                let body = assemble_seed_stream(b"stale-snapshot\n", &PaneSeedState::default(), 24);
+                Some((body, sampled))
+            },
+        );
+        assert_eq!(
+            result,
+            VtRefreshResult::Busy,
+            "output after the capture fork must still fence the install"
+        );
+        let grid = parser.lock().expect("parser").screen().contents();
+        assert!(
+            grid.contains("capture-window-chunk") && !grid.contains("stale-snapshot"),
+            "the raced chunk must survive in the live grid:\n{grid:?}"
         );
 
         stop.store(true, Ordering::Relaxed);
@@ -5029,6 +5399,8 @@ mod tests {
         let control = Mutex::new(DrainControl {
             stream: Some(parent_control),
             next_generation: 0,
+            before_deadline: None,
+            next_now: None,
         });
         assert_eq!(
             swap_drained_seeded_parser(
@@ -5061,35 +5433,23 @@ mod tests {
         forwarder_thread.join().expect("forwarder exits");
     }
 
-    /// A reseed waits on the forwarder's ACK, and `write_input` needs the
-    /// same socket mutex the seed reads the pipe through. Holding it across
-    /// that wait stalls a keystroke for the whole ACK deadline, once per
-    /// retry. `seed_parser` clones the descriptor and drops the guard before
-    /// draining, so input keeps flowing while a slow forwarder is answering.
+    /// Input remains usable while drain owns control, before its native deadline.
     #[test]
-    fn a_pending_drain_does_not_hold_the_input_socket_mutex() {
-        use std::io::Write;
-        use std::sync::mpsc;
+    fn entered_drain_leaves_input_socket_available() {
+        use std::io::{Read, Write};
 
-        let (_data_reader, data_forwarder) = UnixStream::pair().expect("data pair");
+        let (mut data_reader, data_forwarder) = UnixStream::pair().expect("data pair");
         let (parent_control, mut forwarder_control) = UnixStream::pair().expect("control pair");
-        let (probed_tx, probed_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel::<()>();
-        // Answers only once released, so the seed is parked on the deadline
-        // for as long as the test needs.
-        let forwarder = std::thread::spawn(move || {
-            let (kind, generation) =
-                read_drain_frame(&mut forwarder_control).expect("receive drain probe");
-            assert_eq!(kind, DRAIN_PROBE);
-            probed_tx.send(()).expect("signal the probe arrived");
-            let _ = release_rx.recv_timeout(Duration::from_secs(5));
-            let _ = forwarder_control.write_all(&drain_frame(DRAIN_ACK, generation));
-        });
-
+        forwarder_control
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("bound probe wait");
+        let (before_deadline, entered_rx, resume_tx) = TestRendezvous::new();
         let socket = Arc::new(Mutex::new(Some(data_forwarder)));
         let control = Mutex::new(DrainControl {
             stream: Some(parent_control),
             next_generation: 0,
+            before_deadline: Some(before_deadline),
+            next_now: None,
         });
         let parser = Mutex::new(vt100::Parser::new(6, 40, 0));
         let app_cursor = AtomicBool::new(false);
@@ -5119,26 +5479,39 @@ mod tests {
             )
         });
 
-        probed_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("seed sent its drain probe");
-        // The seed is now waiting on the ACK. Input must not be queued behind it.
-        let acquired = socket
+        let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+        let wrote_input = socket
             .try_lock()
             .map(|mut guard| {
                 guard
                     .as_mut()
-                    .map(|stream| stream.write_all(b"x").is_ok())
-                    .unwrap_or(false)
+                    .is_some_and(|stream| stream.write_all(b"x").is_ok())
             })
             .unwrap_or(false);
-        release_tx.send(()).ok();
-        let _ = seed.join();
-        forwarder.join().expect("forwarder thread");
+        let mut input = [0; 1];
+        let received_input = wrote_input && data_reader.read_exact(&mut input).is_ok();
+
+        let resumed = resume_tx.send(());
+        drop(resume_tx);
+        let probe = read_drain_frame(&mut forwarder_control);
+        if let Ok((DRAIN_PROBE, generation)) = probe {
+            let _ = forwarder_control.write_all(&drain_frame(DRAIN_ACK, generation));
+        }
+        let result = seed.join();
+
+        entered.expect("drain is held after acquiring control and before its deadline");
+        resumed.expect("resume drain");
         assert!(
-            acquired,
-            "a keystroke must reach the pane while a reseed waits for its drain ACK"
+            received_input,
+            "input must traverse the socket while drain is held"
         );
+        assert_eq!(&input, b"x");
+        assert!(matches!(probe, Ok((DRAIN_PROBE, _))), "receive drain probe");
+        // The native deadline can expire after release; drain protocol has separate tests.
+        assert!(matches!(
+            result.expect("seed exits"),
+            VtRefreshResult::Busy | VtRefreshResult::Refreshed
+        ));
     }
 
     #[test]
@@ -5151,6 +5524,11 @@ mod tests {
         let (probe_tx, probe_rx) = mpsc::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
         let (late_ack_tx, late_ack_rx) = mpsc::channel();
+        let (matching_tx, matching_rx) = mpsc::channel();
+        let (written_tx, written_rx) = mpsc::channel();
+        forwarder_control
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         let forwarder = std::thread::spawn(move || {
             let (kind, generation) =
                 read_drain_frame(&mut forwarder_control).expect("receive first drain probe");
@@ -5170,14 +5548,28 @@ mod tests {
             let (kind, generation) =
                 read_drain_frame(&mut forwarder_control).expect("receive retry drain probe");
             assert_eq!(kind, DRAIN_PROBE);
+            matching_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("release matching ACK");
             forwarder_control
                 .write_all(&drain_frame(DRAIN_ACK, generation))
                 .expect("acknowledge retry probe");
+            // The final positive seed is not a scheduling test: queue its ACK
+            // before that operation starts its native deadline.
+            forwarder_control
+                .write_all(&drain_frame(DRAIN_ACK, generation.wrapping_add(1)))
+                .expect("prequeue seed ACK");
+            written_tx.send(()).expect("matching and seed ACKs written");
+            let (kind, next) =
+                read_drain_frame(&mut forwarder_control).expect("receive seed probe");
+            assert_eq!((kind, next), (DRAIN_PROBE, generation.wrapping_add(1)));
         });
 
         let control = Mutex::new(DrainControl {
             stream: Some(parent_control),
             next_generation: 0,
+            before_deadline: None,
+            next_now: None,
         });
         let parser = Mutex::new(vt100::Parser::new(6, 40, 0));
         let app_cursor = AtomicBool::new(false);
@@ -5226,6 +5618,33 @@ mod tests {
             "the control stream remains open so the retry can observe generations"
         );
 
+        let (second_read, rejected_rx, resume_read) = TestRendezvous::new();
+        let (rejected, written, retried) = std::thread::scope(|scope| {
+            let control = &control;
+            let retry = scope.spawn(move || {
+                let now = Instant::now();
+                let mut reads = 0;
+                let mut second_read = Some(second_read);
+                drain_forwarder_with_io(
+                    control,
+                    || now,
+                    |stream| {
+                        reads += 1;
+                        if reads == 2 && !second_read.take().unwrap().hold() {
+                            return Err(std::io::ErrorKind::Interrupted.into());
+                        }
+                        read_drain_frame(stream)
+                    },
+                )
+            });
+            let rejected = rejected_rx.recv_timeout(Duration::from_secs(5));
+            let _ = matching_tx.send(());
+            let written = written_rx.recv_timeout(Duration::from_secs(5));
+            let _ = resume_read.send(());
+            (rejected, written, retry.join())
+        });
+
+        control.lock().unwrap().next_now = Some(Instant::now());
         assert_eq!(
             swap_drained_seeded_parser(
                 SeedSink {
@@ -5246,9 +5665,15 @@ mod tests {
                 },
             ),
             VtRefreshResult::Refreshed,
-            "the stale acknowledgement is ignored until the matching retry acknowledgement arrives"
+            "the correlated connection remains usable for the seed retry"
         );
         forwarder.join().expect("forwarder exits");
+        rejected.expect("drain rejected the stale ACK before requesting another frame");
+        written.expect("matching ACK was written before the next read");
+        assert!(
+            retried.expect("retry exits"),
+            "matching ACK completes the retry"
+        );
     }
 
     #[test]
@@ -5303,6 +5728,7 @@ mod tests {
         let lifecycle = Arc::new(AtomicU8::new(VtLifecycle::Starting as u8));
         let wakeup_slot: Arc<Mutex<Option<ChangeWakeup>>> = Arc::new(Mutex::new(None));
         let ctx = ReaderCtx {
+            snapshot_contended: None,
             parser: parser.clone(),
             stop: stop.clone(),
             // Seeded upfront: this test has no capture-pane seed to wait for.
@@ -5321,7 +5747,7 @@ mod tests {
             grid_gen: Arc::new(AtomicU64::new(0)),
             signals: Arc::new(ViewerSignals::new()),
         };
-        let reader = std::thread::spawn(move || run_reader(listener, ctx));
+        let reader = std::thread::spawn(move || run_reader(listener, ctx, chunk_now_ms));
         let mut conn = UnixStream::connect(&sock).expect("connect");
 
         let pair: ChangeWakeup = Arc::new((Mutex::new(0), Condvar::new()));
@@ -5333,7 +5759,7 @@ mod tests {
         conn.write_all(b"echo-marker").expect("write pane output");
         let (wake_guard, res) = pair
             .1
-            .wait_timeout(guard, Duration::from_secs(5))
+            .wait_timeout_while(guard, Duration::from_secs(5), |generation| *generation == 0)
             .expect("wait");
         // Release the pair's mutex before joining: the reader's exit path
         // notifies the wakeup one last time (death), and that notify takes
@@ -5465,6 +5891,7 @@ mod tests {
         let lifecycle = Arc::new(AtomicU8::new(VtLifecycle::Starting as u8));
         let clipboard: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let ctx = ReaderCtx {
+            snapshot_contended: None,
             parser: parser.clone(),
             stop: stop.clone(),
             seeded: Arc::new(AtomicBool::new(true)),
@@ -5482,7 +5909,8 @@ mod tests {
             grid_gen: Arc::new(AtomicU64::new(0)),
             signals: Arc::new(ViewerSignals::new()),
         };
-        let reader = std::thread::spawn(move || run_reader(listener, ctx));
+        let settled = ctx.settled_chunk_seq.clone();
+        let reader = std::thread::spawn(move || run_reader(listener, ctx, chunk_now_ms));
         let mut conn = UnixStream::connect(&sock).expect("connect");
         conn.write_all(b"visible\x1b]52;c;aGVsbG8=\x07")
             .expect("write pane output");
@@ -5498,6 +5926,13 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         };
         assert_eq!(copied.as_deref(), Some("hello"));
+        while settled.load(Ordering::Acquire) < 1 {
+            assert!(
+                Instant::now() < deadline,
+                "reader never settled copied chunk"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert!(
             parser
                 .lock()
@@ -5527,6 +5962,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let links: Arc<LinkTable> = Arc::new(LinkTable::default());
         let ctx = ReaderCtx {
+            snapshot_contended: None,
             parser: parser.clone(),
             stop: stop.clone(),
             seeded: Arc::new(AtomicBool::new(true)),
@@ -5544,19 +5980,26 @@ mod tests {
             grid_gen: Arc::new(AtomicU64::new(0)),
             signals: Arc::new(ViewerSignals::new()),
         };
-        let reader = std::thread::spawn(move || run_reader(listener, ctx));
+        let reader = std::thread::spawn(move || run_reader(listener, ctx, chunk_now_ms));
         let mut conn = UnixStream::connect(&sock).expect("connect");
         conn.write_all(b"see \x1b]8;;https://example.com/repo\x1b\\the repo\x1b]8;;\x1b\\ now")
             .expect("write pane output");
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let recorded = loop {
-            let held: Vec<PaneLink> = links.table.lock().unwrap().iter().cloned().collect();
-            if !held.is_empty() || Instant::now() >= deadline {
-                break held;
-            }
+        while !parser
+            .lock()
+            .unwrap()
+            .screen()
+            .contents()
+            .contains("see the repo now")
+            && Instant::now() < deadline
+        {
             std::thread::sleep(Duration::from_millis(5));
-        };
+        }
+        stop.store(true, Ordering::Relaxed);
+        drop(conn);
+        reader.join().expect("reader thread");
+        let recorded: Vec<PaneLink> = links.table.lock().unwrap().iter().cloned().collect();
         assert_eq!(
             recorded,
             vec![PaneLink {
@@ -5573,10 +6016,6 @@ mod tests {
                 .contains("see the repo now"),
             "the grid keeps the visible text and none of the sequence"
         );
-
-        stop.store(true, Ordering::Relaxed);
-        drop(conn);
-        let _ = reader.join();
     }
 
     /// tmux only learned to re-emit OSC 8 from `capture-pane -e` in 3.4 (its
@@ -5644,29 +6083,30 @@ mod tests {
             .output()
             .expect("tmux new-session");
         assert!(out.status.success());
-        let target = format!("{}:^.0", guard.name());
+        let target = crate::tmux::test_helpers::only_pane_id(guard.name());
         let deadline = crate::tmux::TmuxCommandDeadline::new();
 
         // Wait for the prompt to be painted before seeding.
         let mut probe = PaneSeedState::default();
         for _ in 0..50 {
             probe = pane_seed_state(&target, &deadline).unwrap_or_default();
-            if probe.cursor_y == 20 {
+            if probe.cursor_y == 20 && probe.cursor_x == 7 {
                 break;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
         assert_eq!(
-            (probe.pane_height, probe.cursor_y),
-            (40, 20),
+            (probe.pane_height, probe.cursor_y, probe.cursor_x),
+            (40, 20, 7),
             "fixture must park the cursor on the prompt row of a 40-row pane"
         );
 
         // Seed a grid SHORTER than the pane, the racing shape: the body's top
         // rows scroll into history and take the prompt with them.
         let rows: u16 = 24;
-        let stream =
-            capture_seed_stream(&target, (80, rows), &deadline).expect("capture seed stream");
+        let stream = capture_seed_stream(&target, (80, rows), &deadline, || ())
+            .expect("capture seed stream")
+            .0;
         let mut p = vt100::Parser::new(rows, 80, SCROLLBACK_LINES);
         p.process(&stream);
 
@@ -5723,13 +6163,24 @@ mod tests {
             .output()
             .expect("tmux new-session");
         assert!(out.status.success());
-        // Let the pane paint before capturing it.
-        let target = format!("{}:^.0", guard.name());
+        let expected = vec![
+            PaneLink {
+                text: "mid link".to_string(),
+                uri: "https://example.com/mid".to_string(),
+            },
+            PaneLink {
+                text: "eol link".to_string(),
+                uri: "https://example.com/eol".to_string(),
+            },
+        ];
+        let target = crate::tmux::test_helpers::only_pane_id(guard.name());
         let deadline = crate::tmux::TmuxCommandDeadline::new();
         let mut stream = Vec::new();
         for _ in 0..50 {
-            stream = capture_seed_stream(&target, (80, 24), &deadline).unwrap_or_default();
-            if !crate::tmux::osc8::extract_links(&stream).is_empty() {
+            stream = capture_seed_stream(&target, (80, 24), &deadline, || ())
+                .map(|(stream, ())| stream)
+                .unwrap_or_default();
+            if crate::tmux::osc8::extract_links(&stream) == expected {
                 break;
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -5739,17 +6190,7 @@ mod tests {
         record_seed_links(&slot, &stream);
         let held: Vec<PaneLink> = slot.table.lock().unwrap().iter().cloned().collect();
         assert_eq!(
-            held,
-            vec![
-                PaneLink {
-                    text: "mid link".to_string(),
-                    uri: "https://example.com/mid".to_string(),
-                },
-                PaneLink {
-                    text: "eol link".to_string(),
-                    uri: "https://example.com/eol".to_string(),
-                },
-            ],
+            held, expected,
             "capture-pane -e must round-trip both hyperlink shapes"
         );
     }
@@ -5859,17 +6300,8 @@ mod tests {
         assert_eq!(held[0].uri, "https://example.com/live");
     }
 
-    /// The install's half of #3818's ordering: it takes the snapshot fence
-    /// before its drain and still holds it inside the swap, where it replaces
-    /// the link table. The reader cannot show this, and the seed's chunk guard
-    /// would keep catching the erase on its own, so a fence narrowed to either
-    /// side would leave `reconcile_links` racing the reader again with nothing
-    /// red.
-    ///
-    /// Probed at both ends, because one end does not imply the other. The
-    /// forwarder probes during the drain, which cannot complete until it
-    /// answers. The link table is then held so the install parks inside the
-    /// swap, and the parser lock going away is the install arriving there.
+    /// Observe the snapshot fence before the native drain deadline and again
+    /// inside the swap, while link reconciliation is held.
     #[test]
     fn an_install_holds_the_snapshot_fence_across_its_swap() {
         use std::io::Write;
@@ -5877,69 +6309,82 @@ mod tests {
         let (_data_reader, data_forwarder) = UnixStream::pair().expect("data pair");
         let (parent_control, mut forwarder_control) = UnixStream::pair().expect("control pair");
         let snapshot = Arc::new(Mutex::new(()));
-        let probed_fence = snapshot.clone();
-        let forwarder = std::thread::spawn(move || {
-            let (kind, generation) =
-                read_drain_frame(&mut forwarder_control).expect("receive drain probe");
-            assert_eq!(kind, DRAIN_PROBE);
-            let fenced = probed_fence.try_lock().is_err();
-            let _ = forwarder_control.write_all(&drain_frame(DRAIN_ACK, generation));
-            fenced
-        });
+        let (before_deadline, entered, resume) = TestRendezvous::new();
 
         let socket = Arc::new(Mutex::new(Some(data_forwarder)));
         let control = Mutex::new(DrainControl {
             stream: Some(parent_control),
             next_generation: 0,
+            before_deadline: Some(before_deadline),
+            next_now: Some(Instant::now()),
         });
         let parser = Mutex::new(vt100::Parser::new(6, 40, 0));
         let app_cursor = AtomicBool::new(false);
         let grid_gen = AtomicU64::new(0);
         let links = LinkTable::default();
 
-        // Park the install inside the swap: `reconcile_links` waits on this.
-        let in_swap = links.table.lock().expect("hold the link table");
-        let (result, fenced_in_swap) = std::thread::scope(|scope| {
-            let install = scope.spawn(|| {
-                install_seeded_parser(
-                    SeedSink {
-                        parser: &parser,
-                        app_cursor: &app_cursor,
-                        grid_gen: &grid_gen,
-                        links: &links,
-                    },
-                    None,
-                    b"\x1b]8;;https://example.com/seeded\x1b\\docs\x1b]8;;\x1b\\\r\n",
-                    (40, 6),
-                    SeedGuard {
-                        chunk: None,
-                        pipe: None,
-                    },
-                    SeedInstallFence {
-                        snapshot: Some(&snapshot),
-                        socket: Some(&socket),
-                        control: Some(&control),
-                    },
+        let (result, entered, ack, resumed, reached_swap, fenced_at_drain, fenced_in_swap) =
+            std::thread::scope(|scope| {
+                // These guards must unwind before scope joins a blocked install.
+                let resume = resume;
+                let in_swap = links.table.lock().expect("hold the link table");
+                let install = scope.spawn(|| {
+                    install_seeded_parser(
+                        SeedSink {
+                            parser: &parser,
+                            app_cursor: &app_cursor,
+                            grid_gen: &grid_gen,
+                            links: &links,
+                        },
+                        None,
+                        b"\x1b]8;;https://example.com/seeded\x1b\\docs\x1b]8;;\x1b\\\r\n",
+                        (40, 6),
+                        SeedGuard {
+                            chunk: None,
+                            pipe: None,
+                        },
+                        SeedInstallFence {
+                            snapshot: Some(&snapshot),
+                            socket: Some(&socket),
+                            control: Some(&control),
+                        },
+                    )
+                });
+                let entered = entered.recv_timeout(Duration::from_secs(5));
+                let fenced_at_drain = snapshot.try_lock().is_err();
+                let ack = forwarder_control.write_all(&drain_frame(DRAIN_ACK, 0));
+                let resumed = resume.send(());
+                drop(resume);
+                let arrival = Instant::now() + Duration::from_secs(5);
+                while parser.try_lock().is_ok()
+                    && Instant::now() < arrival
+                    && !install.is_finished()
+                {
+                    std::thread::yield_now();
+                }
+                let reached_swap = parser.try_lock().is_err();
+                let fenced = snapshot.try_lock().is_err();
+                drop(in_swap);
+                (
+                    install.join(),
+                    entered,
+                    ack,
+                    resumed,
+                    reached_swap,
+                    fenced_at_drain,
+                    fenced,
                 )
             });
-            // The install takes the parser lock only inside the swap, so losing
-            // it here is the install past its drain and into the replacement.
-            let arrival = Instant::now() + Duration::from_secs(5);
-            while parser.try_lock().is_ok() {
-                assert!(
-                    Instant::now() < arrival,
-                    "the install never reached the swap"
-                );
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            let fenced = snapshot.try_lock().is_err();
-            drop(in_swap);
-            (install.join().expect("install thread"), fenced)
-        });
+
+        entered.expect("install reached native drain");
+        ack.expect("prequeue native ACK");
+        resumed.expect("release drain");
+        assert!(reached_swap, "the install never reached the swap");
+        let result = result.expect("install thread");
 
         assert_eq!(result, VtRefreshResult::Refreshed);
         assert!(
-            forwarder.join().expect("forwarder thread"),
+            fenced_at_drain,
             "the install must hold the fence across its drain"
         );
         assert!(
@@ -5988,7 +6433,9 @@ mod tests {
         let snapshot = Arc::new(Mutex::new(()));
         let stream: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
+        let (contended_tx, contended_rx) = mpsc::channel();
         let ctx = ReaderCtx {
+            snapshot_contended: Some(contended_tx),
             parser: parser.clone(),
             stop: stop.clone(),
             seeded: Arc::new(AtomicBool::new(true)),
@@ -6006,7 +6453,7 @@ mod tests {
             grid_gen: grid_gen.clone(),
             signals: Arc::new(ViewerSignals::new()),
         };
-        let reader = std::thread::spawn(move || run_reader(listener, ctx));
+        let reader = std::thread::spawn(move || run_reader(listener, ctx, chunk_now_ms));
         let mut conn = UnixStream::connect(&sock).expect("connect");
 
         // The screen the reseed's snapshot was taken from. Waiting for it also
@@ -6014,7 +6461,13 @@ mod tests {
         // what the install reads the pending queue through.
         conn.write_all(b"see docs now").expect("write pane output");
         let ready = Instant::now() + Duration::from_secs(5);
-        while settled_chunk_seq.load(Ordering::Acquire) == 0 {
+        while !parser
+            .lock()
+            .unwrap()
+            .screen()
+            .contents()
+            .contains("see docs now")
+        {
             assert!(
                 Instant::now() < ready,
                 "reader never applied the first chunk"
@@ -6035,6 +6488,8 @@ mod tests {
         let control = Arc::new(Mutex::new(DrainControl {
             stream: Some(parent_control),
             next_generation: 0,
+            before_deadline: None,
+            next_now: None,
         }));
 
         let expected_chunk_seq = chunk_seq.load(Ordering::Acquire);
@@ -6082,24 +6537,9 @@ mod tests {
             })
         };
 
-        // Neither side may enter. The install takes the fence before anything
-        // else, so it never reaches its drain; and the reader takes it before
-        // `recv`, so the chunk is not claimed, let alone recorded. This is the
-        // interleaving #3818 describes, and there is no state in which the
-        // target is recorded and its bytes are not yet applied.
-        assert!(
-            matches!(
-                probed_rx.recv_timeout(Duration::from_millis(200)),
-                Err(mpsc::RecvTimeoutError::Timeout)
-            ),
-            "the install must not run its drain inside another holder's fence"
-        );
-        assert_eq!(
-            chunk_seq.load(Ordering::Acquire),
-            expected_chunk_seq,
-            "the fence holds the reader off the chunk, sequence and bytes together"
-        );
-        assert!(links.table.lock().unwrap().is_empty());
+        let contention = contended_rx.recv_timeout(Duration::from_secs(5));
+        let fenced_seq = chunk_seq.load(Ordering::Acquire);
+        let fenced_links_empty = links.table.lock().unwrap().is_empty();
 
         drop(fence);
         probed_rx
@@ -6111,16 +6551,28 @@ mod tests {
             "whichever side wins the released fence, the snapshot is stale: the chunk is either unread on the socket or already past the baseline it captured at"
         );
 
-        // The reader applies what it was holding: label and target arrive
-        // together, and the stale snapshot took neither.
         let landed = Instant::now() + Duration::from_secs(5);
-        let recorded = loop {
-            let held: Vec<PaneLink> = links.table.lock().unwrap().iter().cloned().collect();
-            if !held.is_empty() || Instant::now() >= landed {
-                break held;
-            }
+        while !parser
+            .lock()
+            .unwrap()
+            .screen()
+            .contents()
+            .contains("docs added")
+            && Instant::now() < landed
+        {
             std::thread::sleep(Duration::from_millis(5));
-        };
+        }
+        stop.store(true, Ordering::Relaxed);
+        drop(conn);
+        reader.join().expect("reader thread");
+        forwarder.join().expect("forwarder thread");
+        contention.expect("reader attempted the held snapshot fence");
+        assert_eq!(
+            fenced_seq, expected_chunk_seq,
+            "the held fence excludes recv"
+        );
+        assert!(fenced_links_empty);
+        let recorded: Vec<PaneLink> = links.table.lock().unwrap().iter().cloned().collect();
         assert_eq!(
             recorded,
             vec![PaneLink {
@@ -6138,11 +6590,6 @@ mod tests {
                 .contains("docs added"),
             "and the label it describes must be on the grid"
         );
-
-        stop.store(true, Ordering::Relaxed);
-        drop(conn);
-        let _ = reader.join();
-        forwarder.join().expect("forwarder thread");
     }
 
     #[test]
@@ -6252,13 +6699,7 @@ mod tests {
     fn reader_chunk_timing_distinguishes_stream_from_lone_chunk() {
         use std::io::Write;
 
-        // Drive run_reader against a raw socket (posing as the pipe-pane
-        // forwarder), no tmux needed. The reader stamps each chunk's arrival;
-        // `chunk_timing` feeds the capture worker's repaint-quiescence debounce,
-        // which must tell a lone chunk (a keystroke echo, wide inter-chunk gap)
-        // from a back-to-back stream (a multi-chunk repaint, small gap). Without
-        // that distinction the worker samples half-repainted grids and the
-        // paired terminal flashes (#2903).
+        // Socket reads remain separate; arrival times are local test input.
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("s.sock");
         let listener = UnixListener::bind(&sock).expect("bind");
@@ -6269,7 +6710,8 @@ mod tests {
         let last_chunk_ms = Arc::new(AtomicU64::new(0));
         let prev_gap_ms = Arc::new(AtomicU64::new(u64::MAX));
         let ctx = ReaderCtx {
-            parser,
+            snapshot_contended: None,
+            parser: parser.clone(),
             stop: stop.clone(),
             // Seeded upfront: this test has no capture-pane seed to wait for.
             seeded: Arc::new(AtomicBool::new(true)),
@@ -6287,7 +6729,11 @@ mod tests {
             grid_gen: Arc::new(AtomicU64::new(0)),
             signals: Arc::new(ViewerSignals::new()),
         };
-        let reader = std::thread::spawn(move || run_reader(listener, ctx));
+        let now = Arc::new(AtomicU64::new(100));
+        let reader_now = now.clone();
+        let reader = std::thread::spawn(move || {
+            run_reader(listener, ctx, || reader_now.load(Ordering::Acquire))
+        });
         let mut conn = UnixStream::connect(&sock).expect("connect");
 
         // Wait for the reader to publish the nth chunk's complete parser
@@ -6305,36 +6751,24 @@ mod tests {
             }
         };
 
-        // First chunk (the repaint's clear): no prior chunk, so the gap is
-        // "infinite" and it classifies as lone, never streaming.
-        conn.write_all(b"\x1b[2J").expect("write clear");
-        wait_seq(1);
+        for (index, (at, bytes, gap)) in [
+            (100, &b"\x1b[2J"[..], u64::MAX),
+            (104, &b"partial"[..], 4),
+            (109, &b" repaint"[..], 5),
+            (149, &b"!"[..], 40),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            now.store(at, Ordering::Release);
+            conn.write_all(bytes).expect("write chunk");
+            wait_seq(index as u64 + 1);
+            assert_eq!(last_chunk_ms.load(Ordering::Relaxed), at);
+            assert_eq!(prev_gap_ms.load(Ordering::Relaxed), gap);
+        }
         assert_eq!(
-            prev_gap_ms.load(Ordering::Relaxed),
-            u64::MAX,
-            "the first chunk after arming is lone, not streaming"
-        );
-
-        // Two back-to-back reprint chunks: the reader records a real, small gap.
-        conn.write_all(b"partial").expect("write partial");
-        wait_seq(2);
-        conn.write_all(b" repaint").expect("write rest");
-        wait_seq(3);
-        let stream_gap = prev_gap_ms.load(Ordering::Relaxed);
-        assert!(
-            stream_gap < 20,
-            "back-to-back chunks record a small gap, got {stream_gap}"
-        );
-
-        // A chunk after a quiet pause records a much wider gap, so it reads as a
-        // lone chunk and samples immediately rather than debouncing.
-        std::thread::sleep(Duration::from_millis(40));
-        conn.write_all(b"!").expect("write lone");
-        wait_seq(4);
-        let quiet_gap = prev_gap_ms.load(Ordering::Relaxed);
-        assert!(
-            quiet_gap >= 20 && quiet_gap > stream_gap,
-            "a chunk after a 40ms pause is lone (gap {quiet_gap}) vs streamed (gap {stream_gap})"
+            parser.lock().unwrap().screen().contents(),
+            "partial repaint!"
         );
 
         stop.store(true, Ordering::Relaxed);
@@ -6396,6 +6830,7 @@ mod tests {
         let chunk_seq = Arc::new(AtomicU64::new(0));
         let settled_chunk_seq = Arc::new(AtomicU64::new(0));
         let ctx = ReaderCtx {
+            snapshot_contended: None,
             parser: parser.clone(),
             stop: stop.clone(),
             seeded: seeded.clone(),
@@ -6413,17 +6848,17 @@ mod tests {
             grid_gen: grid_gen.clone(),
             signals: Arc::new(ViewerSignals::new()),
         };
-        let reader = std::thread::spawn(move || run_reader(listener, ctx));
+        let reader = std::thread::spawn(move || run_reader(listener, ctx, chunk_now_ms));
         let mut conn = UnixStream::connect(&sock).expect("connect");
 
         // Pre-seed: pane output plus an OSC 52 copy, all while `seeded == false`.
         conn.write_all(b"PRE-SEED-OUTPUT\x1b]52;c;aGVsbG8=\x07")
             .expect("write pre-seed");
         let deadline = Instant::now() + Duration::from_secs(5);
-        while clipboard.lock().unwrap().is_none() {
+        while settled_chunk_seq.load(Ordering::Acquire) < 1 {
             assert!(
                 Instant::now() < deadline,
-                "reader never tapped the pre-seed OSC 52"
+                "reader never settled the pre-seed chunk"
             );
             std::thread::sleep(Duration::from_millis(2));
         }
@@ -6466,6 +6901,10 @@ mod tests {
             1,
             "a queued chunk must remain unsettled until it mutates the parser"
         );
+        assert!(
+            snapshot.try_lock().is_err(),
+            "the reader must hold the snapshot fence while waiting to parse"
+        );
         let (swap_tx, swap_rx) = std::sync::mpsc::channel();
         let swap_parser = parser.clone();
         let swap_snapshot = snapshot.clone();
@@ -6494,10 +6933,8 @@ mod tests {
             );
             swap_tx.send(result).expect("report seed result");
         });
-        assert!(
-            swap_rx.recv_timeout(Duration::from_millis(30)).is_err(),
-            "snapshot must wait for a reader that has received but not parsed a chunk"
-        );
+        // Snapshot ownership was observed before starting the swap, so the
+        // held parser cannot mask a missing reader fence.
         stop.store(true, Ordering::Relaxed);
         drop(parser_guard);
         assert_eq!(
@@ -6775,9 +7212,9 @@ mod tests {
         let signals = ViewerSignals::new();
         let stale = u64::MAX;
         signals.sync_hold_since_ms.store(stale, Ordering::Relaxed);
-        SyncHoldPlan::from_events(&[true]).begin(&signals);
+        SyncHoldPlan::from_events(&[true]).begin(&signals, || 100);
         assert_eq!(signals.sync_hold_since_ms.load(Ordering::Relaxed), stale);
-        SyncHoldPlan::from_events(&[false, true]).begin(&signals);
+        SyncHoldPlan::from_events(&[false, true]).begin(&signals, || 100);
         let fresh = signals.sync_hold_since_ms.load(Ordering::Relaxed);
         assert_ne!(fresh, stale, "a new bracket gets a new timestamp");
         // The restart is one store: the previous repaint's tail bytes have not
@@ -6789,21 +7226,21 @@ mod tests {
     #[test]
     fn viewer_signals_hold_opens_and_closes() {
         let signals = ViewerSignals::new();
-        assert!(!signals.hold_active());
-        signals.begin_hold();
-        assert!(signals.hold_active());
+        assert!(!signals.hold_active_at(100));
+        signals.begin_hold(100);
+        assert!(signals.hold_active_at(100));
         // Re-opening does not restart the clock.
         let since = signals.sync_hold_since_ms.load(Ordering::Relaxed);
-        signals.begin_hold();
+        signals.begin_hold(101);
         assert_eq!(signals.sync_hold_since_ms.load(Ordering::Relaxed), since);
         signals.end_hold();
-        assert!(!signals.hold_active());
-        assert!(!signals.frame_incomplete());
+        assert!(!signals.hold_active_at(100));
+        assert!(!signals.incomplete_within(100));
 
         // A repaint slower than the wakeup hold stops suppressing publication
         // but must still read as incomplete, or the sampler would serve the
         // half-drawn grid instead of the last whole frame it already has.
-        signals.begin_hold();
+        signals.begin_hold(100);
         let since = signals.sync_hold_since_ms.load(Ordering::Relaxed);
         for (elapsed, hold, incomplete) in [
             (0, true, true),
@@ -6814,11 +7251,7 @@ mod tests {
             (SYNC_BRACKET_ABANDON_MS, false, false),
         ] {
             let now = since + elapsed;
-            assert_eq!(
-                open_within(since, now, SYNC_HOLD_MAX_MS) && signals.incomplete_within(now),
-                hold,
-                "hold at {elapsed}ms"
-            );
+            assert_eq!(signals.hold_active_at(now), hold, "hold at {elapsed}ms");
             assert_eq!(
                 signals.incomplete_within(now),
                 incomplete,
@@ -6837,11 +7270,11 @@ mod tests {
         // therefore stamped once and left alone, so the abandon window still
         // expires and publication resumes (torn at worst, never frozen).
         let signals = ViewerSignals::new();
-        signals.begin_hold();
+        signals.begin_hold(100);
         let run_started = signals.incomplete_since_ms.load(Ordering::Relaxed);
         let mut bracket = signals.sync_hold_since_ms.load(Ordering::Relaxed);
         for read in 1..=50 {
-            SyncHoldPlan::from_events(&[false, true]).begin(&signals);
+            SyncHoldPlan::from_events(&[false, true]).begin(&signals, || 100 + read);
             let next = signals.sync_hold_since_ms.load(Ordering::Relaxed);
             assert!(next >= bracket, "read {read}: bracket hold moves forward");
             bracket = next;
@@ -6860,10 +7293,10 @@ mod tests {
         // it ends the run, and the next repaint gets a whole fresh hold.
         SyncHoldPlan::from_events(&[false]).end(&signals);
         assert_eq!(signals.incomplete_since_ms.load(Ordering::Relaxed), 0);
-        assert!(!signals.frame_incomplete());
-        signals.begin_hold();
-        assert!(signals.frame_incomplete());
-        assert!(signals.hold_active());
+        assert!(!signals.incomplete_within(100));
+        signals.begin_hold(100);
+        assert!(signals.incomplete_within(100));
+        assert!(signals.hold_active_at(100));
     }
 
     #[test]
@@ -6878,12 +7311,12 @@ mod tests {
         let plan = SyncHoldPlan::from_events(&[true, false, true]);
         assert!(plan.restart, "the last opener follows a close");
         assert!(!plan.close, "and the read ends inside the new bracket");
-        plan.begin(&signals);
+        plan.begin(&signals, || 100);
         assert!(
-            signals.frame_incomplete(),
+            signals.incomplete_within(100),
             "the half-applied repaint is held"
         );
-        assert!(signals.hold_active());
+        assert!(signals.hold_active_at(100));
         assert_ne!(signals.incomplete_since_ms.load(Ordering::Relaxed), 0);
     }
 
@@ -6902,6 +7335,7 @@ mod tests {
         let signals = Arc::new(ViewerSignals::new());
         let wakeup: ChangeWakeup = Arc::new((Mutex::new(0u64), Condvar::new()));
         let ctx = ReaderCtx {
+            snapshot_contended: None,
             parser: Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0))),
             stop: stop.clone(),
             seeded: Arc::new(AtomicBool::new(true)),
@@ -6920,17 +7354,24 @@ mod tests {
             signals: signals.clone(),
         };
         let rx = signals.changed_tx.subscribe();
-        let reader = std::thread::spawn(move || run_reader(listener, ctx));
+        let parser = ctx.parser.clone();
+        let settled = ctx.settled_chunk_seq.clone();
+        let reader = std::thread::spawn(move || run_reader(listener, ctx, || 100));
         let mut conn = UnixStream::connect(&sock).expect("connect");
 
         conn.write_all(b"\x1b[?2026h\x1b[2J\x1b[HPART-A")
             .expect("write");
         let deadline = Instant::now() + Duration::from_secs(5);
-        while grid_gen.load(Ordering::Relaxed) < 1 {
+        while settled.load(Ordering::Acquire) < 1 {
             assert!(Instant::now() < deadline, "reader never parsed the chunk");
             std::thread::sleep(Duration::from_millis(2));
         }
-        assert!(signals.hold_active(), "bracket opened: hold must be active");
+        // Settlement precedes notification; the parser lock closes that window.
+        drop(parser.lock().unwrap());
+        assert!(
+            signals.hold_active_at(100),
+            "bracket opened: hold must be active"
+        );
         assert!(
             !rx.has_changed().unwrap(),
             "no viewer wake inside the bracket"
@@ -6943,11 +7384,15 @@ mod tests {
 
         conn.write_all(b"\x1b[5;1HPART-B\x1b[?2026l")
             .expect("write");
-        while grid_gen.load(Ordering::Relaxed) < 2 {
+        while settled.load(Ordering::Acquire) < 2 {
             assert!(Instant::now() < deadline, "reader never parsed the close");
             std::thread::sleep(Duration::from_millis(2));
         }
-        assert!(!signals.hold_active(), "bracket closed: hold released");
+        drop(parser.lock().unwrap());
+        assert!(
+            !signals.hold_active_at(100),
+            "bracket closed: hold released"
+        );
         assert!(
             rx.has_changed().unwrap(),
             "viewers wake when the frame completes"
@@ -6974,6 +7419,7 @@ mod tests {
         let settled = Arc::new(AtomicU64::new(0));
         let signals = Arc::new(ViewerSignals::new());
         let ctx = ReaderCtx {
+            snapshot_contended: None,
             parser: Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0))),
             stop: stop.clone(),
             seeded: Arc::new(AtomicBool::new(false)),
@@ -6991,7 +7437,7 @@ mod tests {
             grid_gen: Arc::new(AtomicU64::new(0)),
             signals: signals.clone(),
         };
-        let reader = std::thread::spawn(move || run_reader(listener, ctx));
+        let reader = std::thread::spawn(move || run_reader(listener, ctx, || 100));
         let mut conn = UnixStream::connect(&sock).expect("connect");
         let deadline = Instant::now() + Duration::from_secs(5);
         let await_chunk = |seq: u64| {
@@ -7006,12 +7452,15 @@ mod tests {
 
         conn.write_all(b"\x1b[?2026h\x1b[2JPART-A").expect("write");
         await_chunk(1);
-        assert!(signals.hold_active(), "pre-seed opener still holds");
+        assert!(signals.hold_active_at(100), "pre-seed opener still holds");
 
         conn.write_all(b"PART-B\x1b[?2026l").expect("write");
         await_chunk(2);
-        assert!(!signals.hold_active(), "pre-seed close releases the hold");
-        assert!(!signals.frame_incomplete());
+        assert!(
+            !signals.hold_active_at(100),
+            "pre-seed close releases the hold"
+        );
+        assert!(!signals.incomplete_within(100));
 
         stop.store(true, Ordering::Relaxed);
         drop(conn);
@@ -7025,21 +7474,21 @@ mod tests {
         ch.parser.lock().unwrap().process(b"before");
         ch.grid_gen.fetch_add(1, Ordering::Relaxed);
         let deadline = crate::tmux::TmuxCommandDeadline::new();
-        let first = ch.sample_with_deadline(4, &deadline).content;
+        let first = ch.sample_with_clock(4, &deadline, || 100).content;
         assert!(first.contains("before"));
 
         // Output lands inside a bracket: the sample must not follow it yet.
-        ch.signals.begin_hold();
+        ch.signals.begin_hold(100);
         ch.parser.lock().unwrap().process(b"\r\x1b[Kafter");
         ch.grid_gen.fetch_add(1, Ordering::Relaxed);
-        let held = ch.sample_with_deadline(4, &deadline).content;
+        let held = ch.sample_with_clock(4, &deadline, || 100).content;
         assert_eq!(
             held, first,
             "mid-bracket sample serves the last complete frame"
         );
 
         ch.signals.end_hold();
-        let fresh = ch.sample_with_deadline(4, &deadline).content;
+        let fresh = ch.sample_with_clock(4, &deadline, || 100).content;
         assert!(
             fresh.contains("after"),
             "closing the bracket publishes the new frame"
@@ -7255,20 +7704,20 @@ mod tests {
         let deadline = crate::tmux::TmuxCommandDeadline::new();
         ch.parser.lock().unwrap().process(b"whole");
         ch.grid_gen.fetch_add(1, Ordering::Relaxed);
-        let cached = ch.sample_with_deadline(4, &deadline);
+        let cached = ch.sample_with_clock(4, &deadline, || 100);
         assert!(cached.content.contains("whole"));
         assert!(!cached.incomplete);
 
         // A repaint opens a bracket and only its first half has been applied.
-        ch.signals.begin_hold();
+        ch.signals.begin_hold(100);
         ch.parser.lock().unwrap().process(b"\r\x1b[Kpart");
         ch.grid_gen.fetch_add(1, Ordering::Relaxed);
 
-        let hit = ch.sample_with_deadline(4, &deadline);
+        let hit = ch.sample_with_clock(4, &deadline, || 100);
         assert_eq!(hit.content, cached.content, "cache hit stays whole");
         assert!(!hit.incomplete);
 
-        let miss = ch.sample_with_deadline(3, &deadline);
+        let miss = ch.sample_with_clock(3, &deadline, || 100);
         assert!(miss.content.contains("part"), "cache miss reassembles");
         assert!(miss.incomplete, "a mid-bracket assembly is not publishable");
 
@@ -7277,7 +7726,7 @@ mod tests {
         ch.signals.end_hold();
         assert!(miss.incomplete);
 
-        let after = ch.sample_with_deadline(3, &deadline);
+        let after = ch.sample_with_clock(3, &deadline, || 100);
         assert!(!after.incomplete, "a closed bracket publishes again");
         assert!(after.content.contains("part"));
     }

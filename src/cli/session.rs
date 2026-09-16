@@ -208,6 +208,10 @@ pub struct RenameArgs {
     /// Off by default; ignored for untied / non-worktree sessions.
     #[arg(long)]
     rename_branch: bool,
+
+    /// Rename the Git branch without moving the worktree directory
+    #[arg(long, conflicts_with = "rename_branch")]
+    branch: Option<String>,
 }
 
 #[derive(Args)]
@@ -1593,12 +1597,36 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
             );
         }
         println!("  Profile: {}", storage.profile());
-        if let Some(parent_id) = &inst.parent_session_id {
-            println!("  Parent:  {}", parent_id);
+        for line in relationship_lines(&inst, &instances) {
+            println!("{line}");
         }
     }
 
     Ok(())
+}
+
+/// `session show` lines naming `inst`'s parent and children (`aoe add -P`),
+/// by title when the related session is in `instances`.
+fn relationship_lines(
+    inst: &crate::session::Instance,
+    instances: &[crate::session::Instance],
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(parent_id) = &inst.parent_session_id {
+        lines.push(match instances.iter().find(|i| &i.id == parent_id) {
+            Some(parent) => format!("  Parent:  {} ({parent_id})", parent.title),
+            None => format!("  Parent:  {parent_id}"),
+        });
+    }
+    let mut children = instances
+        .iter()
+        .filter(|i| i.parent_session_id.as_deref() == Some(inst.id.as_str()))
+        .peekable();
+    if children.peek().is_some() {
+        lines.push("  Children:".to_string());
+        lines.extend(children.map(|child| format!("    {} ({})", child.title, child.id)));
+    }
+    lines
 }
 
 async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
@@ -1729,8 +1757,8 @@ fn rename_success_message(
 }
 
 async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
-    if args.title.is_none() && args.group.is_none() {
-        bail!("At least one of --title or --group must be specified");
+    if args.title.is_none() && args.group.is_none() && args.branch.is_none() {
+        bail!("At least one of --title, --group or --branch must be specified");
     }
 
     let storage = Storage::open_unwatched(profile)?;
@@ -1761,7 +1789,7 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
 
     let id = inst.id.clone();
     let title_requested = args.title.is_some();
-    let session_lock_required = title_requested || args.rename_branch;
+    let session_lock_required = title_requested || args.rename_branch || args.branch.is_some();
 
     // The initial load only resolves the requested row. Serialize every
     // identity-changing rename from the fresh duplicate check through external
@@ -1818,7 +1846,7 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
     // the two cannot drift. Decided per-session from the resolved setting.
     let config = crate::session::config::profile_config::resolve_config_or_warn(profile);
     let tied = inst.tie_workdir_applies(config.session.tie_workdir_to_name);
-    let tied_edit = tied && (args.title.is_some() || args.rename_branch);
+    let tied_edit = args.branch.is_none() && tied && (args.title.is_some() || args.rename_branch);
     let duplicate_path = if tied_edit {
         crate::session::worktree_edit::derived_worktree_path(
             std::path::Path::new(&inst.project_path),
@@ -1842,7 +1870,51 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
 
     let mut new_path: Option<String> = None;
     let mut new_branch: Option<String> = None;
-    if tied_edit {
+    if let Some(branch) = &args.branch {
+        let info = inst
+            .worktree_info
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Branch-only rename requires a managed worktree"))?;
+        if branch != &info.branch {
+            let path = std::path::Path::new(&inst.project_path).canonicalize()?;
+            let repo = std::path::Path::new(&info.main_repo_path).canonicalize()?;
+            let same_branch = |main_repo: &str, name: &str| {
+                name == info.branch
+                    && std::path::Path::new(main_repo).canonicalize().ok().as_ref() == Some(&repo)
+            };
+            for other_profile in crate::session::list_profiles()? {
+                let rows = Storage::open_unwatched(&other_profile)?.load()?;
+                if rows.iter().any(|other| {
+                    other.id != id
+                        && !other.is_trashed()
+                        && (std::path::Path::new(&other.project_path)
+                            .canonicalize()
+                            .ok()
+                            .as_ref()
+                            == Some(&path)
+                            || other
+                                .worktree_info
+                                .as_ref()
+                                .is_some_and(|wt| same_branch(&wt.main_repo_path, &wt.branch))
+                            || other.workspace_info.as_ref().is_some_and(|workspace| {
+                                workspace
+                                    .repos
+                                    .iter()
+                                    .any(|wt| same_branch(&wt.main_repo_path, &wt.branch))
+                            }))
+                }) {
+                    bail!("Another session shares this branch or worktree in profile {other_profile}; rename is not isolated");
+                }
+            }
+        }
+        if crate::session::worktree_edit::rename_worktree_branch(
+            info,
+            std::path::Path::new(&inst.project_path),
+            branch,
+        )? {
+            new_branch = Some(branch.clone());
+        }
+    } else if tied_edit {
         let current_path = inst.project_path.clone();
         let worktree_info = inst
             .worktree_info
@@ -1950,6 +2022,33 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
     let (persisted_old_title, committed_title) = match persist {
         Ok(titles) => titles,
         Err(error) => {
+            if args.branch.is_some() {
+                if let Some(branch) = &new_branch {
+                    let info = inst
+                        .worktree_info
+                        .as_ref()
+                        .expect("branch rename checked worktree metadata");
+                    let stored = storage.load().map_err(|_| anyhow::anyhow!("Session metadata write failed ({error}) and its state cannot be read. Branch is {branch}; directory unchanged. Inspect before retrying."))?;
+                    let persisted_branch = stored
+                        .iter()
+                        .find(|row| row.id == id)
+                        .and_then(|row| row.worktree_info.as_ref())
+                        .map(|wt| wt.branch.as_str());
+                    if persisted_branch == Some(info.branch.as_str()) {
+                        if let Err(rollback) =
+                            crate::session::worktree_edit::rollback_worktree_branch(
+                                info,
+                                std::path::Path::new(&inst.project_path),
+                                branch,
+                            )
+                        {
+                            bail!("Session metadata failed: {error}; branch rollback also failed: {rollback}. The directory is unchanged; inspect Git and session metadata before continuing.");
+                        }
+                    } else if persisted_branch != Some(branch.as_str()) {
+                        bail!("Session metadata failed: {error}; its branch changed concurrently. Directory unchanged; inspect before continuing.");
+                    }
+                }
+            }
             // When the git move already landed, surface that the disk and
             // metadata are out of sync rather than a bare persist error.
             if let Some(path) = &new_path {
@@ -1978,6 +2077,11 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         }
     }
 
+    if args.branch.is_some() {
+        if let Some(branch) = &new_branch {
+            println!("✓ Branch renamed to: {branch} (worktree directory unchanged)");
+        }
+    }
     if let Some(path) = &new_path {
         println!("✓ Worktree moved to: {}", path);
         if let Some(branch) = &new_branch {
@@ -1997,6 +2101,308 @@ mod rename_tests {
     use super::{rename_session, rename_success_message, RenameArgs};
     use crate::session::{Instance, Status, Storage};
     use serial_test::serial;
+
+    #[tokio::test]
+    #[serial]
+    async fn branch_rename_preserves_worktree_and_updates_metadata() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let _tie_guard = crate::session::test_support::TieWorkdirToNameGuard::set(true);
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let worktree = dir.path().join("agent-fixed");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |path: &std::path::Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(path)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&repo, &["init", "-b", "main"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        );
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "agent-old",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        let head = git(&worktree, &["rev-parse", "HEAD"]);
+        std::fs::write(worktree.join("uncommitted.txt"), "keep me").unwrap();
+        let storage = Storage::new_unwatched("branch-only").unwrap();
+        let mut target = Instance::new("Old Title", worktree.to_str().unwrap());
+        target.status = Status::Running;
+        target.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "agent-old".into(),
+            main_repo_path: repo.to_str().unwrap().into(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: Some("main".into()),
+        });
+        let id = target.id.clone();
+        storage
+            .update(|instances, _| {
+                instances.push(target);
+                Ok(())
+            })
+            .unwrap();
+        let external = dir.path().join("external");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--force",
+                external.to_str().unwrap(),
+                "agent-old",
+            ],
+        );
+        std::fs::write(external.join("external.txt"), "keep external").unwrap();
+        let before = serde_json::to_value(storage.load().unwrap()).unwrap();
+        let shared = rename_session(
+            "branch-only",
+            RenameArgs {
+                identifier: Some(id.clone()),
+                title: Some("Must not apply".into()),
+                group: None,
+                rename_branch: false,
+                branch: Some("blocked-shared".into()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(shared.to_string().contains("another Git worktree"));
+        assert_eq!(
+            serde_json::to_value(storage.load().unwrap()).unwrap(),
+            before
+        );
+        for path in [&worktree, &external] {
+            assert_eq!(git(path, &["branch", "--show-current"]), "agent-old");
+            assert_eq!(git(path, &["rev-parse", "HEAD"]), head);
+        }
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("uncommitted.txt")).unwrap(),
+            "keep me"
+        );
+        assert_eq!(
+            std::fs::read_to_string(external.join("external.txt")).unwrap(),
+            "keep external"
+        );
+        assert!(git(&repo, &["branch", "--list", "blocked-shared"]).is_empty());
+        git(
+            &repo,
+            &["worktree", "remove", "--force", external.to_str().unwrap()],
+        );
+        for branch in ["olof/bemlo-123-task", "olof/bemlo-123-task"] {
+            rename_session(
+                "branch-only",
+                RenameArgs {
+                    identifier: Some(id.clone()),
+                    title: Some(branch.into()),
+                    group: None,
+                    rename_branch: false,
+                    branch: Some(branch.into()),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let target = storage.load().unwrap().pop().unwrap();
+        assert_eq!(target.project_path, worktree.to_str().unwrap());
+        assert_eq!(target.title, "olof/bemlo-123-task");
+        assert_eq!(target.worktree_info.unwrap().branch, "olof/bemlo-123-task");
+        assert_eq!(
+            git(&worktree, &["branch", "--show-current"]),
+            "olof/bemlo-123-task"
+        );
+        assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), head);
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("uncommitted.txt")).unwrap(),
+            "keep me"
+        );
+        for branch in ["bad name", "-option", "bad..name", "refs/heads/"] {
+            assert!(rename_session(
+                "branch-only",
+                RenameArgs {
+                    identifier: Some(id.clone()),
+                    title: Some("Must not apply".into()),
+                    group: None,
+                    rename_branch: false,
+                    branch: Some(branch.into()),
+                },
+            )
+            .await
+            .is_err());
+        }
+        git(&repo, &["remote", "add", "origin", "."]);
+        git(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/olof/bemlo-123-task",
+            ],
+        );
+        for title in [Some("Updated title"), None, Some("olof/bemlo-123-task")] {
+            rename_session(
+                "branch-only",
+                RenameArgs {
+                    identifier: Some(id.clone()),
+                    title: title.map(str::to_owned),
+                    group: None,
+                    rename_branch: false,
+                    branch: Some("olof/bemlo-123-task".into()),
+                },
+            )
+            .await
+            .unwrap();
+            let current = storage.load().unwrap().pop().unwrap();
+            assert_eq!(current.title, title.unwrap_or("Updated title"));
+            assert_eq!(current.project_path, worktree.to_str().unwrap());
+            assert_eq!(current.worktree_info.unwrap().branch, "olof/bemlo-123-task");
+            assert_eq!(
+                git(&worktree, &["branch", "--show-current"]),
+                "olof/bemlo-123-task"
+            );
+            assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), head);
+            assert_eq!(
+                std::fs::read_to_string(worktree.join("uncommitted.txt")).unwrap(),
+                "keep me"
+            );
+        }
+        let protected = rename_session(
+            "branch-only",
+            RenameArgs {
+                identifier: Some(id.clone()),
+                title: None,
+                group: None,
+                rename_branch: false,
+                branch: Some("blocked-default".into()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(protected.to_string().contains("default branch"));
+        git(
+            &repo,
+            &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+        );
+        let peer_storage = Storage::new_unwatched("branch-peer").unwrap();
+        for with_worktree_info in [true, false] {
+            let mut peer = Instance::new("Peer", worktree.join(".").to_str().unwrap());
+            if with_worktree_info {
+                peer.worktree_info = storage.load().unwrap()[0].worktree_info.clone();
+                peer.worktree_info.as_mut().unwrap().managed_by_aoe = false;
+            }
+            peer_storage
+                .update(|rows, _| {
+                    *rows = vec![peer];
+                    Ok(())
+                })
+                .unwrap();
+            let shared = rename_session(
+                "branch-only",
+                RenameArgs {
+                    identifier: Some(id.clone()),
+                    title: Some("Must not apply".into()),
+                    group: None,
+                    rename_branch: false,
+                    branch: Some("would-change-peer".into()),
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(shared.to_string().contains("profile branch-peer"));
+            assert_eq!(
+                git(&worktree, &["branch", "--show-current"]),
+                "olof/bemlo-123-task"
+            );
+            assert_eq!(storage.load().unwrap()[0].title, "olof/bemlo-123-task");
+        }
+        peer_storage
+            .update(|rows, _| {
+                rows.clear();
+                Ok(())
+            })
+            .unwrap();
+        let error = rename_session(
+            "branch-only",
+            RenameArgs {
+                identifier: Some(id),
+                title: Some("collision".into()),
+                group: None,
+                rename_branch: false,
+                branch: Some("main".into()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("already exists"));
+        assert_eq!(storage.load().unwrap()[0].title, "olof/bemlo-123-task");
+        assert_eq!(
+            git(&worktree, &["branch", "--show-current"]),
+            "olof/bemlo-123-task"
+        );
+
+        let info = storage.load().unwrap()[0].worktree_info.clone().unwrap();
+        git(&worktree, &["branch", "-m", "rollback-source"]);
+        git(&worktree, &["checkout", "-b", "external-checkout"]);
+        let refs = git(&repo, &["show-ref", "--heads"]);
+        let error = crate::session::worktree_edit::rollback_worktree_branch(
+            &info,
+            &worktree,
+            "rollback-source",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("changed concurrently"));
+        assert_eq!(git(&repo, &["show-ref", "--heads"]), refs);
+        assert_eq!(
+            git(&worktree, &["branch", "--show-current"]),
+            "external-checkout"
+        );
+        assert_eq!(
+            storage.load().unwrap()[0]
+                .worktree_info
+                .as_ref()
+                .unwrap()
+                .branch,
+            info.branch
+        );
+        git(&worktree, &["checkout", "rollback-source"]);
+        crate::session::worktree_edit::rollback_worktree_branch(
+            &info,
+            &worktree,
+            "rollback-source",
+        )
+        .unwrap();
+        assert_eq!(git(&worktree, &["branch", "--show-current"]), info.branch);
+        assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), head);
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("uncommitted.txt")).unwrap(),
+            "keep me"
+        );
+    }
 
     // Three duplicate-identity behaviors kept in one test on purpose: they
     // share the costly setup that forces `#[serial]` (an isolated app dir plus
@@ -2025,6 +2431,7 @@ mod rename_tests {
                 title: Some("main branch".to_string()),
                 group: None,
                 rename_branch: false,
+                branch: None,
             },
         )
         .await
@@ -2040,6 +2447,7 @@ mod rename_tests {
                 title: None,
                 group: Some("work".to_string()),
                 rename_branch: false,
+                branch: None,
             },
         )
         .await
@@ -2080,6 +2488,7 @@ mod rename_tests {
                 title: Some("main branch".to_string()),
                 group: None,
                 rename_branch: false,
+                branch: None,
             },
         )
         .await
@@ -2124,6 +2533,7 @@ mod rename_tests {
                 title: Some("Main Branch".to_string()),
                 group: None,
                 rename_branch: false,
+                branch: None,
             },
         )
         .await
@@ -2136,6 +2546,110 @@ mod rename_tests {
             .unwrap();
         assert_eq!(active.title, "Main Branch");
         assert_eq!(active.project_path, "/tmp/worktrees/main-branch");
+    }
+
+    /// #3739: the live-status gate must consult the command's profile rules;
+    /// storage-loaded rows carry no `source_profile`, so without it a
+    /// profile-local rule is skipped and a running agent reads as Idle.
+    #[tokio::test]
+    #[serial]
+    async fn worktree_edit_consults_profile_status_rules() {
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
+            eprintln!("Skipping: tmux not available");
+            return;
+        }
+        const PROFILE: &str = "worktree-edit-profile-rules";
+        const AGENT: &str = "worktree-edit-rules-agent";
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let _tie_guard = crate::session::test_support::TieWorkdirToNameGuard::set(false);
+        // Otherwise an empty `source_profile` resolves to the only profile,
+        // which is this one, and the rule matches anyway.
+        crate::session::config::update_config(|config| {
+            config.default_profile = "main".to_string();
+        })
+        .unwrap();
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(PROFILE);
+        let profile_config =
+            crate::session::config::profile_config::get_profile_config_path(PROFILE).unwrap();
+        std::fs::create_dir_all(profile_config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &profile_config,
+            format!(
+                "[[agents.{AGENT}.status_rules]]\nstatus = \"running\"\ncontains = \"agent-busy\"\n"
+            ),
+        )
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join("agent-old");
+        std::fs::create_dir(&worktree).unwrap();
+        let mut target = Instance::new("Busy", worktree.to_str().unwrap());
+        target.tool = AGENT.to_string();
+        target.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "agent-old".into(),
+            main_repo_path: dir.path().join("repo").to_str().unwrap().into(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
+        let id = target.id.clone();
+        let tmux_name = crate::tmux::Session::generate_name(&target.id, &target.title);
+        let storage = Storage::new_unwatched(PROFILE).unwrap();
+        storage
+            .update(|instances, _| {
+                instances.push(target);
+                Ok(())
+            })
+            .unwrap();
+
+        let _kill = crate::tmux::test_helpers::TmuxTestSession::from_name(tmux_name.clone());
+        let created = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &tmux_name,
+                "printf 'agent-busy\\n'; sleep 300",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let captured = crate::tmux::tmux_command()
+                .args(["capture-pane", "-p", "-t", &tmux_name])
+                .output()
+                .unwrap();
+            if String::from_utf8_lossy(&captured.stdout).contains("agent-busy") {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "pane never painted");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let error = super::set_worktree_name(
+            PROFILE,
+            super::SetWorktreeNameArgs {
+                identifier: Some(id),
+                name: "agent-new".into(),
+                rename_branch: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("while the session is active"),
+            "{error}"
+        );
+        assert!(worktree.is_dir());
+        assert_eq!(
+            storage.load().unwrap()[0].project_path,
+            worktree.to_str().unwrap()
+        );
     }
 
     #[test]
@@ -2226,6 +2740,7 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
     // enforcing the guard. The holding entry point, for the reason
     // `rename_session` gives: an ambiguous frame must refuse the move.
     let mut live = inst.clone();
+    live.source_profile = profile.to_string();
     crate::tmux::refresh_session_cache();
     live.update_status_with_metadata(None, None);
     // A sandbox container keeps the worktree dir mounted even while the agent
@@ -2954,9 +3469,7 @@ mod set_session_id_tests {
     #[serial]
     async fn set_session_id_clears_resume_probe_failed_marker() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
 
         let storage = Storage::new_unwatched("set-sid-clear-marker").unwrap();
         let mut inst = Instance::new("marked_session", "/tmp/x");
@@ -3022,9 +3535,7 @@ mod set_color_tests {
     #[serial]
     async fn set_color_persists_palette_value_and_clears() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
 
         let (storage, id) = seed("set-color-ok").await;
 
@@ -3060,9 +3571,7 @@ mod set_color_tests {
     #[serial]
     async fn set_color_rejects_unknown_color() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
 
         let (storage, id) = seed("set-color-bad").await;
 
@@ -3120,9 +3629,7 @@ mod acp_reject_tests {
     #[serial]
     async fn set_session_id_rejects_structured_view_session() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
 
         let storage = Storage::new_unwatched("acp-reject").unwrap();
         let mut inst = Instance::new("acp_session", "/tmp/x");
@@ -3217,24 +3724,70 @@ mod import_tests {
         assert_eq!(inst.resume_intent, ResumeIntent::Default);
     }
 
+    /// A row claims a conversation in one of three places, and a re-import
+    /// must see all of them: a terminal import pins `resume_intent`, the
+    /// poller writes `agent_session_id`, and a structured import seeds
+    /// `acp_session_id` while leaving `resume_intent` at `Default`. Missing
+    /// any one of them creates a second row claiming a conversation that is
+    /// already claimed.
     #[test]
-    fn already_imported_matches_resume_and_observed_ids() {
+    fn already_imported_matches_every_spelling_of_a_claim() {
         let mut by_resume = Instance::new("a", "/p");
         by_resume.resume_intent = ResumeIntent::Use("id-1".to_string());
         let mut by_observed = Instance::new("b", "/p");
         by_observed.agent_session_id = Some("id-2".to_string());
-        let fresh = Instance::new("c", "/p");
-        let instances = vec![by_resume, by_observed, fresh];
+        let mut by_structured = Instance::new("c", "/p");
+        by_structured.acp_session_id = Some("id-3".to_string());
+        let fresh = Instance::new("d", "/p");
+        let instances = vec![by_resume, by_observed, by_structured, fresh];
 
-        assert!(already_imported(&instances, "id-1"));
-        assert!(already_imported(&instances, "id-2"));
-        assert!(!already_imported(&instances, "id-3"));
+        for (id, claimed) in [
+            ("id-1", true),
+            ("id-2", true),
+            ("id-3", true),
+            ("id-4", false),
+        ] {
+            assert_eq!(already_imported(&instances, id), claimed, "{id}");
+        }
     }
 }
 
 #[cfg(test)]
 mod show_json_tests {
     use super::*;
+
+    /// #3472: plain `session show` names a parent by title and lists children.
+    #[test]
+    fn relationship_lines_name_parent_and_children() {
+        let parent = Instance::new("orchestrator", "/repo");
+        let mut child = Instance::new("worker", "/repo");
+        child.parent_session_id = Some(parent.id.clone());
+        let mut orphan = Instance::new("stray", "/repo");
+        orphan.parent_session_id = Some("gone".to_string());
+        let instances = vec![parent.clone(), child.clone(), orphan.clone()];
+
+        for (inst, expected) in [
+            (
+                &parent,
+                vec![
+                    "  Children:".to_string(),
+                    format!("    worker ({})", child.id),
+                ],
+            ),
+            (
+                &child,
+                vec![format!("  Parent:  orchestrator ({})", parent.id)],
+            ),
+            (&orphan, vec!["  Parent:  gone".to_string()]),
+        ] {
+            assert_eq!(
+                relationship_lines(inst, &instances),
+                expected,
+                "{}",
+                inst.title
+            );
+        }
+    }
 
     /// #3350 gave `aoe list --json` a `state` tag and both timestamps;
     /// `session show --json` was left behind, so a scripted consumer that
