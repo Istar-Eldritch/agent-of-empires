@@ -324,25 +324,16 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             });
         }
 
-        // `publish_persisted` folds this event into the control cache before
-        // broadcasting the frame, so a hydrated cache already reflects it. A
-        // cold cache (nothing has hydrated this session since the daemon
-        // started, e.g. right after a restart with a reattached worker)
-        // never received that fold. Only `Stopped` and `BackgroundAgentCompleted`
-        // below read the cache's activity flags; every other arm derives its
-        // status from the event alone, so gate the replay on those two: a
-        // streaming chunk or capability event must not pay a full log replay
-        // on this serial listener task, and whichever of the two flag-reading
-        // events arrives first still hydrates before it is read. The replay
-        // picks up this frame's own event too, since it is persisted to the
-        // store before being broadcast. `fold_control_state` hydrates through
+        // Gated on `reads_activity_flags`: a cold cache (nothing has
+        // hydrated this session since the daemon started, e.g. right after a
+        // restart with a reattached worker) must not cost every other arm a
+        // full log replay on this serial listener task. The replay picks up
+        // this frame's own event too, since it is persisted to the store
+        // before being broadcast, and `fold_control_state` hydrates through
         // the cache's per-session lock, so a second frame for the same cold
         // session waits for the first rather than double-hydrating (#4001).
-        if matches!(
-            frame.event.as_ref(),
-            crate::acp::state::Event::Stopped { .. }
-                | crate::acp::state::Event::BackgroundAgentCompleted { .. }
-        ) && !state.acp_control_cache.is_hydrated(&frame.session_id)
+        if reads_activity_flags(frame.event.as_ref())
+            && !state.acp_control_cache.is_hydrated(&frame.session_id)
         {
             state
                 .session_service
@@ -997,6 +988,18 @@ pub(crate) enum StatusIntent {
     HealError,
 }
 
+/// Whether `derive_acp_status` reads either activity flag for `event`,
+/// i.e. whether a caller must hydrate a cold control cache before calling
+/// it. Kept in sync with the `Stopped` / `BackgroundAgentCompleted` arms
+/// below by construction: same `match`, so a new flag-reading arm cannot
+/// silently skip the gate.
+pub(super) fn reads_activity_flags(event: &crate::acp::Event) -> bool {
+    matches!(
+        event,
+        crate::acp::Event::Stopped { .. } | crate::acp::Event::BackgroundAgentCompleted { .. }
+    )
+}
+
 /// `turn_active_after` and `background_agent_active_after` are the session's
 /// post-event activity flags from the folded control state (`AcpState::
 /// turn_active` / `has_active_background_agent()`); misses read `false` and
@@ -1005,7 +1008,8 @@ pub(crate) enum StatusIntent {
 /// `Stopped` and `BackgroundAgentCompleted` resolve Idle only once neither
 /// flag is set; the former needs the flags because the cache can be ahead of
 /// a lagged frame (a newer turn already opened), the latter because a
-/// sub-agent can outlive its own completion event's ordering. See #4001.
+/// sub-agent can outlive its own completion event's ordering. `reads_activity_
+/// flags` above must name exactly these two arms. See #4001.
 pub(crate) fn derive_acp_status(
     event: &crate::acp::Event,
     turn_active_after: bool,
@@ -1955,9 +1959,10 @@ mod tests {
         let mut inst = Instance::new("acp-cold-reattach", "/tmp/acp");
         inst.view = crate::session::View::Structured;
         inst.source_profile = profile.to_string();
-        // What boot-time seeding would have left: the turn was open when the
-        // previous daemon died.
-        inst.status = Status::Running;
+        // Seeded Idle, not the Running a real boot would leave: the poll
+        // below must observe the listener drive Idle -> Running, or a
+        // vacuous seed would pass whether or not the fix ran.
+        inst.status = Status::Idle;
         let id = inst.id.clone();
         seed_profile_store(profile, vec![inst.clone()]);
 
@@ -2094,9 +2099,10 @@ mod tests {
         let mut inst = Instance::new("acp-cold-stopped-outstanding", "/tmp/acp");
         inst.view = crate::session::View::Structured;
         inst.source_profile = profile.to_string();
-        // What boot-time seeding would have left: the turn was open when the
-        // previous daemon died.
-        inst.status = Status::Running;
+        // Seeded Idle, not the Running a real boot would leave: the poll
+        // below must observe the listener drive Idle -> Running, or a
+        // vacuous seed would pass whether or not the fix ran.
+        inst.status = Status::Idle;
         let id = inst.id.clone();
         seed_profile_store(profile, vec![inst.clone()]);
 
@@ -2169,10 +2175,7 @@ mod tests {
             })
             .expect("listener is subscribed");
 
-        // Same reasoning as the completion test above: poll the observable,
-        // not the hydrated flag. Without the gated hydration this never
-        // turns true (a cold read derives Idle and marks the row unread) and
-        // the loop times out.
+        // Poll the observable, same reasoning as the completion test above.
         let mut resolved = false;
         for _ in 0..500 {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
