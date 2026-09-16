@@ -394,16 +394,6 @@ export function backgroundAgentLaunched(fields: {
   };
 }
 
-export function backgroundAgentCompleted(fields: { agent_id: string; status?: string }) {
-  return {
-    BackgroundAgentCompleted: {
-      agent_id: fields.agent_id,
-      status: fields.status ?? "completed",
-      ended_at: new Date().toISOString(),
-    },
-  };
-}
-
 export function configOptionsUpdated(options: unknown[]) {
   return { ConfigOptionsUpdated: { options } };
 }

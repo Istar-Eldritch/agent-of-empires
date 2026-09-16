@@ -1326,7 +1326,7 @@ describe("turnActive: daemon truth plus an optimistic overlay (#3417)", () => {
     expect(isVisiblyBusy({ turnActive: false, backgroundAgents: [backgroundAgent(null)] })).toBe(true);
   });
 
-  it("BackgroundAgentProgress(stalled) does not set endedAt, mirroring the Rust reducer (#3900)", () => {
+  it("BackgroundAgentProgress(stalled) does not set endedAt, mirroring the Rust reducer (#4001)", () => {
     let state = applyEvent(emptyAcpState(), {
       session_id: "s-1",
       seq: 1,

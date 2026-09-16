@@ -1742,7 +1742,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
         toolCount: e.tool_count,
         tools: e.tools && e.tools.length > 0 ? e.tools : a.tools,
         // A Progress never ends an agent; only the terminal
-        // BackgroundAgentCompleted sets endedAt (#3900).
+        // BackgroundAgentCompleted sets endedAt (#4001).
         endedAt: null,
         lastTool: e.last_tool ?? a.lastTool,
         lastText: e.last_text ?? a.lastText,

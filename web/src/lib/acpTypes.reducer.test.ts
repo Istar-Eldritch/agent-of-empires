@@ -373,7 +373,7 @@ describe("applyEvent / background agents", () => {
     expect(s.backgroundAgents[0]!.result).toBe("done");
   });
 
-  it("a stall does not set endedAt (matches the Rust reducer, #3900): the elapsed timer keeps ticking rather than freezing", () => {
+  it("a stall does not set endedAt (matches the Rust reducer, #4001): the elapsed timer keeps ticking rather than freezing", () => {
     let s = emptyAcpState();
     s = applyEvent(s, {
       session_id: "s-1",
@@ -455,7 +455,7 @@ describe("applyEvent / background agents", () => {
     expect(s.backgroundAgents[0]!.toolCount).toBe(0);
   });
 
-  it("does not reopen a stalled-terminal agent on a late progress event (#3925)", () => {
+  it("does not reopen a stalled-terminal agent on a late progress event (#4001)", () => {
     // A terminal BackgroundAgentCompleted can carry status "stalled" (the
     // tailer's own abort timeout gives up without a clean end_turn). It sets
     // endedAt just like any other terminal record, so a late Progress must

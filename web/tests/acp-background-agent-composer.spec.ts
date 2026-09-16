@@ -1,7 +1,7 @@
 import { test, expect } from "./helpers/mockedTest";
 import { mockAcpSession, openStructuredSession, backgroundAgentLaunched, stopped } from "./helpers/acpMock";
 
-// Regression for the busy-signal fix (#3900): the main turn ending while a
+// Regression for the busy-signal fix (#4001): the main turn ending while a
 // background sub-agent (Claude's async Task tool) is still running must not
 // leave the composer unable to accept a new prompt.
 //

@@ -364,7 +364,7 @@ export function clearFoldGeneration(rows: readonly ActivityRow[], showClearedTur
  */
 export function activityToThreadMessages(
   rows: readonly ActivityRow[],
-  turnActive: boolean,
+  visiblyBusy: boolean,
   showClearedTurns = false,
   todosEnabled = true,
   profile: AgentProfile = DEFAULT_AGENT_PROFILE,
@@ -569,7 +569,7 @@ export function activityToThreadMessages(
   // status indicators alive. The runtime's isRunning prop covers the
   // global flag; per-message status is derived from the trailing
   // message's `status`.
-  if (turnActive) {
+  if (visiblyBusy) {
     const last = messages[messages.length - 1];
     if (last && last.role === "assistant") {
       messages[messages.length - 1] = {
