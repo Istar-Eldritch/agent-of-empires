@@ -990,9 +990,11 @@ pub(crate) enum StatusIntent {
 
 /// Whether `derive_acp_status` reads either activity flag for `event`,
 /// i.e. whether a caller must hydrate a cold control cache before calling
-/// it. Kept in sync with the `Stopped` / `BackgroundAgentCompleted` arms
-/// below by construction: same `match`, so a new flag-reading arm cannot
-/// silently skip the gate.
+/// it. Adjacent to the two flag-reading arms below, not structurally tied to
+/// them: `derive_acp_status_ignores_the_flags_off_the_two_reading_arms`
+/// enumerates every other named arm and asserts each ignores the flags, so a
+/// new arm that starts reading them without being added here fails that
+/// test rather than silently under-hydrating the live listener.
 pub(super) fn reads_activity_flags(event: &crate::acp::Event) -> bool {
     matches!(
         event,
@@ -1008,8 +1010,8 @@ pub(super) fn reads_activity_flags(event: &crate::acp::Event) -> bool {
 /// `Stopped` and `BackgroundAgentCompleted` resolve Idle only once neither
 /// flag is set; the former needs the flags because the cache can be ahead of
 /// a lagged frame (a newer turn already opened), the latter because a
-/// sub-agent can outlive its own completion event's ordering. `reads_activity_
-/// flags` above must name exactly these two arms. See #4001.
+/// sub-agent can outlive its own completion event's ordering.
+/// `reads_activity_flags` above must name exactly these two arms. See #4001.
 pub(crate) fn derive_acp_status(
     event: &crate::acp::Event,
     turn_active_after: bool,
@@ -2041,18 +2043,22 @@ mod tests {
             })
             .expect("listener is subscribed");
 
-        // Poll the observable the fix is about, not the cache's hydrated
+        // Poll for the Idle -> Running transition, not the cache's hydrated
         // flag: a yield point (the instances write lock) sits between the
-        // hydrating await and the status/unread write landing, so a hydrated
-        // cache does not imply the write happened yet. Without the gated
-        // hydration this never turns true (a cold read derives Idle and
-        // marks the row unread) and the loop times out.
+        // hydrating await and the status write landing, so a hydrated cache
+        // does not imply the write happened yet. `status` is the whole
+        // discriminating signal here: `should_mark_acp_unread` only marks a
+        // row unread off an OLD status of Running, and the seed above is
+        // Idle, so unread cannot flip regardless of the fix; the guard below
+        // checks it anyway in case a future change adds a different path to
+        // unread. Without the gated hydration `row.status` never turns
+        // Running (a cold read derives Idle) and the loop times out.
         let mut resolved = false;
         for _ in 0..500 {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             let instances = state.instances.read().await;
             if let Some(row) = instances.iter().find(|i| i.id == id) {
-                if row.status == Status::Running && !row.unread {
+                if row.status == Status::Running {
                     resolved = true;
                     break;
                 }
@@ -2062,8 +2068,16 @@ mod tests {
 
         assert!(
             resolved,
-            "a live turn must not drop to Idle off a cold-cache miss, or be marked unread"
+            "a live turn must not drop to Idle off a cold-cache miss"
         );
+        {
+            let instances = state.instances.read().await;
+            let row = instances.iter().find(|i| i.id == id).expect("row");
+            assert!(
+                !row.unread,
+                "guard: a resolved live turn must not be unread"
+            );
+        }
         assert!(
             state.acp_control_cache.is_hydrated(&id),
             "the listener must have hydrated the cold session"
@@ -2175,13 +2189,16 @@ mod tests {
             })
             .expect("listener is subscribed");
 
-        // Poll the observable, same reasoning as the completion test above.
+        // Same discriminating signal as the completion test above: the
+        // seeded Idle status means `should_mark_acp_unread` can never flip
+        // unread here, so `status` alone is what the poll must watch for,
+        // and the guard assertion below checks unread separately.
         let mut resolved = false;
         for _ in 0..500 {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             let instances = state.instances.read().await;
             if let Some(row) = instances.iter().find(|i| i.id == id) {
-                if row.status == Status::Running && !row.unread {
+                if row.status == Status::Running {
                     resolved = true;
                     break;
                 }
@@ -2191,9 +2208,16 @@ mod tests {
 
         assert!(
             resolved,
-            "a sub-agent still running past its parent's Stopped must not drop \
-             to Idle off a cold-cache miss, or be marked unread"
+            "a sub-agent still running past its parent's Stopped must not drop to Idle off a cold-cache miss"
         );
+        {
+            let instances = state.instances.read().await;
+            let row = instances.iter().find(|i| i.id == id).expect("row");
+            assert!(
+                !row.unread,
+                "guard: a resolved live turn must not be unread"
+            );
+        }
         assert!(
             state.acp_control_cache.is_hydrated(&id),
             "the listener must have hydrated the cold session"
@@ -2745,6 +2769,143 @@ mod tests {
         // ThinkingEnded is a sub-phase terminator, not a work signal; leaving
         // it None avoids needless intents (ThinkingStarted already set Running).
         assert_eq!(derive_acp_status(&Event::ThinkingEnded, false, false), None);
+    }
+
+    #[test]
+    fn derive_acp_status_ignores_the_flags_off_the_two_reading_arms() {
+        use crate::acp::approvals::{ApprovalDecision, Nonce};
+        use crate::acp::state::ToolCall;
+        use crate::acp::Event;
+        // Every arm `derive_acp_status` currently gives a name to, other than
+        // `Stopped` and `BackgroundAgentCompleted`. If a future arm starts
+        // reading `turn_active_after` / `background_agent_active_after`
+        // without extending `reads_activity_flags`, its entry here still
+        // returns `false`, the assertion below calls it with `(false, false)`
+        // and `(true, true)`, and a flag-sensitive result makes them differ:
+        // this fails instead of silently under-hydrating the live listener.
+        let tool_call = ToolCall {
+            id: "t".into(),
+            name: "shell".into(),
+            kind: "execute".into(),
+            args_preview: "{}".into(),
+            started_at: chrono::Utc::now(),
+            parent_tool_call_id: None,
+            memory_recall: None,
+            diffs: Vec::new(),
+        };
+        let elicitation = crate::acp::elicitations::Elicitation {
+            nonce: Nonce("e-1".into()),
+            message: "Pick".into(),
+            title: None,
+            description: None,
+            tool_call_id: None,
+            questions: Vec::new(),
+            requested_at: chrono::Utc::now(),
+            resolved: None,
+        };
+        let events: Vec<(&str, Event)> = vec![
+            (
+                "UserPromptSent",
+                Event::UserPromptSent {
+                    prompt_id: None,
+                    text: "hi".into(),
+                    attachments: Vec::new(),
+                },
+            ),
+            (
+                "ApprovalResolved",
+                Event::ApprovalResolved {
+                    nonce: Nonce("x".into()),
+                    decision: ApprovalDecision::Allow,
+                },
+            ),
+            (
+                "ElicitationResolved",
+                Event::ElicitationResolved {
+                    nonce: Nonce("e-1".into()),
+                    outcome: crate::acp::elicitations::ElicitationOutcome::Accepted,
+                    answers: Vec::new(),
+                },
+            ),
+            ("ThinkingStarted", Event::ThinkingStarted),
+            (
+                "AgentMessageChunk",
+                Event::AgentMessageChunk { text: "x".into() },
+            ),
+            (
+                "ToolCallStarted",
+                Event::ToolCallStarted {
+                    tool_call: tool_call.clone(),
+                },
+            ),
+            (
+                "BackgroundAgentLaunched",
+                Event::BackgroundAgentLaunched {
+                    agent_id: "a-1".into(),
+                    tool_call_id: "t".into(),
+                    description: "desc".into(),
+                    prompt: "p".into(),
+                    model: "m".into(),
+                    output_file: "f".into(),
+                    started_at: chrono::Utc::now(),
+                },
+            ),
+            (
+                "BackgroundAgentProgress(Running)",
+                Event::BackgroundAgentProgress {
+                    agent_id: "a-1".into(),
+                    status: crate::acp::state::BackgroundAgentStatus::Running,
+                    tool_count: 1,
+                    tools: Vec::new(),
+                    last_tool: None,
+                    last_text: None,
+                    at: chrono::Utc::now(),
+                },
+            ),
+            (
+                "ApprovalRequested",
+                Event::ApprovalRequested {
+                    approval: crate::acp::permissions::build_approval(
+                        tool_call.clone(),
+                        Vec::new(),
+                    ),
+                },
+            ),
+            (
+                "ElicitationRequested",
+                Event::ElicitationRequested { elicitation },
+            ),
+            (
+                "AgentStartupError",
+                Event::AgentStartupError {
+                    message: "boom".into(),
+                },
+            ),
+            (
+                "AcpSessionAssigned",
+                Event::AcpSessionAssigned {
+                    acp_session_id: "uuid".into(),
+                },
+            ),
+            (
+                "RateLimitAutoResumed",
+                Event::RateLimitAutoResumed {
+                    resets_at: chrono::Utc::now(),
+                    manual: false,
+                },
+            ),
+        ];
+        for (name, event) in &events {
+            assert!(
+                !reads_activity_flags(event),
+                "{name} must not be in this table if it reads the flags"
+            );
+            assert_eq!(
+                derive_acp_status(event, false, false),
+                derive_acp_status(event, true, true),
+                "{name} must ignore turn_active_after/background_agent_active_after"
+            );
+        }
     }
 
     // --- #2248: a structured session must heal out of a stale Stopped ---
