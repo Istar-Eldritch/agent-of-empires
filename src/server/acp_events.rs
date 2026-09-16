@@ -1477,12 +1477,7 @@ mod tests {
     #[serial_test::serial]
     async fn recover_structured_unread_after_lag_keeps_running_for_a_live_background_agent() {
         let temp = tempfile::tempdir().expect("tempdir");
-        // SAFETY: serialized test; no other test mutates HOME concurrently.
-        unsafe { std::env::set_var("HOME", temp.path()) };
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
-        }
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
         crate::session::set_unread_enabled(true);
 
         let profile = "acp-unread-lag-background";
@@ -1590,12 +1585,7 @@ mod tests {
     #[serial_test::serial]
     async fn recover_structured_unread_after_lag_keeps_running_for_a_newer_turn_past_the_seed() {
         let temp = tempfile::tempdir().expect("tempdir");
-        // SAFETY: serialized test; no other test mutates HOME concurrently.
-        unsafe { std::env::set_var("HOME", temp.path()) };
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
-        }
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
         crate::session::set_unread_enabled(true);
 
         let profile = "acp-unread-lag-newer-turn";
@@ -1934,12 +1924,7 @@ mod tests {
     #[serial_test::serial]
     async fn acp_event_listener_hydrates_a_cold_cache_for_a_reattached_mid_turn_completion() {
         let temp = tempfile::tempdir().expect("tempdir");
-        // SAFETY: serialized test; no other test mutates HOME concurrently.
-        unsafe { std::env::set_var("HOME", temp.path()) };
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
-        }
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
         crate::session::set_unread_enabled(true);
 
         let profile = "acp-listener-cold-reattach";
@@ -2086,12 +2071,7 @@ mod tests {
     async fn acp_event_listener_hydrates_a_cold_cache_for_a_stopped_turn_with_an_outstanding_agent()
     {
         let temp = tempfile::tempdir().expect("tempdir");
-        // SAFETY: serialized test; no other test mutates HOME concurrently.
-        unsafe { std::env::set_var("HOME", temp.path()) };
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
-        }
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
         crate::session::set_unread_enabled(true);
 
         let profile = "acp-listener-cold-stopped-outstanding";

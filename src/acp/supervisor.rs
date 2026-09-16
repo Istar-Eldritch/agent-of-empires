@@ -5945,10 +5945,7 @@ cursor-acp-bridge = "agent acp"
     #[serial_test::serial]
     async fn shutdown_detaches_outstanding_background_agents_before_stopped() {
         let tmp = tempfile::TempDir::new().unwrap();
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
-        }
+        let _home = crate::session::test_support::isolate_home(tmp.path());
         let sink = VecSink::with_stale_background_agent_ids(vec!["bg-1".into(), "bg-2".into()]);
         let sup = Supervisor::new(sink.clone());
         {
@@ -5997,10 +5994,7 @@ cursor-acp-bridge = "agent acp"
     #[serial_test::serial]
     async fn shutdown_publishes_no_synthetic_completion_when_no_agents_are_outstanding() {
         let tmp = tempfile::TempDir::new().unwrap();
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
-        }
+        let _home = crate::session::test_support::isolate_home(tmp.path());
         let sink = VecSink::new();
         let sup = Supervisor::new(sink.clone());
         {
@@ -6027,10 +6021,7 @@ cursor-acp-bridge = "agent acp"
     #[serial_test::serial]
     async fn shutdown_on_an_unknown_session_publishes_nothing() {
         let tmp = tempfile::TempDir::new().unwrap();
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
-        }
+        let _home = crate::session::test_support::isolate_home(tmp.path());
         let sink = VecSink::with_stale_background_agent_ids(vec!["bg-1".into()]);
         let sup = Supervisor::new(sink.clone());
 
@@ -6050,10 +6041,7 @@ cursor-acp-bridge = "agent acp"
     #[serial_test::serial]
     async fn shutdown_during_an_in_flight_resume_publishes_nothing() {
         let tmp = tempfile::TempDir::new().unwrap();
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
-        }
+        let _home = crate::session::test_support::isolate_home(tmp.path());
         let sink = VecSink::with_stale_background_agent_ids(vec!["bg-1".into()]);
         let sup = Supervisor::new(sink.clone());
         let _reservation = reserve(sup.begin_resume("s-resuming", ResumeKind::Spawn).await);
@@ -6082,10 +6070,7 @@ cursor-acp-bridge = "agent acp"
     #[serial_test::serial]
     async fn shutdown_detaches_through_a_real_channel_sink_and_event_store() {
         let tmp = tempfile::TempDir::new().unwrap();
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
-        }
+        let _home = crate::session::test_support::isolate_home(tmp.path());
 
         let event_store = Arc::new(
             crate::acp::event_store::EventStore::open(&tmp.path().join("acp.db"), 1000).unwrap(),
@@ -6124,6 +6109,12 @@ cursor-acp-bridge = "agent acp"
             sup.test_install_handle("s-real-teardown", client, dummy_runner_kind(&tmp), None)
                 .await;
         }
+
+        assert_eq!(
+            event_store.unresolved_background_agent_ids("s-real-teardown"),
+            vec!["bg-real".to_string()],
+            "precondition: the launch is genuinely outstanding before teardown"
+        );
 
         sup.shutdown("s-real-teardown")
             .await
