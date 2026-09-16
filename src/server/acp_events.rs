@@ -328,13 +328,22 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
         // broadcasting the frame, so a hydrated cache already reflects it. A
         // cold cache (nothing has hydrated this session since the daemon
         // started, e.g. right after a restart with a reattached worker)
-        // never received that fold, so hydrate it here before reading: the
-        // replay picks up this frame's own event too, since it is persisted
-        // to the store before being broadcast. `fold_control_state` hydrates
-        // through the cache's per-session lock, so a second frame for the
-        // same cold session waits for the first rather than double-hydrating
-        // (#4001).
-        if !state.acp_control_cache.is_hydrated(&frame.session_id) {
+        // never received that fold. Only `Stopped` and `BackgroundAgentCompleted`
+        // below read the cache's activity flags; every other arm derives its
+        // status from the event alone, so gate the replay on those two: a
+        // streaming chunk or capability event must not pay a full log replay
+        // on this serial listener task, and whichever of the two flag-reading
+        // events arrives first still hydrates before it is read. The replay
+        // picks up this frame's own event too, since it is persisted to the
+        // store before being broadcast. `fold_control_state` hydrates through
+        // the cache's per-session lock, so a second frame for the same cold
+        // session waits for the first rather than double-hydrating (#4001).
+        if matches!(
+            frame.event.as_ref(),
+            crate::acp::state::Event::Stopped { .. }
+                | crate::acp::state::Event::BackgroundAgentCompleted { .. }
+        ) && !state.acp_control_cache.is_hydrated(&frame.session_id)
+        {
             state
                 .session_service
                 .fold_control_state(&frame.session_id)
@@ -2027,41 +2036,51 @@ mod tests {
             })
             .expect("listener is subscribed");
 
-        let mut hydrated = false;
+        // Poll the observable the fix is about, not the cache's hydrated
+        // flag: a yield point (the instances write lock) sits between the
+        // hydrating await and the status/unread write landing, so a hydrated
+        // cache does not imply the write happened yet. Without the gated
+        // hydration this never turns true (a cold read derives Idle and
+        // marks the row unread) and the loop times out.
+        let mut resolved = false;
         for _ in 0..500 {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            if state.acp_control_cache.is_hydrated(&id) {
-                hydrated = true;
-                break;
+            let instances = state.instances.read().await;
+            if let Some(row) = instances.iter().find(|i| i.id == id) {
+                if row.status == Status::Running && !row.unread {
+                    resolved = true;
+                    break;
+                }
             }
         }
-        // apply_status_intent and the unread check run synchronously right
-        // after the hydrating await returns, with no yield point in between,
-        // so by the time the cache reports hydrated the write has landed.
         listener.abort();
 
-        assert!(hydrated, "the listener never hydrated the cold session");
+        assert!(
+            resolved,
+            "a live turn must not drop to Idle off a cold-cache miss, or be marked unread"
+        );
+        assert!(
+            state.acp_control_cache.is_hydrated(&id),
+            "the listener must have hydrated the cold session"
+        );
         assert!(
             state.acp_control_cache.turn_active(&id),
             "the replay must pick up the still-open UserPromptSent"
         );
-
-        let instances = state.instances.read().await;
-        let row = instances.iter().find(|i| i.id == id).expect("row present");
-        assert_eq!(
-            row.status,
-            Status::Running,
-            "a live turn must not drop to Idle off a cold-cache miss"
-        );
-        assert!(!row.unread, "an unfinished turn must not be marked unread");
     }
 
-    /// #4001: a `BackgroundAgentLaunched` must not clobber a pending
-    /// approval's Waiting dot even when the cache that computes its target
-    /// status is cold and needs hydrating first.
+    /// #4001: the `Stopped` arm reads the same activity flags as
+    /// `BackgroundAgentCompleted` and needs the same cold-cache hydration.
+    /// A worker reattaches with its sub-agent still running, the main turn
+    /// ends, and the tailer's next line this process sees is a plain
+    /// `Stopped` (no completion yet); without hydrating first, both flags
+    /// read false and `Stopped` wrongly derives Idle, marking the still-open
+    /// work unread. Hydrating must pick up the outstanding launch and keep
+    /// the row Running.
     #[tokio::test]
     #[serial_test::serial]
-    async fn acp_event_listener_hydrating_a_cold_cache_does_not_clobber_a_pending_approval() {
+    async fn acp_event_listener_hydrates_a_cold_cache_for_a_stopped_turn_with_an_outstanding_agent()
+    {
         let temp = tempfile::tempdir().expect("tempdir");
         // SAFETY: serialized test; no other test mutates HOME concurrently.
         unsafe { std::env::set_var("HOME", temp.path()) };
@@ -2071,51 +2090,60 @@ mod tests {
         }
         crate::session::set_unread_enabled(true);
 
-        let profile = "acp-listener-cold-waiting";
-        let mut inst = Instance::new("acp-cold-waiting", "/tmp/acp");
+        let profile = "acp-listener-cold-stopped-outstanding";
+        let mut inst = Instance::new("acp-cold-stopped-outstanding", "/tmp/acp");
         inst.view = crate::session::View::Structured;
         inst.source_profile = profile.to_string();
-        // What boot-time seeding would have left: an approval was pending
-        // when the previous daemon died.
-        inst.status = Status::Waiting;
+        // What boot-time seeding would have left: the turn was open when the
+        // previous daemon died.
+        inst.status = Status::Running;
         let id = inst.id.clone();
         seed_profile_store(profile, vec![inst.clone()]);
 
         let state = test_support::build_test_app_state(vec![inst]);
 
-        let tool_call = crate::acp::state::ToolCall {
-            id: "tc-1".into(),
-            name: "Edit".into(),
-            kind: "edit".into(),
-            args_preview: String::new(),
-            started_at: chrono::Utc::now(),
-            diffs: Vec::new(),
-            memory_recall: None,
-            parent_tool_call_id: None,
-        };
+        // The pre-restart log: a sub-agent was launched and is still going
+        // (no completion recorded) when the main turn's Stopped arrives.
         state
             .acp_event_store
             .record(
                 &id,
                 1,
-                &crate::acp::Event::ApprovalRequested {
-                    approval: crate::acp::permissions::build_approval(tool_call, Vec::new()),
+                &crate::acp::Event::UserPromptSent {
+                    text: "spawn and go".into(),
+                    attachments: Vec::new(),
+                    prompt_id: None,
                 },
             )
-            .expect("record approval");
-        let launched = crate::acp::Event::BackgroundAgentLaunched {
-            agent_id: "bg-1".into(),
-            tool_call_id: "tc-2".into(),
-            description: "map backend".into(),
-            prompt: "do it".into(),
-            model: "claude-opus-4-8".into(),
-            output_file: "/tmp/bg-1.output".into(),
-            started_at: chrono::Utc::now(),
+            .expect("record prompt");
+        state
+            .acp_event_store
+            .record(
+                &id,
+                2,
+                &crate::acp::Event::BackgroundAgentLaunched {
+                    agent_id: "bg-1".into(),
+                    tool_call_id: "tc-1".into(),
+                    description: "map backend".into(),
+                    prompt: "do it".into(),
+                    model: "claude-opus-4-8".into(),
+                    output_file: "/tmp/bg-1.output".into(),
+                    started_at: chrono::Utc::now(),
+                },
+            )
+            .expect("record launch");
+        let stopped = crate::acp::Event::Stopped {
+            reason: "prompt_complete".into(),
         };
         state
             .acp_event_store
-            .record(&id, 2, &launched)
-            .expect("record launch");
+            .record(&id, 3, &stopped)
+            .expect("record stop");
+
+        assert!(
+            !state.acp_control_cache.is_hydrated(&id),
+            "precondition: a fresh process starts with a cold cache"
+        );
 
         let listener = tokio::spawn(acp_event_listener(state.clone()));
         for _ in 0..500 {
@@ -2129,39 +2157,47 @@ mod tests {
             "listener never subscribed"
         );
 
+        // The reattached worker's tailer resumes and emits the main turn's
+        // Stopped as the first live frame this process sees.
         state
             .acp_events_tx
             .send(AcpBroadcastFrame {
                 session_id: id.clone(),
-                seq: 2,
-                event: Arc::new(launched),
+                seq: 3,
+                event: Arc::new(stopped),
                 worker_generation: None,
             })
             .expect("listener is subscribed");
 
-        let mut hydrated = false;
+        // Same reasoning as the completion test above: poll the observable,
+        // not the hydrated flag. Without the gated hydration this never
+        // turns true (a cold read derives Idle and marks the row unread) and
+        // the loop times out.
+        let mut resolved = false;
         for _ in 0..500 {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            if state.acp_control_cache.is_hydrated(&id) {
-                hydrated = true;
-                break;
+            let instances = state.instances.read().await;
+            if let Some(row) = instances.iter().find(|i| i.id == id) {
+                if row.status == Status::Running && !row.unread {
+                    resolved = true;
+                    break;
+                }
             }
         }
         listener.abort();
 
-        assert!(hydrated, "the listener never hydrated the cold session");
+        assert!(
+            resolved,
+            "a sub-agent still running past its parent's Stopped must not drop \
+             to Idle off a cold-cache miss, or be marked unread"
+        );
+        assert!(
+            state.acp_control_cache.is_hydrated(&id),
+            "the listener must have hydrated the cold session"
+        );
         assert!(
             state.acp_control_cache.has_active_background_agent(&id),
-            "the replay must pick up the launch even though the guard below \
-             ignores it"
-        );
-
-        let instances = state.instances.read().await;
-        let row = instances.iter().find(|i| i.id == id).expect("row present");
-        assert_eq!(
-            row.status,
-            Status::Waiting,
-            "a background launch must not clobber a pending approval"
+            "the replay must pick up the still-outstanding launch"
         );
     }
 
