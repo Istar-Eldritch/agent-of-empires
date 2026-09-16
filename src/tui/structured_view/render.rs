@@ -2762,7 +2762,7 @@ mod tests {
         assert!(dump.contains("12k/200k (6%)"), "usage meter missing");
     }
 
-    /// #3900: the status banner must light up for a background sub-agent
+    /// #4001: the status banner must light up for a background sub-agent
     /// even while the main turn itself is idle.
     #[test]
     fn status_line_shows_working_banner_for_a_background_agent_alone() {

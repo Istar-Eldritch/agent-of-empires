@@ -693,7 +693,7 @@ async fn handle_terminal_event(
                 // track only the main turn, not a display-only background
                 // sub-agent signal (see `AcpTranscript.background_agent_active`),
                 // or Esc stops being inert while the main turn is genuinely
-                // idle (#3900).
+                // idle (#4001).
                 agent_busy: state.transcript.turn_active || state.in_flight,
             };
             let intent = input::dispatch(state.focus, &key, ctx);

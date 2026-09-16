@@ -1173,7 +1173,7 @@ impl AcpState {
     /// `BackgroundAgentCompleted` can carry `status: Stalled` (its abort
     /// timeout gives up without a clean `end_turn`), and that record must
     /// count as done like any other terminal one, not wedge this on forever
-    /// (#3900).
+    /// (#4001).
     pub fn has_active_background_agent(&self) -> bool {
         self.background_agents.iter().any(|a| a.ended_at.is_none())
     }
@@ -1385,7 +1385,7 @@ impl AcpState {
                 // A background sub-agent the main turn handed work off to
                 // keeps running past its parent's `Stopped`, but `turn_active`
                 // gates prompt dispatch and the queue drain, not just display
-                // (#3900): it must clear unconditionally here. Use
+                // (#4001): it must clear unconditionally here. Use
                 // `is_visibly_busy` at display boundaries for the combined
                 // signal.
                 self.turn_active = false;
@@ -1876,9 +1876,9 @@ mod tests {
         assert_eq!(s.background_agents[0].tool_count, 3, "must not overwrite");
     }
 
-    /// #3925: a terminal `Stalled` record (the tailer's own abort timeout,
+    /// #4001: a terminal `Stalled` record (the tailer's own abort timeout,
     /// not one of the `status`-matched terminal variants) still carries
-    /// `ended_at`, so a late Progress must not reopen it either — the
+    /// `ended_at`, so a late Progress must not reopen it either: the
     /// progress guard has to key on `ended_at`, not just `status`, to match
     /// `has_active_background_agent`'s own `ended_at`-keyed read.
     #[test]
@@ -1978,7 +1978,7 @@ mod tests {
         );
     }
 
-    /// #3900: `Stopped` must clear `turn_active` unconditionally, even while
+    /// #4001: `Stopped` must clear `turn_active` unconditionally, even while
     /// a background sub-agent it spawned is still running. `turn_active`
     /// gates prompt dispatch and the queue drain, not just display; the busy
     /// *display* signal is the separate `is_visibly_busy`.
@@ -2038,7 +2038,7 @@ mod tests {
     /// not a clean `end_turn`) still reaches `BackgroundAgentCompleted` with
     /// `ended_at` set. `has_active_background_agent` must treat that as
     /// terminal like any other completion, not wedge the busy signal on
-    /// forever (#3900 permanent-latch regression).
+    /// forever (#4001 permanent-latch regression).
     #[test]
     fn a_stalled_terminal_record_does_not_wedge_the_busy_signal_on() {
         let mut s = fresh_state();

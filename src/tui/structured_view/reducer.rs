@@ -76,8 +76,8 @@ pub struct AcpTranscript {
     /// Whether a background sub-agent (async Task) is still outstanding.
     /// Display-only: unlike `turn_active`, the composer must NOT gate
     /// send-vs-park on this, since the main turn itself is genuinely idle
-    /// (#3900). Combine with `turn_active` only for the busy spinner /
-    /// Esc-to-cancel indicator.
+    /// (#4001). Combine with `turn_active` only for the busy spinner;
+    /// Esc-to-cancel reads `turn_active` alone (see `agent_busy` in mod.rs).
     pub background_agent_active: bool,
     /// Whether the agent accepts `_session/steering`. When true the composer
     /// sends a mid-turn prompt straight through instead of parking it: the
@@ -639,7 +639,7 @@ mod tests {
         assert!(t.available_modes.is_empty());
     }
 
-    /// #3900: a live background sub-agent must reach the TUI's busy
+    /// #4001: a live background sub-agent must reach the TUI's busy
     /// signal via `apply_reduced_state`, distinct from `turn_active` (which
     /// stays false since the main turn itself may be genuinely idle).
     #[test]

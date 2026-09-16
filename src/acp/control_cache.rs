@@ -103,7 +103,7 @@ impl ControlStateCache {
     /// sub-agent, or `false` if nothing is cached. Used right after
     /// `apply_if_cached` folds a `Stopped` or `BackgroundAgentCompleted`
     /// event, to tell the sidebar status derivation whether a background
-    /// sub-agent is still keeping the session busy (#3900), and by live lag
+    /// sub-agent is still keeping the session busy (#4001), and by live lag
     /// recovery to override a stale seed event. Deliberately does not
     /// hydrate on a miss: for the live caller a miss means the fold was
     /// dropped (a failed persist), for recovery it may just mean the session

@@ -350,7 +350,7 @@ impl StructuredViewState {
     /// (and the connection/POST state), not a display-only background
     /// sub-agent signal (see `AcpTranscript.background_agent_active`), or an
     /// idle main turn would suppress the resync while a sub-agent runs
-    /// (#3900).
+    /// (#4001).
     pub fn is_busy(&self) -> bool {
         self.transcript.turn_active || self.in_flight || self.ws.is_none()
     }

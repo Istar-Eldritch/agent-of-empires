@@ -326,7 +326,7 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
 
         // `publish_persisted` folds this event into the control cache before
         // broadcasting the frame, so the cached `turn_active` already
-        // reflects it (#3900).
+        // reflects it (#4001).
         let turn_active_after = state.acp_control_cache.turn_active(&frame.session_id);
         let background_agent_active_after = state
             .acp_control_cache
@@ -527,7 +527,7 @@ pub(crate) async fn seed_acp_statuses(state: Arc<AppState>) {
         };
         // No live control-state fold to consult at boot (the cache is
         // cold), so a background sub-agent outstanding across a restart
-        // reads as Idle here same as before #3900; the reconciler and the
+        // reads as Idle here same as before #4001; the reconciler and the
         // next live event correct it once the tailer resumes.
         let Some(intent) = derive_acp_status(&event, false, false) else {
             continue;
@@ -783,7 +783,7 @@ pub(super) async fn recover_structured_unread_after_lag(
         // best available verdict; a miss (never opened, evicted, or
         // forgotten) degrades to boot's conservative verdict. The seed query
         // excludes background events, so a `Stopped` under a still-running
-        // sub-agent needs this (#3900).
+        // sub-agent needs this (#4001).
         let turn_active_after = control_cache.turn_active(&id);
         let background_agent_active_after = control_cache.has_active_background_agent(&id);
         let Some(intent) =
@@ -969,7 +969,7 @@ pub(crate) enum StatusIntent {
     /// `Stopped` (a deliberate stop), or `Error` (a dead connection awaiting
     /// respawn). Background sub-agent lifecycle events must not speak for
     /// the main turn; its own events (plain `Set`) and `HealError` resolve
-    /// those. Used only by the `BackgroundAgent*` arms (#3900).
+    /// those. Used only by the `BackgroundAgent*` arms (#4001).
     SetUnlessWaiting(Status),
     HealError,
 }
@@ -982,7 +982,7 @@ pub(crate) enum StatusIntent {
 /// `Stopped` and `BackgroundAgentCompleted` resolve Idle only once neither
 /// flag is set; the former needs the flags because the cache can be ahead of
 /// a lagged frame (a newer turn already opened), the latter because a
-/// sub-agent can outlive its own completion event's ordering. See #3900.
+/// sub-agent can outlive its own completion event's ordering. See #4001.
 pub(crate) fn derive_acp_status(
     event: &crate::acp::Event,
     turn_active_after: bool,
@@ -1005,7 +1005,7 @@ pub(crate) fn derive_acp_status(
         // A launched or still-working background sub-agent keeps the sidebar
         // dot lit even while the main turn is between its own events. Must
         // not override a pending approval/elicitation's Waiting dot, which
-        // speaks to the main turn, not the sub-agent (#3900).
+        // speaks to the main turn, not the sub-agent (#4001).
         Event::BackgroundAgentLaunched { .. } => {
             Some(StatusIntent::SetUnlessWaiting(Status::Running))
         }
@@ -1026,7 +1026,7 @@ pub(crate) fn derive_acp_status(
         // sidebar pill staying grey is the right signal. See #1281.
         //
         // Unless something is still busy after this `Stopped`: a background
-        // sub-agent keeps working past its parent (#3900), and the cache can
+        // sub-agent keeps working past its parent (#4001), and the cache can
         // be ahead of a lagged frame (a newer turn already opened), so the
         // arm consults both activity flags. Live, the event itself folds
         // `turn_active` false, so ahead-ness is the only source of `true`.
@@ -1043,7 +1043,7 @@ pub(crate) fn derive_acp_status(
         // outlives its own completion event's ordering; the `Stopped` arm
         // consults the same flags). `SetUnlessWaiting`
         // because a sibling agent finishing must not clobber a pending
-        // approval/elicitation on the main turn (#3900).
+        // approval/elicitation on the main turn (#4001).
         Event::BackgroundAgentCompleted { .. } => Some(StatusIntent::SetUnlessWaiting(
             if turn_active_after || background_agent_active_after {
                 Status::Running
@@ -1405,7 +1405,7 @@ mod tests {
         }
         // A cold control cache for these sessions: never hydrated, so the
         // reads miss and degrade to boot's conservative `(false, false)`
-        // verdict, the pre-#3900 Idle+unread behavior this test pins.
+        // verdict, the pre-#4001 Idle+unread behavior this test pins.
         let control_cache = crate::acp::control_cache::ControlStateCache::new();
 
         let instances = RwLock::new(rows);
@@ -1451,7 +1451,7 @@ mod tests {
         assert!(!row(&terminal_id).unread);
     }
 
-    /// #3900: the lag-recovery replay must consult the live control cache.
+    /// #4001: the lag-recovery replay must consult the live control cache.
     /// The seed query excludes background events, so the latest status event
     /// is the turn's `Stopped` even though a background sub-agent is still
     /// running; deriving from hardcoded inactivity would resolve Idle under
@@ -1564,7 +1564,7 @@ mod tests {
         assert!(!inst.unread, "an unfinished turn must not be marked unread");
     }
 
-    /// #3900: a `UserDiffCommentsPrompt` opens a turn in the control state
+    /// #4001: a `UserDiffCommentsPrompt` opens a turn in the control state
     /// but is absent from the seed query, so during such a turn the latest
     /// seed event is the previous turn's `Stopped`. Lag recovery must let
     /// the cache's `turn_active` override that stale seed instead of
@@ -2225,7 +2225,7 @@ mod tests {
         // A background sub-agent the main turn spawned is still running
         // (the caller's `background_agent_active_after` reads true): the dot
         // must stay lit rather than drop to Idle with the main turn's
-        // Stopped. #3900. `turn_active_after` is false here: live, the
+        // Stopped. #4001. `turn_active_after` is false here: live, the
         // Stopped itself folds it; ahead-of-frame is covered by another test.
         assert_eq!(
             derive_acp_status(
@@ -2255,7 +2255,7 @@ mod tests {
         );
         // The main turn that launched this agent is still going (it landed
         // mid-turn, ahead of the eventual Stopped): must not drop to Idle
-        // under a live turn even with no sibling agents left. See #3925.
+        // under a live turn even with no sibling agents left. See #4001.
         assert_eq!(
             derive_acp_status(
                 &Event::BackgroundAgentCompleted {
@@ -2515,7 +2515,7 @@ mod tests {
         assert_eq!(inst.status, Status::Idle);
     }
 
-    /// #3900: a background sub-agent's progress must not clobber a pending
+    /// #4001: a background sub-agent's progress must not clobber a pending
     /// approval/elicitation's Waiting dot; the main turn's own
     /// `ApprovalResolved`/`ElicitationResolved` (a plain `Set`) still
     /// recovers it normally.
@@ -2548,8 +2548,9 @@ mod tests {
 
     /// A background sub-agent's lifecycle must not clear the main
     /// connection's Error banner: the tailer keeps draining on a cloned
-    /// sender while the supervisor evaluates a respawn, and only HealError
-    /// from a fresh worker attach resolves Error.
+    /// sender while the supervisor evaluates a respawn. The main turn's
+    /// own events (plain `Set`) and `HealError` from a fresh worker attach
+    /// both still resolve Error; only `SetUnlessWaiting` preserves it.
     #[test]
     fn set_unless_waiting_never_clears_a_main_agent_error() {
         let mut inst = stopped_structured_instance();
@@ -2576,7 +2577,7 @@ mod tests {
         );
     }
 
-    /// #3900: a background agent finishing must not clobber a pending
+    /// #4001: a background agent finishing must not clobber a pending
     /// approval/elicitation on the main turn either.
     #[test]
     fn background_agent_completed_does_not_clobber_waiting() {
@@ -2600,7 +2601,7 @@ mod tests {
         assert_eq!(inst.status, Status::Waiting);
     }
 
-    /// #3925: a sub-agent launched mid-turn can complete before its parent
+    /// #4001: a sub-agent launched mid-turn can complete before its parent
     /// turn's own `Stopped`. That completion must not drop the sidebar to
     /// Idle (and, via `should_mark_acp_unread`'s Running->Idle edge, must not
     /// mark the still-unfinished turn unread) just because it was the last
@@ -2688,9 +2689,9 @@ mod tests {
         assert!(should_mark_acp_unread(&inst, old_status, true));
     }
 
-    /// #3900: `BackgroundAgentCompleted` arriving after the main turn's own
+    /// #4001: `BackgroundAgentCompleted` arriving after the main turn's own
     /// `Stopped` (the ordinary case) still resolves Idle once it is the last
-    /// agent outstanding — this must not regress from the mid-turn fix above.
+    /// agent outstanding, and must not regress from the mid-turn fix above.
     #[test]
     fn background_agent_completed_after_stopped_still_resolves_idle() {
         use crate::acp::Event;
