@@ -77,7 +77,8 @@ pub struct AcpTranscript {
     /// Display-only: unlike `turn_active`, the composer must NOT gate
     /// send-vs-park on this, since the main turn itself is genuinely idle
     /// (#4001). Combine with `turn_active` only for the busy spinner;
-    /// Esc-to-cancel reads `turn_active` alone (see `agent_busy` in mod.rs).
+    /// Esc-to-cancel reads `turn_active` (via `agent_busy` in mod.rs), never
+    /// this field.
     pub background_agent_active: bool,
     /// Whether the agent accepts `_session/steering`. When true the composer
     /// sends a mid-turn prompt straight through instead of parking it: the
