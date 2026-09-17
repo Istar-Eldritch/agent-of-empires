@@ -653,6 +653,7 @@ mod tests {
             prompt: "do the thing".into(),
             model: "claude-opus-4-8".into(),
             output_file: "/tmp/a1.output".into(),
+            output_format: None,
             started_at: chrono::Utc::now(),
         }]);
         assert!(!state.turn_active, "fixture invariant: no main turn opened");

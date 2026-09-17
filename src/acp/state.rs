@@ -1903,6 +1903,7 @@ mod tests {
             prompt: "do the thing".into(),
             model: "claude-opus-4-8".into(),
             output_file: "/tmp/a1.output".into(),
+            output_format: None,
             started_at: Utc::now(),
         })
         .unwrap();
@@ -1958,6 +1959,7 @@ mod tests {
             prompt: "do the thing".into(),
             model: "claude-opus-4-8".into(),
             output_file: "/tmp/a1.output".into(),
+            output_format: None,
             started_at: Utc::now(),
         })
         .unwrap();
@@ -2009,6 +2011,7 @@ mod tests {
             prompt: "do the thing".into(),
             model: "claude-opus-4-8".into(),
             output_file: "/tmp/a1.output".into(),
+            output_format: None,
             started_at: Utc::now(),
         })
         .unwrap();
@@ -2065,6 +2068,7 @@ mod tests {
             prompt: "do the thing".into(),
             model: "claude-opus-4-8".into(),
             output_file: "/tmp/a1.output".into(),
+            output_format: None,
             started_at: Utc::now(),
         })
         .unwrap();
@@ -2116,6 +2120,7 @@ mod tests {
             prompt: "do the thing".into(),
             model: "claude-opus-4-8".into(),
             output_file: "/tmp/a1.output".into(),
+            output_format: None,
             started_at: Utc::now(),
         })
         .unwrap();
@@ -2155,6 +2160,7 @@ mod tests {
             prompt: "do the thing".into(),
             model: "claude-opus-4-8".into(),
             output_file: "/tmp/a1.output".into(),
+            output_format: None,
             started_at: Utc::now(),
         })
         .unwrap();

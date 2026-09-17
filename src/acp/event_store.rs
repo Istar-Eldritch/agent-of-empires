@@ -4601,6 +4601,7 @@ mod tests {
             prompt: "do it".into(),
             model: "claude-opus-4-8".into(),
             output_file: format!("/tmp/{agent_id}.output"),
+            output_format: None,
             started_at: Utc::now(),
         }
     }

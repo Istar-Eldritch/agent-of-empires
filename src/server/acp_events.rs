@@ -1513,6 +1513,7 @@ mod tests {
                     prompt: "do it".into(),
                     model: "claude-opus-4-8".into(),
                     output_file: "/tmp/bg-1.output".into(),
+                    output_format: None,
                     started_at: chrono::Utc::now(),
                 },
             )
@@ -1965,6 +1966,7 @@ mod tests {
                     prompt: "do it".into(),
                     model: "claude-opus-4-8".into(),
                     output_file: "/tmp/bg-1.output".into(),
+                    output_format: None,
                     started_at: chrono::Utc::now(),
                 },
             )
@@ -2111,6 +2113,7 @@ mod tests {
                     prompt: "do it".into(),
                     model: "claude-opus-4-8".into(),
                     output_file: "/tmp/bg-1.output".into(),
+                    output_format: None,
                     started_at: chrono::Utc::now(),
                 },
             )
@@ -2580,6 +2583,7 @@ mod tests {
                     prompt: "p".into(),
                     model: "m".into(),
                     output_file: "f".into(),
+                    output_format: None,
                     started_at: chrono::Utc::now(),
                 },
                 false,
@@ -2681,6 +2685,7 @@ mod tests {
                 prompt: "do it".into(),
                 model: "claude-opus-4-8".into(),
                 output_file: "/tmp/bg-1.output".into(),
+                output_format: None,
                 started_at: chrono::Utc::now(),
             })
             .unwrap();
@@ -2884,6 +2889,7 @@ mod tests {
                     prompt: "p".into(),
                     model: "m".into(),
                     output_file: "f".into(),
+                    output_format: None,
                     started_at: chrono::Utc::now(),
                 },
             ),
@@ -3129,6 +3135,7 @@ mod tests {
                 prompt: "p".into(),
                 model: "m".into(),
                 output_file: "f".into(),
+                output_format: None,
                 started_at: chrono::Utc::now(),
             },
             true,
