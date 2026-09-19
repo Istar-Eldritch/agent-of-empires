@@ -146,10 +146,12 @@ fn handle_resume_background_tailing_cmd(
 ) {
     for (agent_id, tool_call_id, output_file, output_format) in launches {
         crate::acp::background_agent::spawn_tailer(
-            agent_id,
-            tool_call_id,
-            output_file,
-            output_format,
+            crate::acp::background_agent::BackgroundAgentLaunch {
+                agent_id,
+                tool_call_id,
+                output_file,
+                output_format,
+            },
             bg_transcript_source.clone(),
             event_tx.clone(),
             between_prompt_bg_agents.clone(),
@@ -697,10 +699,12 @@ pub(super) async fn run_connection_task<W, R>(
                     {
                         if !suppressing && !output_file.is_empty() {
                             crate::acp::background_agent::spawn_tailer(
-                                agent_id.clone(),
-                                tool_call_id.clone(),
-                                output_file.clone(),
-                                output_format.clone(),
+                                crate::acp::background_agent::BackgroundAgentLaunch {
+                                    agent_id: agent_id.clone(),
+                                    tool_call_id: tool_call_id.clone(),
+                                    output_file: output_file.clone(),
+                                    output_format: output_format.clone(),
+                                },
                                 bg_transcript_source.clone(),
                                 event_tx.clone(),
                                 between_prompt_bg_agents.clone(),

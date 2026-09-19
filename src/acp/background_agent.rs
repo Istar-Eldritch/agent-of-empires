@@ -222,16 +222,28 @@ impl TranscriptFormat {
     }
 }
 
+/// Identifying/transcript fields from a `BackgroundAgentLaunched` event,
+/// grouped so `spawn_tailer` doesn't need a parameter per field.
+pub struct BackgroundAgentLaunch {
+    pub agent_id: String,
+    pub tool_call_id: String,
+    pub output_file: String,
+    pub output_format: Option<String>,
+}
+
 pub fn spawn_tailer(
-    agent_id: String,
-    tool_call_id: String,
-    output_file: String,
-    output_format: Option<String>,
+    launch: BackgroundAgentLaunch,
     source: TranscriptSource,
     event_tx: Sender<Event>,
     active: Arc<Mutex<HashSet<String>>>,
     start: TailerStart,
 ) {
+    let BackgroundAgentLaunch {
+        agent_id,
+        tool_call_id,
+        output_file,
+        output_format,
+    } = launch;
     // `insert` returns false when the id is already active: a second spawn
     // for the same agent is a no-op instead of racing two tailers against
     // one transcript.
@@ -1270,10 +1282,12 @@ mod tests {
         let active = Arc::new(Mutex::new(HashSet::from(["dup".to_string()])));
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         spawn_tailer(
-            "dup".into(),
-            "tc-dup".into(),
-            String::new(),
-            None,
+            BackgroundAgentLaunch {
+                agent_id: "dup".into(),
+                tool_call_id: "tc-dup".into(),
+                output_file: String::new(),
+                output_format: None,
+            },
             TranscriptSource::Host,
             tx,
             active.clone(),
