@@ -428,6 +428,7 @@ mod tests {
                 prompt: "p".into(),
                 model: "m".into(),
                 output_file: "/home/user/.aoe/transcripts/a1.jsonl".into(),
+                output_format: None,
                 started_at: chrono::Utc::now(),
             }),
             worker_generation: None,

@@ -8728,6 +8728,7 @@ cursor-acp-bridge = "agent acp"
                 prompt: "do a thing".into(),
                 model: "claude".into(),
                 output_file: "/tmp/nonexistent-4029.jsonl".into(),
+                output_format: None,
                 started_at: chrono::Utc::now(),
             },
         );
@@ -8803,6 +8804,7 @@ cursor-acp-bridge = "agent acp"
                 prompt: "do a thing".into(),
                 model: "claude".into(),
                 output_file: "/tmp/nonexistent.jsonl".into(),
+                output_format: None,
                 started_at: chrono::Utc::now(),
             },
         );
@@ -8922,6 +8924,7 @@ cursor-acp-bridge = "agent acp"
                 prompt: "do a thing".into(),
                 model: "claude".into(),
                 output_file: output_file.into(),
+                output_format: None,
                 started_at: chrono::Utc::now(),
             },
         );
